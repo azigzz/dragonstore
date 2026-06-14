@@ -83,7 +83,7 @@ npm start
 
 Depois de mudar slash commands em `deploy-commands.js`, rode `npm run deploy` ou redeploy no Render. As melhorias atuais usam comandos ja existentes, mas ainda e recomendado redeployar para subir o codigo novo.
 
-Se `/configpix` nao aparecer ou disser que falta permissao, rode `npm run deploy` de novo. Os comandos slash ficam visiveis no Discord, mas o bot so deixa usar quem tem Administrator ou o cargo ADM configurado em `config.json`.
+Se `/configpix` nao aparecer ou disser que falta permissao, use `!configpix`: o bot manda um botao que abre o mesmo formulario. Rode `npm run deploy` de novo quando quiser corrigir os slash commands. Os comandos slash ficam visiveis no Discord, mas o bot so deixa usar quem tem Administrator ou o cargo ADM configurado em `config.json`.
 
 ## Fluxo do dono da loja
 
@@ -127,7 +127,7 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 ## Fluxo de atendimento
 
 1. Um ADM usa `/setup-atendimento` no canal da equipe.
-2. Cada ADM usa `/configpix` ou o botao **Configurar meu Pix**.
+2. Cada ADM usa `!configpix`, `/configpix` ou o botao **Configurar meu Pix**.
 3. O ADM salva nome de exibicao, chave Pix, QR Code opcional e mensagem extra.
 4. O ADM clica em **Ficar ON** quando puder receber vendas.
 5. Se houver um unico ADM ON, o bot assume a compra automaticamente para ele.

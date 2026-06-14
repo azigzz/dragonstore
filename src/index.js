@@ -240,6 +240,17 @@ function staffPanelRows() {
     )
   ];
 }
+function pixShortcutRows() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("staff:config")
+        .setLabel("Configurar meu Pix")
+        .setEmoji("💸")
+        .setStyle(ButtonStyle.Primary)
+    )
+  ];
+}
 async function refreshStaffPanel(guildId) {
   const staff = getStaffGuild(guildId);
   if (!staff.panelChannelId || !staff.panelMessageId) return false;
@@ -435,7 +446,7 @@ async function assumeOrder(interaction, id) {
 
   const profile = getStaffProfile(interaction.guildId, interaction.user.id);
   if (!profile?.pixKey) {
-    return interaction.reply({ content: "Configure seu Pix primeiro com `/configpix` ou no botão **Configurar meu Pix** do painel de atendimento.", ephemeral: true });
+    return interaction.reply({ content: "Configure seu Pix primeiro com `!configpix`, `/configpix` ou no botão **Configurar meu Pix** do painel de atendimento.", ephemeral: true });
   }
 
   const online = onlineStaffProfiles(interaction.guildId);
@@ -2131,7 +2142,14 @@ client.on("messageCreate", async message => {
   }
 
   if (content === `${config.prefix || "!"}configpix`) {
-    return message.reply("Use `/configpix` ou clique em **Configurar meu Pix** no painel de atendimento, porque o Discord só abre formulário por botão/comando slash.");
+    if (!isAdmin(message.member)) return message.reply("Só ADM pode configurar Pix.");
+    await message.delete().catch(() => null);
+    const reply = await message.channel.send({
+      content: `<@${message.author.id}> clique no botão abaixo para abrir o formulário do Pix. Se o Discord não mostrar os comandos com \`/\`, esse botão resolve.`,
+      components: pixShortcutRows()
+    });
+    setTimeout(() => reply.delete().catch(() => null), 2 * 60 * 1000);
+    return;
   }
 
   if (content === `${config.prefix || "!"}status-loja`) {
