@@ -6,8 +6,11 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 
 - Painel de loja com embed, banner, thumbnail, cor e menu de produtos.
 - Configurador por `/configds` ou `!configds`, com uma configuracao independente por canal.
-- Presets prontos: TFT Sets, Steam Keys e SMM.
+- Configurador novo com painel vazio por padrao, sem produtos fake.
+- Recuperacao de painel ja publicado quando o JSON local some em redeploy.
+- Presets prontos: Vazio, TFT Sets, Steam Keys e SMM.
 - Produto com nome, preco, descricao, estoque e foto individual.
+- Remocao de produtos em lote com selecao e botao de confirmacao.
 - Upload de imagem pelo Discord, sem precisar colar URL manualmente.
 - Mensagem estilo **Compre aqui** com botao Comprar e formulario editavel.
 - Edicao de produto existente sem precisar remover e recriar.
@@ -93,11 +96,12 @@ Se `/configpix` nao aparecer ou disser que falta permissao, use `!configpix`: o 
 4. Clique em **Editar produto** para trocar nome, preco, estoque, foto ou brindes.
 5. Use **Enviar imagem do painel** para mandar banner/thumbnail como anexo no Discord.
 6. Use **Enviar foto de produto** para escolher um produto e mandar a foto como anexo.
-7. Use **Presets** para aplicar TFT Sets, Steam Keys ou SMM naquele canal.
+7. Use **Presets** para aplicar Vazio, TFT Sets, Steam Keys ou SMM naquele canal.
 8. Clique em **Adicionar caixa surpresa** para cadastrar uma caixa de brindes digitais.
 9. Use **Preview** para conferir.
 10. Use **Publicar painel** para publicar ou reutilizar a mensagem salva quando possivel.
 11. Use **Atualizar publicado** para editar manualmente o painel que ja esta no chat.
+12. Use **Vincular painel** e cole o link/ID da mensagem se o Render perdeu o JSON e o bot nao encontrou o painel sozinho.
 
 Ao enviar imagem por arquivo, o bot salva uma copia da imagem em uma mensagem dele no Discord e grava a URL dessa copia no JSON.
 
@@ -110,6 +114,7 @@ No configurador, clique em **Presets** e escolha:
 - **TFT Sets**: cria os sets da lista TFT e ignora os textos `(xxx em estoque)`.
 - **Steam Keys**: cria Steam Key Black Premium, Ruby e 3x aleatorias.
 - **SMM**: cria seguidores, curtidas e visualizacoes.
+- **Vazio**: limpa os produtos e deixa o painel pronto para configurar do zero.
 
 Aplicar preset substitui os produtos do painel daquele canal. Banner, thumbnail e canal de publicacao sao preservados.
 
@@ -178,14 +183,19 @@ Os dados ficam em JSON dentro da pasta `data`:
 
 Em hospedagem gratis, esses arquivos podem sumir em redeploy/restart dependendo da plataforma. Para loja em producao, o proximo passo recomendado e migrar esses dados para Neon/PostgreSQL.
 
+Quando o painel publicado ainda existe no chat, o bot tenta recuperar automaticamente o embed e as opcoes do menu ao abrir `!configds` no mesmo canal ou quando um cliente clica no menu antigo. Se a mensagem estiver mais antiga, use **Vincular painel** no configurador e cole o link ou ID da mensagem publicada.
+
+A recuperacao pelo Discord preserva titulo, descricao, cor, banner, thumbnail, nome, preco, descricao curta e estoque que aparecem no menu publicado. Fotos individuais de produto e regras internas de caixa surpresa dependem do JSON/DB original.
+
 ## Como testar no Discord
 
 1. Rode `npm run deploy`.
 2. Rode `npm start`.
 3. Use `/configds` em dois canais diferentes e confirme que cada canal tem produtos/config separada.
-4. Aplique o preset TFT, publique o painel e abra um carrinho como cliente.
+4. Confirme que o `configds` novo abre vazio, aplique o preset TFT, publique o painel e abra um carrinho como cliente.
 5. Clique em **Editar compra**, confira as perguntas, publique a mensagem e teste o botao **Comprar**.
-6. Use `/setup-atendimento`, configure Pix com `/configpix` e fique ON.
-7. Abra outro carrinho e confirme se o Pix vai automaticamente quando houver um unico ADM ON.
-8. Adicione uma caixa surpresa, compre e finalize como ADM para verificar o sorteio.
-9. Use `/status-loja` no canal desejado para conferir o resumo daquele painel.
+6. Use **Remover produto**, selecione mais de um item e confirme a remocao.
+7. Use `/setup-atendimento`, configure Pix com `/configpix` e fique ON.
+8. Abra outro carrinho e confirme se o Pix vai automaticamente quando houver um unico ADM ON.
+9. Adicione uma caixa surpresa, compre e finalize como ADM para verificar o sorteio.
+10. Use `/status-loja` no canal desejado para conferir o resumo daquele painel.

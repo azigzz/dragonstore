@@ -573,31 +573,21 @@ function defaultPanel(guildId, scopeId = "default") {
     imageUrl: "",
     thumbnailUrl: "",
     quickOrder: defaultQuickOrder(),
-    description: `🛒 **Loja digital de packs prontos**\n\nEscolha o produto no menu abaixo e o bot abre um carrinho privado para atendimento.\n\n📦 **O que você encontra**\n\n🎥 **Packs de edição e cortes**\nConteúdo pronto para usar em reels, criativos e páginas de venda.\n\n💎 **Packs lifestyle premium**\nVídeos com estética de luxo, viagens, carros e rotina de alto padrão.\n\n🎁 **Caixa surpresa digital**\nBrindes digitais sorteados somente após a compra ser finalizada pelo ADM.\n\n✅ Atendimento manual\n✅ Pagamento via Pix do atendente\n✅ Entrega combinada no carrinho`,
-    products: [
-      { id: "p" + random7(), name: "250 Cortes de Filmes e Séries aleatórios", price: "R$ 1,00", description: "Conteúdo pronto para postar e reaproveitar", stock: "infinito" },
-      { id: "p" + random7(), name: "Pack de 100 Vídeos Lifestyle Rico", price: "R$ 1,00", description: "Vídeos de alto padrão para conteúdo", stock: "infinito" },
-      { id: "p" + random7(), name: "Pack de 20K Vídeos Lifestyle Rico", price: "R$ 5,00", description: "Pack grande para criativos e páginas", stock: "infinito" },
-      { id: "p" + random7(), name: "Pack de Edição de Vídeo", price: "R$ 5,00", description: "Vídeos ideais para edições e reels", stock: "infinito" },
-      {
-        id: "p" + random7(),
-        type: "mystery_box",
-        name: "Caixa Surpresa de Packs",
-        price: "R$ 0,10",
-        description: "Sorteia um brinde digital aleatório após a compra ser finalizada",
-        stock: "infinito",
-        rewards: [
-          { name: "Mini Pack de Cortes", description: "10 cortes aleatórios", weight: 70 },
-          { name: "Pack Lifestyle Pequeno", description: "20 vídeos lifestyle", weight: 20 },
-          { name: "Pack Premium de Edição", description: "Brinde premium de edição", weight: 8 },
-          { name: "Pack Grande Surpresa", description: "Brinde raro de conteúdo digital", weight: 2 }
-        ]
-      }
-    ],
+    description: `🛒 **Loja em configuracao**\n\nAdicione produtos, imagem, cor e canal pelo configurador.\n\nQuando tudo estiver pronto, clique em **Publicar painel** para enviar ou atualizar a mensagem da loja.`,
+    products: [],
     updatedAt: new Date().toISOString()
   };
 }
 const PRODUCT_PRESETS = {
+  empty: {
+    label: "Vazio",
+    title: "🐉 Dragon Store",
+    color: "#9b00ff",
+    description:
+      "🛒 **Loja em configuracao**\n\nAdicione produtos, imagem, cor e canal pelo configurador.\n\nQuando tudo estiver pronto, clique em **Publicar painel** para enviar ou atualizar a mensagem da loja.",
+    productDescription: "Produto da loja.",
+    items: []
+  },
   tft: {
     label: "TFT Sets",
     title: "Frosted TFT",
@@ -765,7 +755,7 @@ function getOrderPanel(order, guildId) {
   return (order?.panelId && getPanelById(guildId, order.panelId)) ||
     getPanel(guildId, order?.panelScopeId || order?.scopeId || "default");
 }
-function product(panel, id) { return panel.products.find(p => p.id === id); }
+function product(panel, id) { return (panel.products || []).find(p => p.id === id); }
 function normalizeProductInput({ name, price, description, stock, imageUrl }) {
   const cleanImage = clampText(imageUrl, 500);
   return {
@@ -946,6 +936,167 @@ function productSelect(panel, customId = `buy:${panel.id}`) {
   return new ActionRowBuilder().addComponents(menu);
 }
 function saleMessage(panel) { return { embeds: [panelEmbed(panel)], components: [productSelect(panel)] }; }
+function componentCustomId(component) {
+  return String(component?.customId || component?.data?.custom_id || component?.data?.customId || "");
+}
+function componentOptions(component) {
+  if (Array.isArray(component?.options)) return component.options;
+  if (Array.isArray(component?.data?.options)) return component.data.options;
+  return [];
+}
+function optionField(option, field) {
+  return option?.[field] ?? option?.data?.[field] ?? "";
+}
+function saleSelectComponentFromMessage(message) {
+  for (const row of message?.components || []) {
+    for (const component of row.components || []) {
+      if (componentCustomId(component).startsWith("buy:")) return component;
+    }
+  }
+  return null;
+}
+function quickBuyComponentFromMessage(message) {
+  for (const row of message?.components || []) {
+    for (const component of row.components || []) {
+      if (componentCustomId(component).startsWith("quickbuy:")) return component;
+    }
+  }
+  return null;
+}
+function panelIdFromComponentCustomId(customId) {
+  return String(customId || "").split(":")[1] || "";
+}
+function scopeIdFromPanelId(panelId, fallback = "default") {
+  const raw = String(panelId || "");
+  if (raw === "main") return "default";
+  if (raw.startsWith("panel_")) return raw.slice("panel_".length) || fallback;
+  return fallback;
+}
+function stripProductIcon(label) {
+  return String(label || "")
+    .replace(/^(🛒|🎁)\s*/u, "")
+    .trim() || "Produto";
+}
+function embedColorToHex(embed) {
+  if (typeof embed?.hexColor === "string") return normColor(embed.hexColor);
+  if (typeof embed?.color === "number") return `#${embed.color.toString(16).padStart(6, "0")}`;
+  return "#9b00ff";
+}
+function parseRecoveredProductOption(option) {
+  const fallbackId = `p${random7()}`;
+  const parts = String(optionField(option, "description") || "")
+    .split("|")
+    .map(part => part.trim())
+    .filter(Boolean);
+  const stockPart = parts.find(part => /^Estoque:/i.test(part));
+  const description = parts
+    .filter((part, index) => index > 0 && !/^Estoque:/i.test(part))
+    .join(" | ");
+
+  return {
+    id: clampText(optionField(option, "value") || fallbackId, 100, fallbackId),
+    name: clampText(stripProductIcon(optionField(option, "label")), 100, "Produto"),
+    price: clampText(parts[0] || "A combinar", 50, "A combinar"),
+    description: clampText(description || "Produto recuperado do painel publicado", 200, "Produto da loja"),
+    stock: clampText(stockPart ? stockPart.replace(/^Estoque:\s*/i, "") : "infinito", 50, "infinito"),
+    imageUrl: ""
+  };
+}
+function applyEmbedToPanel(panel, embed) {
+  if (!embed) return;
+  panel.title = embed.title || panel.title;
+  panel.description = embed.description || panel.description;
+  panel.color = embedColorToHex(embed);
+  panel.imageUrl = embed.image?.url || panel.imageUrl || "";
+  panel.thumbnailUrl = embed.thumbnail?.url || panel.thumbnailUrl || "";
+}
+function parseMessageReference(raw, fallbackChannelId) {
+  const text = String(raw || "").trim();
+  const link = text.match(/channels\/(\d{15,25})\/(\d{15,25})\/(\d{15,25})/);
+  if (link) return { guildId: link[1], channelId: link[2], messageId: link[3] };
+
+  const ids = text.match(/\d{15,25}/g) || [];
+  if (ids.length >= 2) return { channelId: ids[0], messageId: ids[1] };
+  if (ids.length === 1) return { channelId: fallbackChannelId, messageId: ids[0] };
+  return null;
+}
+function panelFromSaleMessage(message, guildId, scopeIdOverride = null) {
+  const select = saleSelectComponentFromMessage(message);
+  if (!select) return null;
+
+  const panelId = panelIdFromComponentCustomId(componentCustomId(select));
+  const scopeId = scopeIdOverride || scopeIdFromPanelId(panelId, message.channelId || "default");
+  const panel = defaultPanel(guildId, scopeId);
+  const options = componentOptions(select).filter(option => optionField(option, "value") && optionField(option, "value") !== "none");
+
+  panel.id = panelId || panel.id;
+  panel.channelId = message.channelId;
+  panel.publishedChannelId = message.channelId;
+  panel.publishedMessageId = message.id;
+  panel.products = options.map(parseRecoveredProductOption).slice(0, 25);
+  panel.recoveredAt = new Date().toISOString();
+  applyEmbedToPanel(panel, message.embeds?.[0]);
+
+  return panel;
+}
+function panelFromQuickOrderMessage(message, guildId, scopeIdOverride = null) {
+  const button = quickBuyComponentFromMessage(message);
+  if (!button) return null;
+
+  const panelId = panelIdFromComponentCustomId(componentCustomId(button));
+  const scopeId = scopeIdOverride || scopeIdFromPanelId(panelId, message.channelId || "default");
+  const panel = defaultPanel(guildId, scopeId);
+  const quick = quickOrderConfig(panel);
+  const embed = message.embeds?.[0];
+
+  panel.id = panelId || panel.id;
+  panel.channelId = message.channelId;
+  panel.quickOrder = {
+    ...quick,
+    title: embed?.title || quick.title,
+    description: embed?.description || quick.description,
+    publishedChannelId: message.channelId,
+    publishedMessageId: message.id
+  };
+  panel.recoveredAt = new Date().toISOString();
+  applyEmbedToPanel(panel, embed);
+
+  return panel;
+}
+async function recoverPanelFromPublishedMessage(message, guildId, scopeIdOverride = null) {
+  const panel = panelFromSaleMessage(message, guildId, scopeIdOverride);
+  if (!panel) return null;
+  savePanel(guildId, panel, panel.scopeId);
+  return panel;
+}
+async function recoverQuickOrderFromPublishedMessage(message, guildId, scopeIdOverride = null) {
+  const panel = panelFromQuickOrderMessage(message, guildId, scopeIdOverride);
+  if (!panel) return null;
+  savePanel(guildId, panel, panel.scopeId);
+  return panel;
+}
+function shouldAutoRecoverPanel(panel) {
+  return !panel?.publishedMessageId && !(panel?.products || []).length;
+}
+async function findRecoverableSalePanel(channel, guildId, scopeId) {
+  if (!channel?.messages?.fetch) return null;
+  const messages = await channel.messages.fetch({ limit: 75 }).catch(() => null);
+  if (!messages?.size) return null;
+
+  const sorted = [...messages.values()].sort((a, b) => {
+    const left = BigInt(a.id);
+    const right = BigInt(b.id);
+    if (right > left) return 1;
+    if (right < left) return -1;
+    return 0;
+  });
+  const found = sorted.find(message => {
+    const sameBot = !client.user?.id || message.author?.id === client.user.id;
+    return sameBot && saleSelectComponentFromMessage(message);
+  });
+
+  return found ? recoverPanelFromPublishedMessage(found, guildId, scopeId) : null;
+}
 async function resetSelectMessage(interaction, payload) {
   try {
     await interaction.message?.edit(payload);
@@ -1130,6 +1281,7 @@ ${lines}
 **Atualizar publicado** edita manualmente o painel que já está no chat.
 Use **Editar produto** para trocar nome, preço, estoque, foto e brindes.
 Use **Presets** para substituir os produtos só deste canal.
+Use **Vincular painel** se o Render perdeu o JSON e voce quer recuperar uma mensagem ja publicada.
 Use os botões de **Enviar imagem** para mandar arquivo direto no Discord, sem colar link.`);
 }
 function configRows(sessionId) {
@@ -1151,7 +1303,8 @@ function configRows(sessionId) {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`cfg:${sessionId}:mystery`).setLabel("Adicionar caixa surpresa").setEmoji("🎁").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`cfg:${sessionId}:edit`).setLabel("Editar produto").setEmoji("✏️").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`cfg:${sessionId}:reset`).setLabel("Resetar exemplo").setEmoji("♻️").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:${sessionId}:linkpanel`).setLabel("Vincular painel").setEmoji("🔗").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`cfg:${sessionId}:reset`).setLabel("Resetar vazio").setEmoji("♻️").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`cfg:${sessionId}:close`).setLabel("Fechar config").setEmoji("🔒").setStyle(ButtonStyle.Danger)
     ),
     new ActionRowBuilder().addComponents(
@@ -1178,7 +1331,10 @@ async function startConfig(channel, member, user) {
   if (!isAdmin(member)) return channel.send(`<@${user.id}> você precisa ser admin ou ter o cargo ADM configurado.`);
 
   const guildId = channel.guild.id;
-  const panel = getPanel(guildId, channel.id);
+  let panel = getPanel(guildId, channel.id);
+  if (shouldAutoRecoverPanel(panel)) {
+    panel = await findRecoverableSalePanel(channel, guildId, channel.id) || panel;
+  }
   const sessionId = sid();
   let msg = null;
 
@@ -1221,6 +1377,7 @@ function editModal(sessionId, field, panel) {
   );
   if (field === "color") modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("color").setLabel("Cor HEX").setPlaceholder("#9b00ff").setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(true).setValue(String(panel.color || "#9b00ff"))));
   if (field === "channel") modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("channel").setLabel("ID do canal de publicação").setPlaceholder("Cole o ID do canal").setStyle(TextInputStyle.Short).setMaxLength(30).setRequired(false).setValue(String(panel.channelId || ""))));
+  if (field === "linkpanel") modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("messageRef").setLabel("Link ou ID da mensagem publicada").setPlaceholder("Cole o link da mensagem antiga do painel").setStyle(TextInputStyle.Short).setMaxLength(200).setRequired(true)));
   if (field === "add") modal.addComponents(
     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("name").setLabel("Nome do produto").setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(true)),
     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("price").setLabel("Valor").setPlaceholder("R$ 5,00").setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true)),
@@ -1399,7 +1556,7 @@ function presetMenu(sessionId) {
       .setMaxValues(1)
       .addOptions(Object.entries(PRODUCT_PRESETS).map(([value, preset]) => ({
         label: preset.label,
-        description: `${preset.items.length} produtos cadastrados automaticamente`,
+        description: value === "empty" ? "Limpa os produtos e deixa o painel pronto para configurar" : `${preset.items.length} produtos cadastrados automaticamente`,
         value
       })))
   );
@@ -1489,12 +1646,49 @@ async function queueImageUpload(interaction, sessionId, pending) {
     ephemeral: true
   });
 }
+function removeProductRows(sessionId, panel, selectedIds = []) {
+  const products = (panel.products || []).slice(0, 25);
+  const selected = new Set(selectedIds);
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`remove:${sessionId}`)
+    .setPlaceholder("Selecione os produtos para remover")
+    .setMinValues(1)
+    .setMaxValues(Math.max(1, products.length))
+    .addOptions(products.map(p => ({
+      label: `${productIcon(p)} ${String(p.name).slice(0, 95)}`,
+      description: productOptionDescription(p),
+      value: p.id,
+      default: selected.has(p.id)
+    })));
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`rmconfirm:${sessionId}`)
+      .setLabel(`Remover (${selected.size})`)
+      .setEmoji("🗑️")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(selected.size === 0),
+    new ButtonBuilder()
+      .setCustomId(`rmcancel:${sessionId}`)
+      .setLabel("Cancelar")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return [new ActionRowBuilder().addComponents(menu), buttons];
+}
+function selectedProductNames(panel, ids) {
+  const wanted = new Set(ids || []);
+  return (panel.products || [])
+    .filter(p => wanted.has(p.id))
+    .map(p => `• ${productIcon(p)} ${p.name}`)
+    .join("\n");
+}
 async function handleConfigButton(interaction) {
   const [, sessionId, action] = interaction.customId.split(":");
   const s = await sessionOrReply(interaction, sessionId);
   if (!s) return;
   const panel = getPanel(s.guildId, s.scopeId);
-  if (["title", "desc", "image", "color", "channel", "add", "mystery"].includes(action)) return interaction.showModal(editModal(sessionId, action, panel));
+  if (["title", "desc", "image", "color", "channel", "linkpanel", "add", "mystery"].includes(action)) return interaction.showModal(editModal(sessionId, action, panel));
   if (action === "preview") return interaction.reply({ content: "Preview:", ...saleMessage(panel), ephemeral: true });
   if (action === "preset") {
     return interaction.reply({ content: "Escolha o preset. Isso substitui os produtos atuais deste canal.", components: [presetMenu(sessionId)], ephemeral: true });
@@ -1554,8 +1748,8 @@ async function handleConfigButton(interaction) {
   }
   if (action === "remove") {
     if (!panel.products.length) return interaction.reply({ content: "Não tem produto para remover.", ephemeral: true });
-    const menu = new StringSelectMenuBuilder().setCustomId(`remove:${sessionId}`).setPlaceholder("Produto para remover").setMinValues(1).setMaxValues(1).addOptions(panel.products.slice(0,25).map(p => ({ label: `${productIcon(p)} ${String(p.name).slice(0,95)}`, description: isMysteryBox(p) ? `Caixa surpresa | Valor: ${p.price}`.slice(0,100) : `Valor: ${p.price}`.slice(0,100), value: p.id })));
-    return interaction.reply({ content: "Escolha o produto:", components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+    s.removeIds = [];
+    return interaction.reply({ content: "Selecione um ou mais produtos e confirme para remover.", components: removeProductRows(sessionId, panel), ephemeral: true });
   }
   if (action === "reset") {
     const resetPanel = defaultPanel(s.guildId, s.scopeId);
@@ -1563,7 +1757,7 @@ async function handleConfigButton(interaction) {
     resetPanel.configMessageId = s.messageId;
     savePanel(s.guildId, resetPanel, s.scopeId);
     await refreshConfig(sessionId);
-    return interaction.reply({ content: "Resetado para o exemplo da Dragon Store.", ephemeral: true });
+    return interaction.reply({ content: "Painel resetado para vazio.", ephemeral: true });
   }
   if (action === "close") {
     sessions.delete(sessionId);
@@ -1588,6 +1782,36 @@ async function handleModal(interaction) {
     const channel = interaction.fields.getTextInputValue("channel").trim();
     if (channel && !/^\d{15,25}$/.test(channel)) return interaction.reply({ content: "ID de canal inválido.", ephemeral: true });
     panel.channelId = channel;
+  }
+  if (field === "linkpanel") {
+    const ref = parseMessageReference(interaction.fields.getTextInputValue("messageRef"), panel.publishedChannelId || panel.channelId || interaction.channelId);
+    if (!ref?.messageId || !ref?.channelId) {
+      return interaction.reply({ content: "Cole um link de mensagem do Discord ou o ID da mensagem publicada.", ephemeral: true });
+    }
+    if (ref.guildId && ref.guildId !== interaction.guildId) {
+      return interaction.reply({ content: "Essa mensagem parece ser de outro servidor.", ephemeral: true });
+    }
+
+    const ch = await interaction.guild.channels.fetch(ref.channelId).catch(() => null);
+    if (!ch || !ch.isTextBased()) {
+      return interaction.reply({ content: "Nao achei o canal dessa mensagem. Confira o link/ID e as permissoes do bot.", ephemeral: true });
+    }
+
+    const msg = await ch.messages.fetch(ref.messageId).catch(() => null);
+    if (!msg) {
+      return interaction.reply({ content: "Nao achei essa mensagem no canal informado.", ephemeral: true });
+    }
+
+    const recovered = await recoverPanelFromPublishedMessage(msg, s.guildId, s.scopeId);
+    if (!recovered) {
+      return interaction.reply({ content: "Essa mensagem nao parece ser um painel de produtos publicado por este bot.", ephemeral: true });
+    }
+
+    recovered.configMessageChannelId = s.channelId;
+    recovered.configMessageId = s.messageId;
+    savePanel(s.guildId, recovered, s.scopeId);
+    await refreshConfig(sessionId);
+    return interaction.reply({ content: `Painel vinculado e recuperado de <#${ch.id}> com **${recovered.products.length}** produtos.`, ephemeral: true });
   }
   if (field === "quickedit") {
     const oldQuick = quickOrderConfig(panel);
@@ -1661,10 +1885,40 @@ async function handleRemove(interaction) {
   const s = await sessionOrReply(interaction, sessionId);
   if (!s) return;
   const panel = getPanel(s.guildId, s.scopeId);
-  panel.products = panel.products.filter(p => p.id !== interaction.values[0]);
+  s.removeIds = interaction.values;
+  const picked = selectedProductNames(panel, s.removeIds) || "Nenhum produto selecionado.";
+  return interaction.update({
+    content: `Produtos marcados para remocao:\n${picked}`,
+    components: removeProductRows(sessionId, panel, s.removeIds)
+  });
+}
+async function handleRemoveConfirm(interaction) {
+  const [, sessionId] = interaction.customId.split(":");
+  const s = await sessionOrReply(interaction, sessionId);
+  if (!s) return;
+
+  const ids = Array.isArray(s.removeIds) ? s.removeIds : [];
+  if (!ids.length) {
+    return interaction.reply({ content: "Selecione pelo menos um produto antes de confirmar.", ephemeral: true });
+  }
+
+  const panel = getPanel(s.guildId, s.scopeId);
+  const before = panel.products.length;
+  const removeSet = new Set(ids);
+  panel.products = panel.products.filter(p => !removeSet.has(p.id));
+  const removed = before - panel.products.length;
+
   savePanel(s.guildId, panel, s.scopeId);
+  s.removeIds = [];
   await refreshConfig(sessionId);
-  return interaction.update({ content: "Produto removido.", components: [] });
+  return interaction.update({ content: `${removed} produto(s) removido(s).`, components: [] });
+}
+async function handleRemoveCancel(interaction) {
+  const [, sessionId] = interaction.customId.split(":");
+  const s = await sessionOrReply(interaction, sessionId);
+  if (!s) return;
+  s.removeIds = [];
+  return interaction.update({ content: "Remocao cancelada.", components: [] });
 }
 async function handleEditProduct(interaction) {
   const [, sessionId] = interaction.customId.split(":");
@@ -1816,8 +2070,15 @@ function buildStoreStatusEmbed(guildId, scopeId = "default") {
 }
 async function openCart(interaction) {
   const [, panelId] = interaction.customId.split(":");
-  const panel = getPanelById(interaction.guildId, panelId);
-  if (!panel) return interaction.reply({ content: "Painel antigo. Peça para um admin publicar de novo.", ephemeral: true });
+  let panel = getPanelById(interaction.guildId, panelId);
+  if (!panel || !product(panel, interaction.values[0])) {
+    panel = await recoverPanelFromPublishedMessage(
+      interaction.message,
+      interaction.guildId,
+      panel?.scopeId || scopeIdFromPanelId(panelId, interaction.channelId)
+    ) || panel;
+  }
+  if (!panel) return interaction.reply({ content: "Painel antigo. Use `!configds`, clique em **Vincular painel** e cole o link desta mensagem.", ephemeral: true });
   const p = product(panel, interaction.values[0]);
   if (!p) return interaction.reply({ content: "Produto não encontrado.", ephemeral: true });
   await resetSelectMessage(interaction, saleMessage(panel));
@@ -1871,8 +2132,9 @@ async function openCart(interaction) {
   return interaction.reply({ content: `Carrinho criado: ${ch}`, ephemeral: true });
 }
 async function handleQuickBuyButton(interaction, panelId) {
-  const panel = getPanelById(interaction.guildId, panelId);
-  if (!panel) return interaction.reply({ content: "Mensagem de compra antiga. Peça para um admin publicar de novo.", ephemeral: true });
+  const panel = getPanelById(interaction.guildId, panelId) ||
+    await recoverQuickOrderFromPublishedMessage(interaction.message, interaction.guildId, scopeIdFromPanelId(panelId, interaction.channelId));
+  if (!panel) return interaction.reply({ content: "Mensagem de compra antiga. Use `!configds` e publique a mensagem de compra de novo.", ephemeral: true });
   return interaction.showModal(quickOrderBuyModal(panel));
 }
 function quickOrderAnswersEmbed(order, panel) {
@@ -2191,6 +2453,8 @@ client.on("interactionCreate", async interaction => {
       }
     }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith("rmconfirm:")) return handleRemoveConfirm(interaction);
+      if (interaction.customId.startsWith("rmcancel:")) return handleRemoveCancel(interaction);
       if (interaction.customId.startsWith("cfg:")) return handleConfigButton(interaction);
       if (interaction.customId.startsWith("staff:")) return handleStaffButton(interaction);
       if (interaction.customId.startsWith("quickbuy:")) {
