@@ -4,8 +4,8 @@ import { motion } from "framer-motion";
 import { ArrowRight, BadgeCheck, Headphones, Search, ShieldCheck, ShoppingCart, Sparkles, WalletCards } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import CartDrawer, { type CartItem } from "@/components/CartDrawer";
+import CategoryCard from "@/components/CategoryCard";
 import Header from "@/components/Header";
-import ProductCard from "@/components/ProductCard";
 import type { SiteConfig, StoreData, StoreProduct } from "@/lib/types";
 
 type StorefrontProps = {
@@ -20,22 +20,26 @@ export default function Storefront({ store, config }: StorefrontProps) {
   const [cartOpen, setCartOpen] = useState(false);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [query, setQuery] = useState("");
-  const [notice, setNotice] = useState("");
   const heroImage = store.imageUrl || config.heroImageUrl || "/dragon-store-hero.png";
+  const categories = store.categories?.length ? store.categories : [];
   const products = store.products || [];
   const cartCount = cart.reduce((total, item) => total + item.quantity, 0);
   const trust = useMemo(() => config.trustBadges.slice(0, 5), [config.trustBadges]);
-  const productCountText = `${products.length} ${products.length === 1 ? "produto disponivel" : "produtos disponiveis"} para atendimento.`;
-  const filteredProducts = useMemo(() => {
+  const productCountText = `${categories.length} ${categories.length === 1 ? "secao" : "secoes"} e ${products.length} ${products.length === 1 ? "produto" : "produtos"} no catalogo.`;
+  const filteredCategories = useMemo(() => {
     const term = query.trim().toLowerCase();
-    if (!term) return products;
-    return products.filter(product => {
-      return [product.name, product.description, product.price, product.stock]
+    if (!term) return categories;
+    return categories.filter(category => {
+      return [
+        category.title,
+        category.description,
+        ...category.products.map(product => `${product.name} ${product.description} ${product.price}`)
+      ]
         .join(" ")
         .toLowerCase()
         .includes(term);
     });
-  }, [products, query]);
+  }, [categories, query]);
 
   useEffect(() => {
     try {
@@ -50,12 +54,6 @@ export default function Storefront({ store, config }: StorefrontProps) {
     window.localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(cart));
   }, [cart]);
 
-  useEffect(() => {
-    if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(""), 2200);
-    return () => window.clearTimeout(timer);
-  }, [notice]);
-
   function addProduct(product: StoreProduct) {
     setCart(current => {
       const existing = current.find(item => item.product.id === product.id);
@@ -64,7 +62,6 @@ export default function Storefront({ store, config }: StorefrontProps) {
       }
       return [...current, { product, quantity: 1 }];
     });
-    setNotice(`${product.name} adicionado ao carrinho.`);
   }
 
   function decreaseProduct(productId: string) {
@@ -107,10 +104,10 @@ export default function Storefront({ store, config }: StorefrontProps) {
             </p>
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
               <a
-                href="#produtos"
+                href="#categorias"
                 className="inline-flex h-12 items-center justify-center gap-2 rounded-md bg-emerald-300 px-5 text-sm font-black text-black transition hover:bg-cyan-200"
               >
-                Ver produtos
+                Ver categorias
                 <ArrowRight className="h-4 w-4" />
               </a>
               {config.discordInviteUrl ? (
@@ -144,12 +141,12 @@ export default function Storefront({ store, config }: StorefrontProps) {
         </div>
       </section>
 
-      <section id="produtos" className="bg-[#07090f] py-14 sm:py-20">
+      <section id="categorias" className="bg-[#07090f] py-14 sm:py-20">
         <div className="dragon-container">
           <div className="mb-8 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
               <p className="text-sm font-bold uppercase text-emerald-200">Catalogo</p>
-              <h2 className="mt-2 text-3xl font-black text-white">Produtos digitais</h2>
+              <h2 className="mt-2 text-3xl font-black text-white">Categorias da loja</h2>
               <p className="mt-2 text-sm text-slate-400">{productCountText}</p>
             </div>
             <label className="relative w-full sm:max-w-sm">
@@ -157,26 +154,25 @@ export default function Storefront({ store, config }: StorefrontProps) {
               <input
                 value={query}
                 onChange={event => setQuery(event.target.value)}
-                placeholder="Buscar produto"
+                placeholder="Buscar categoria ou produto"
                 className="h-11 w-full rounded-md border border-white/10 bg-white/[.06] pl-10 pr-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-emerald-300/50"
               />
             </label>
           </div>
 
-          {filteredProducts.length ? (
+          {filteredCategories.length ? (
             <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-              {filteredProducts.map(product => (
-                <ProductCard
-                  key={product.id}
-                  product={product}
+              {filteredCategories.map(category => (
+                <CategoryCard
+                  key={category.id}
+                  category={category}
                   fallbackImage={heroImage}
-                  onAdd={addProduct}
                 />
               ))}
             </div>
           ) : (
             <div className="rounded-lg border border-dashed border-white/15 p-8 text-slate-300">
-              Nenhum produto encontrado nessa busca.
+              Nenhuma categoria encontrada nessa busca.
             </div>
           )}
         </div>
@@ -185,9 +181,9 @@ export default function Storefront({ store, config }: StorefrontProps) {
       <section className="border-t border-white/10 bg-[#090d15] py-12">
         <div className="dragon-container grid gap-4 md:grid-cols-3">
           {[
-            ["1", "Monte seu pedido", "Adicione os produtos desejados ao carrinho."],
-            ["2", "Copie o resumo", "O site gera um codigo organizado para atendimento."],
-            ["3", "Finalize no Discord", "Abra o servidor e envie o pedido para a equipe."]
+            ["1", "Escolha a secao", "Abra a categoria que tem o produto desejado."],
+            ["2", "Monte seu pedido", "Adicione itens ao carrinho e confira o total."],
+            ["3", "Finalize no Discord", "Copie o resumo e fale com a equipe no servidor."]
           ].map(([step, title, text]) => (
             <div key={step} className="rounded-lg border border-white/10 bg-white/[.04] p-5">
               <span className="flex h-9 w-9 items-center justify-center rounded-md bg-emerald-300 text-sm font-black text-black">{step}</span>
@@ -226,16 +222,6 @@ export default function Storefront({ store, config }: StorefrontProps) {
         onRemove={removeProduct}
         onClear={() => setCart([])}
       />
-
-      {notice ? (
-        <button
-          type="button"
-          onClick={() => setCartOpen(true)}
-          className="fixed bottom-4 left-1/2 z-40 w-[calc(100%-32px)] max-w-md -translate-x-1/2 rounded-lg border border-emerald-300/30 bg-[#10141f] px-4 py-3 text-left text-sm font-bold text-emerald-100 shadow-neon transition hover:bg-[#151b29]"
-        >
-          {notice} <span className="text-white">Ver carrinho</span>
-        </button>
-      ) : null}
     </main>
   );
 }

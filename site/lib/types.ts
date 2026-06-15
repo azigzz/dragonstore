@@ -8,6 +8,19 @@ export type StoreProduct = {
   type?: string;
 };
 
+export type StoreCategory = {
+  id: string;
+  panelId?: string;
+  scopeId?: string;
+  title: string;
+  description: string;
+  imageUrl?: string;
+  thumbnailUrl?: string;
+  color?: string;
+  minPrice?: number | null;
+  products: StoreProduct[];
+};
+
 export type StoreData = {
   storeName: string;
   title: string;
@@ -17,6 +30,7 @@ export type StoreData = {
   color: string;
   discordInviteUrl?: string;
   ticketChannelId?: string;
+  categories?: StoreCategory[];
   products: StoreProduct[];
   updatedAt?: string;
   source?: "bot" | "fallback";
@@ -35,6 +49,7 @@ export type SiteConfig = {
   primaryColor: string;
   heroImageUrl: string;
   trustBadges: string[];
+  fallbackCategories?: StoreCategory[];
   fallbackProducts?: StoreProduct[];
 };
 

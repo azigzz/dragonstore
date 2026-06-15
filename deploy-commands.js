@@ -21,12 +21,30 @@ const commands = [
     .setName("setup-atendimento")
     .setDescription("Cria/atualiza o painel ON/OFF dos ADMs e recebedores Pix."),
   new SlashCommandBuilder()
+    .setName("setupsucess")
+    .setDescription("Define este canal como feed de vendas concluidas.")
+    .addBooleanOption(option =>
+      option
+        .setName("ativo")
+        .setDescription("Ativa ou desativa o envio de vendas concluidas neste canal.")
+        .setRequired(false)
+    )
+    .addRoleOption(option =>
+      option
+        .setName("cargo-cliente")
+        .setDescription("Cargo que o cliente recebe quando a compra for finalizada.")
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName("configpix")
     .setDescription("Configura seu nome, chave Pix e QR Code para assumir compras."),
   new SlashCommandBuilder()
     .setName("status-loja")
-    .setDescription("Mostra a configuração atual da loja.")
-].map(c => c.toJSON());
+    .setDescription("Mostra a configuracao atual da loja."),
+  new SlashCommandBuilder()
+    .setName("ranking-gastos")
+    .setDescription("Mostra o ranking de clientes por valor gasto.")
+].map(command => command.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(token);
 

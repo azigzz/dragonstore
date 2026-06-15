@@ -24,6 +24,9 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - Caixa surpresa de brindes digitais com pesos/chances, sorteada somente ao finalizar a compra.
 - Ticket de suporte privado.
 - `/status-loja` com produtos, carrinhos abertos, vendas fechadas, faturamento estimado e ADMs online.
+- `/setupsucess` para definir o canal publico de vendas entregues, com nome do cliente mascarado.
+- `/ranking-gastos` com ranking paginado de gastos por dia, semana, mes e ano.
+- Cancelamento de compra pelo cliente ou ADM e limpeza automatica de carrinhos finalizados apos 3 dias.
 
 ## Instalar
 
@@ -40,7 +43,7 @@ DISCORD_TOKEN=token_do_bot
 CLIENT_ID=id_da_aplicacao
 GUILD_ID=id_do_servidor
 PUBLIC_STORE_API_TOKEN=gere_um_token_grande_e_dificil
-DISCORD_INVITE_URL=https://discord.gg/rapp28qmR4
+DISCORD_INVITE_URL=https://discord.gg/Y2MqnVwXnq
 # opcionais para escolher/recuperar painel antigo
 PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
 PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado
@@ -66,6 +69,10 @@ No Discord:
 /configpix
 !configpix
 /setup-ticket
+/setupsucess
+!setupsucess
+/ranking-gastos
+!ranking-gastos
 /status-loja
 !status-loja
 ```
@@ -90,7 +97,7 @@ Start Command:
 npm start
 ```
 
-Depois de mudar slash commands em `deploy-commands.js`, rode `npm run deploy` ou redeploy no Render. As melhorias atuais usam comandos ja existentes, mas ainda e recomendado redeployar para subir o codigo novo.
+Depois de mudar slash commands em `deploy-commands.js`, rode `npm run deploy` ou redeploy no Render. Esta versao adiciona comandos novos, entao o deploy dos slash commands e necessario.
 
 Se `/configpix` nao aparecer ou disser que falta permissao, use `!configpix`: o bot manda um botao que abre o mesmo formulario. Rode `npm run deploy` de novo quando quiser corrigir os slash commands. Os comandos slash ficam visiveis no Discord, mas o bot so deixa usar quem tem Administrator ou o cargo ADM configurado em `config.json`.
 
@@ -105,7 +112,7 @@ GET /api/public-store
 Authorization: Bearer PUBLIC_STORE_API_TOKEN
 ```
 
-Esse endpoint retorna apenas dados publicos da loja: titulo, descricao, cor, imagens, link do Discord e produtos. Ele junta produtos dos paineis salvos do servidor e nao retorna pedidos, Pix, tokens ou dados internos.
+Esse endpoint retorna apenas dados publicos da loja: titulo, descricao, cor, imagens, link do Discord, categorias e produtos. Cada painel publicado vira uma categoria do site com descricao, imagem e menor preco. Ele nao retorna pedidos, Pix, tokens ou dados internos.
 
 Se o JSON local perdeu os produtos, mas a mensagem publicada ainda existe no Discord, configure `PUBLIC_STORE_CHANNEL_ID` e `PUBLIC_STORE_MESSAGE_ID` no Render para o bot recuperar esse painel quando a API do site for chamada.
 
@@ -168,6 +175,16 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 6. Se houver dois ou mais ADMs ON, o primeiro que clicar em **Assumir compra** fica responsavel.
 7. Depois de assumida, o bot libera **Reenviar Pix**.
 
+## Vendas concluidas e ranking
+
+1. Crie ou escolha um canal publico para mostrar compras entregues.
+2. Use `/setupsucess` nesse canal. Se quiser, informe o cargo cliente na opcao `cargo-cliente`.
+3. Quando um ADM clicar em **Finalizar compra**, o bot manda uma mensagem no canal com o nome do cliente mascarado, adiciona o cargo cliente e salva o gasto.
+4. Use `/ranking-gastos` para ver o ranking por dia, semana, mes ou ano, com 10 clientes por pagina.
+5. Se o slash command ainda nao aparecer, use `!setupsucess` e `!ranking-gastos`.
+
+Carrinhos finalizados ou cancelados ficam visiveis para historico por 3 dias e depois sao apagados automaticamente. Para mudar esse tempo, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
+
 ## Caixa surpresa
 
 A caixa surpresa e apenas para brinde digital, produto, pack ou cupom. Nao use Pix, saldo real, dinheiro real ou premio financeiro.
@@ -191,6 +208,7 @@ Os IDs ficam em `config.json`:
 ```json
 {
   "adminRoleId": "1515799363149103142",
+  "customerRoleId": "cargo_cliente_opcional",
   "categories": {
     "cartOpen": "1515799366760141033",
     "closed": "1515813300862980268",
@@ -198,6 +216,9 @@ Os IDs ficam em `config.json`:
   },
   "ticketPanel": {
     "channelId": "1515799364574904531"
+  },
+  "settings": {
+    "deleteClosedCartAfterSeconds": 259200
   }
 }
 ```

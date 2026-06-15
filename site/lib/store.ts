@@ -1,6 +1,17 @@
 import fallbackStore from "@/data/fallback-store.json";
 import { readSiteConfig, saveSiteConfig } from "@/lib/config";
-import type { SiteConfig, StoreData, StoreProduct } from "@/lib/types";
+import { parsePrice } from "@/lib/money";
+import type { SiteConfig, StoreCategory, StoreData, StoreProduct } from "@/lib/types";
+
+function slugify(value: string) {
+  return String(value || "categoria")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 80) || "categoria";
+}
 
 function normalizeProducts(products: unknown, defaultImage: string): StoreProduct[] {
   if (!Array.isArray(products)) return [];
@@ -18,11 +29,78 @@ function normalizeProducts(products: unknown, defaultImage: string): StoreProduc
         type: product.type ? String(product.type) : "normal"
       };
     })
-    .slice(0, 25);
+    .slice(0, 200);
+}
+
+function minProductPrice(products: StoreProduct[]) {
+  const values = products
+    .map(product => parsePrice(product.price))
+    .filter((value): value is number => value !== null);
+  return values.length ? Math.min(...values) : null;
+}
+
+function normalizeCategories(categories: unknown, defaultImage: string, fallbackTitle = "Catalogo"): StoreCategory[] {
+  if (!Array.isArray(categories)) return [];
+  const seen = new Set<string>();
+  return categories
+    .filter(Boolean)
+    .map((item, index) => {
+      const category = item as Partial<StoreCategory>;
+      const title = String(category.title || `${fallbackTitle} ${index + 1}`);
+      const idBase = String(category.id || category.scopeId || category.panelId || title);
+      let id = slugify(idBase);
+      let suffix = 2;
+      while (seen.has(id)) id = `${slugify(idBase)}-${suffix++}`;
+      seen.add(id);
+
+      const image = category.imageUrl ? String(category.imageUrl) : defaultImage;
+      const products = normalizeProducts(category.products, image);
+      return {
+        id,
+        panelId: category.panelId ? String(category.panelId) : undefined,
+        scopeId: category.scopeId ? String(category.scopeId) : undefined,
+        title,
+        description: String(category.description || "Produtos digitais da Dragon Store"),
+        imageUrl: image,
+        thumbnailUrl: category.thumbnailUrl ? String(category.thumbnailUrl) : "",
+        color: category.color ? String(category.color) : undefined,
+        minPrice: typeof category.minPrice === "number" ? category.minPrice : minProductPrice(products),
+        products
+      };
+    })
+    .filter(category => category.products.length)
+    .slice(0, 50);
+}
+
+function categoryFromProducts(products: StoreProduct[], store: Pick<StoreData, "title" | "description" | "imageUrl" | "color">): StoreCategory[] {
+  if (!products.length) return [];
+  return [{
+    id: slugify(store.title || "catalogo"),
+    title: store.title || "Catalogo Dragon Store",
+    description: store.description || "Produtos digitais da Dragon Store",
+    imageUrl: store.imageUrl || "/dragon-store-hero.png",
+    color: store.color,
+    minPrice: minProductPrice(products),
+    products
+  }];
 }
 
 function fallbackData(config: SiteConfig, message?: string): StoreData {
   const image = config.heroImageUrl || fallbackStore.imageUrl || "/dragon-store-hero.png";
+  const fallbackCategories = (fallbackStore as { categories?: unknown }).categories;
+  const categories = normalizeCategories(config.fallbackCategories || fallbackCategories, image, fallbackStore.title);
+  const products = categories.length
+    ? categories.flatMap(category => category.products)
+    : normalizeProducts(config.fallbackProducts || fallbackStore.products, image);
+  const finalCategories = categories.length
+    ? categories
+    : categoryFromProducts(products, {
+        title: config.heroTitle || fallbackStore.title,
+        description: config.heroText || fallbackStore.description,
+        imageUrl: image,
+        color: config.primaryColor || fallbackStore.color
+      });
+
   return {
     storeName: config.storeName || fallbackStore.storeName,
     title: config.heroTitle || fallbackStore.title,
@@ -32,7 +110,8 @@ function fallbackData(config: SiteConfig, message?: string): StoreData {
     color: config.primaryColor || fallbackStore.color,
     discordInviteUrl: config.discordInviteUrl || fallbackStore.discordInviteUrl,
     ticketChannelId: fallbackStore.ticketChannelId,
-    products: normalizeProducts(config.fallbackProducts || fallbackStore.products, image),
+    categories: finalCategories,
+    products,
     source: "fallback",
     sourceMessage: message || "Usando produtos fallback."
   };
@@ -40,8 +119,24 @@ function fallbackData(config: SiteConfig, message?: string): StoreData {
 
 function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
   const image = raw.imageUrl || config.heroImageUrl || "/dragon-store-hero.png";
+  const fallbackCategoriesSource = (fallbackStore as { categories?: unknown }).categories;
   const botProducts = normalizeProducts(raw.products, image);
+  const botCategories = normalizeCategories(raw.categories, image, raw.title);
   const fallbackProducts = normalizeProducts(config.fallbackProducts || fallbackStore.products, image);
+  const fallbackCategories = normalizeCategories(config.fallbackCategories || fallbackCategoriesSource, image, raw.title || config.heroTitle);
+  const products = botCategories.length ? botCategories.flatMap(category => category.products) : botProducts;
+  const finalProducts = products.length ? products : fallbackProducts;
+  const finalCategories = botCategories.length
+    ? botCategories
+    : fallbackCategories.length
+      ? fallbackCategories
+      : categoryFromProducts(finalProducts, {
+          title: raw.title || config.heroTitle,
+          description: raw.description || config.heroText,
+          imageUrl: image,
+          color: raw.color || config.primaryColor
+        });
+
   return {
     storeName: config.storeName || raw.storeName || "Dragon Store",
     title: raw.title || config.heroTitle,
@@ -51,7 +146,8 @@ function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
     color: raw.color || config.primaryColor,
     discordInviteUrl: config.discordInviteUrl || raw.discordInviteUrl || "",
     ticketChannelId: raw.ticketChannelId || "",
-    products: botProducts.length ? botProducts : fallbackProducts,
+    categories: finalCategories,
+    products: finalProducts,
     updatedAt: raw.updatedAt,
     source: "bot",
     sourceMessage: "Produtos sincronizados do bot."
@@ -90,6 +186,7 @@ export async function syncFallbackFromBot() {
   const config = await readSiteConfig();
   const botStore = mergeBotData(await fetchBotStore(config), config);
   await saveSiteConfig({
+    fallbackCategories: botStore.categories,
     fallbackProducts: botStore.products,
     heroImageUrl: botStore.imageUrl || config.heroImageUrl,
     primaryColor: botStore.color || config.primaryColor

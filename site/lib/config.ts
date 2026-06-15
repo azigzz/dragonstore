@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import baseConfig from "@/data/site-config.json";
 import fallbackStore from "@/data/fallback-store.json";
-import type { AdminConfigPayload, SiteConfig, StoreProduct } from "@/lib/types";
+import type { AdminConfigPayload, SiteConfig, StoreCategory, StoreProduct } from "@/lib/types";
 
 const CONFIG_PATH = path.join(process.cwd(), "data", "site-config.json");
 const RUNTIME_CONFIG_PATH = path.join(process.cwd(), "data", "site-config.runtime.json");
@@ -26,6 +26,30 @@ function asProducts(value: unknown): StoreProduct[] {
     .slice(0, 25);
 }
 
+function asCategories(value: unknown): StoreCategory[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(Boolean)
+    .map((item, index) => {
+      const category = item as Partial<StoreCategory>;
+      const products = asProducts(category.products);
+      return {
+        id: String(category.id || `categoria-${index + 1}`),
+        panelId: category.panelId ? String(category.panelId) : undefined,
+        scopeId: category.scopeId ? String(category.scopeId) : undefined,
+        title: String(category.title || `Categoria ${index + 1}`).slice(0, 120),
+        description: String(category.description || "Produtos digitais da Dragon Store").slice(0, 1200),
+        imageUrl: category.imageUrl ? String(category.imageUrl).slice(0, 500) : "/dragon-store-hero.png",
+        thumbnailUrl: category.thumbnailUrl ? String(category.thumbnailUrl).slice(0, 500) : "",
+        color: category.color ? normalizeColor(String(category.color)) : undefined,
+        minPrice: typeof category.minPrice === "number" ? category.minPrice : null,
+        products
+      };
+    })
+    .filter(category => category.products.length)
+    .slice(0, 50);
+}
+
 function cleanConfig(input: Partial<SiteConfig>): Partial<SiteConfig> {
   const output: Partial<SiteConfig> = {};
   if (typeof input.storeName === "string") output.storeName = input.storeName.slice(0, 80);
@@ -41,6 +65,7 @@ function cleanConfig(input: Partial<SiteConfig>): Partial<SiteConfig> {
   if (Array.isArray(input.trustBadges)) {
     output.trustBadges = input.trustBadges.map(item => String(item).slice(0, 60)).filter(Boolean).slice(0, 8);
   }
+  if (Array.isArray(input.fallbackCategories)) output.fallbackCategories = asCategories(input.fallbackCategories);
   if (Array.isArray(input.fallbackProducts)) output.fallbackProducts = asProducts(input.fallbackProducts);
   return output;
 }
@@ -88,6 +113,9 @@ export async function readSiteConfig(): Promise<SiteConfig> {
     primaryColor: normalizeColor(merged.primaryColor),
     heroImageUrl: merged.heroImageUrl || "/dragon-store-hero.png",
     trustBadges: merged.trustBadges?.length ? merged.trustBadges : baseConfig.trustBadges,
+    fallbackCategories: merged.fallbackCategories?.length
+      ? merged.fallbackCategories
+      : asCategories((fallbackStore as { categories?: unknown }).categories),
     fallbackProducts: merged.fallbackProducts?.length ? merged.fallbackProducts : asProducts(fallbackStore.products)
   };
 }

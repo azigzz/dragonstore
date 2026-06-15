@@ -11,7 +11,7 @@ export async function POST() {
 
   try {
     const store = await syncFallbackFromBot();
-    return NextResponse.json({ ok: true, products: store.products.length, source: store.source });
+    return NextResponse.json({ ok: true, products: store.products.length, categories: store.categories?.length || 0, source: store.source });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Nao foi possivel sincronizar.";
     return NextResponse.json({ ok: false, error: message }, { status: 400 });

@@ -31,7 +31,7 @@ const STAFF_FILE = path.join(DATA_DIR, "staff.json");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PANELS_FILE)) fs.writeFileSync(PANELS_FILE, JSON.stringify({ guilds: {} }, null, 2));
-if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, JSON.stringify({ orders: {}, tickets: {} }, null, 2));
+if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, JSON.stringify({ orders: {}, tickets: {}, customers: {} }, null, 2));
 if (!fs.existsSync(STAFF_FILE)) fs.writeFileSync(STAFF_FILE, JSON.stringify({ guilds: {} }, null, 2));
 
 const client = new Client({
@@ -40,6 +40,7 @@ const client = new Client({
 
 const sessions = new Map();
 const imageUploads = new Map();
+const cartDeleteTimers = new Map();
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
 
@@ -52,17 +53,27 @@ function writeJson(file, data) {
   fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
   fs.renameSync(tmpFile, file);
 }
+function ensureOrdersStore(db) {
+  const store = db && typeof db === "object" ? db : {};
+  if (!store.orders) store.orders = {};
+  if (!store.tickets) store.tickets = {};
+  if (!store.customers) store.customers = {};
+  return store;
+}
 function readPanels() { return readJson(PANELS_FILE, { guilds: {} }); }
 function writePanels(data) { writeJson(PANELS_FILE, data); }
-function readOrders() { return readJson(ORDERS_FILE, { orders: {}, tickets: {} }); }
-function writeOrders(data) { writeJson(ORDERS_FILE, data); }
+function readOrders() { return ensureOrdersStore(readJson(ORDERS_FILE, { orders: {}, tickets: {}, customers: {} })); }
+function writeOrders(data) { writeJson(ORDERS_FILE, ensureOrdersStore(data)); }
 function readStaff() { return readJson(STAFF_FILE, { guilds: {} }); }
 function writeStaff(data) { writeJson(STAFF_FILE, data); }
 function defaultStaffGuild() {
   return {
     users: {},
     panelChannelId: "",
-    panelMessageId: ""
+    panelMessageId: "",
+    successChannelId: "",
+    successMessageEnabled: false,
+    customerRoleId: ""
   };
 }
 function getStaffGuild(guildId) {
@@ -71,6 +82,7 @@ function getStaffGuild(guildId) {
     db.guilds[guildId] = defaultStaffGuild();
     writeStaff(db);
   }
+  db.guilds[guildId] = { ...defaultStaffGuild(), ...db.guilds[guildId], users: db.guilds[guildId].users || {} };
   return db.guilds[guildId];
 }
 function saveStaffGuild(guildId, staffGuild) {
@@ -773,9 +785,10 @@ function pickPublicPanel(guildStore) {
     panels[0] ||
     defaultPanel(process.env.GUILD_ID || "public-store");
 }
-function publicStoreProduct(p, panel) {
+function publicStoreProduct(p, panel, idPrefix = "") {
+  const rawId = String(p.id || `p${random7()}`);
   return {
-    id: String(p.id || `p${random7()}`),
+    id: idPrefix ? `${idPrefix}_${rawId}` : rawId,
     name: String(p.name || "Produto"),
     price: String(p.price || "A combinar"),
     description: String(p.description || "Produto digital da Dragon Store"),
@@ -812,6 +825,60 @@ function publicProductsFromPanels(guildStore, preferredPanel) {
   }
 
   return products.slice(0, 200);
+}
+function publicCategoryId(panel, index = 0) {
+  return safeName(panel?.scopeId || panel?.id || panel?.title || `categoria-${index + 1}`) || `categoria-${index + 1}`;
+}
+function publicCategoryMinPrice(products) {
+  let min = null;
+  for (const product of products || []) {
+    const value = parsePrice(product.price);
+    if (value === null) continue;
+    min = min === null ? value : Math.min(min, value);
+  }
+  return min;
+}
+function publicCategoryFromPanel(panel, index = 0) {
+  const id = publicCategoryId(panel, index);
+  const products = (panel.products || [])
+    .map(product => publicStoreProduct(product, panel, id))
+    .slice(0, 100);
+
+  return {
+    id,
+    panelId: String(panel.id || ""),
+    scopeId: String(panel.scopeId || ""),
+    title: String(panel.title || `Categoria ${index + 1}`),
+    description: String(panel.description || "Produtos digitais da Dragon Store"),
+    imageUrl: panel.imageUrl || products.find(product => product.imageUrl)?.imageUrl || "",
+    thumbnailUrl: panel.thumbnailUrl || "",
+    color: normColor(panel.color || "#9b00ff"),
+    minPrice: publicCategoryMinPrice(products),
+    products
+  };
+}
+function publicCategoriesFromPanels(guildStore, preferredPanel) {
+  const seen = new Set();
+  const panels = [
+    preferredPanel,
+    ...allPublicPanels(guildStore).sort((a, b) => {
+      const aCount = (a.products || []).length;
+      const bCount = (b.products || []).length;
+      return bCount - aCount;
+    })
+  ];
+
+  return panels
+    .filter(Boolean)
+    .filter(panel => (panel.products || []).length)
+    .filter((panel, index) => {
+      const key = panel.id || panel.scopeId || panel.configMessageId || `${panel.title || "panel"}-${index}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .map((panel, index) => publicCategoryFromPanel(panel, index))
+    .slice(0, 50);
 }
 async function recoverPublicPanelsFromDiscord(guildId, guildStore) {
   if (!client.isReady?.()) return;
@@ -850,14 +917,20 @@ async function publicStorePayload() {
   const guildId = configuredGuildId || Object.keys(store.guilds || {})[0] || "public-store";
   let guildStore = store.guilds?.[guildId] || Object.values(store.guilds || {})[0] || { panels: {} };
   let panel = pickPublicPanel(guildStore);
-  let products = publicProductsFromPanels(guildStore, panel);
+  let categories = publicCategoriesFromPanels(guildStore, panel);
+  let products = categories.length
+    ? categories.flatMap(category => category.products).slice(0, 200)
+    : publicProductsFromPanels(guildStore, panel);
 
   if (!products.length || process.env.PUBLIC_STORE_RECOVER_ON_REQUEST === "true") {
     await recoverPublicPanelsFromDiscord(guildId, guildStore);
     const freshStore = readPanels();
     guildStore = freshStore.guilds?.[guildId] || Object.values(freshStore.guilds || {})[0] || guildStore;
     panel = pickPublicPanel(guildStore);
-    products = publicProductsFromPanels(guildStore, panel);
+    categories = publicCategoriesFromPanels(guildStore, panel);
+    products = categories.length
+      ? categories.flatMap(category => category.products).slice(0, 200)
+      : publicProductsFromPanels(guildStore, panel);
   }
 
   return {
@@ -867,8 +940,9 @@ async function publicStorePayload() {
     imageUrl: panel.imageUrl || "",
     thumbnailUrl: panel.thumbnailUrl || "",
     color: normColor(panel.color || "#9b00ff"),
-    discordInviteUrl: process.env.DISCORD_INVITE_URL?.trim() || "https://discord.gg/rapp28qmR4",
+    discordInviteUrl: process.env.DISCORD_INVITE_URL?.trim() || "https://discord.gg/Y2MqnVwXnq",
     ticketChannelId: config.ticketPanel?.channelId || "",
+    categories,
     products,
     updatedAt: panel.updatedAt || new Date().toISOString()
   };
@@ -976,6 +1050,286 @@ function totalLine(order, panel) {
   if (!totals.quantity) return "Carrinho vazio";
   if (totals.unknown) return `${money(totals.amount)} + itens sem preço numérico`;
   return money(totals.amount);
+}
+function closedCartDeleteSeconds() {
+  const configured = Number(process.env.CLOSED_CART_DELETE_SECONDS ?? config.settings?.deleteClosedCartAfterSeconds ?? 3 * 24 * 60 * 60);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 3 * 24 * 60 * 60;
+}
+function isFinishedCart(order) {
+  return ["closed", "cancelled", "canceled"].includes(String(order?.status || ""));
+}
+async function deleteClosedCartChannel(order) {
+  if (!order?.guildId || !order?.channelId || !isFinishedCart(order)) return;
+
+  try {
+    const guild = await client.guilds.fetch(order.guildId);
+    const channel = await guild.channels.fetch(order.channelId).catch(() => null);
+    if (channel?.deletable) await channel.delete(`Carrinho ${order.id} encerrado ha 3 dias`);
+  } catch (error) {
+    console.log(`Nao consegui apagar carrinho ${order.id}: ${error.message}`);
+  } finally {
+    cartDeleteTimers.delete(order.id);
+  }
+}
+function scheduleCartDeletion(order) {
+  if (!order?.id || !order.channelId || !isFinishedCart(order)) return false;
+  if (cartDeleteTimers.has(order.id)) clearTimeout(cartDeleteTimers.get(order.id));
+
+  const seconds = closedCartDeleteSeconds();
+  const closedAt = Date.parse(order.closedAt || order.cancelledAt || new Date().toISOString());
+  const dueAt = Number.isFinite(closedAt) ? closedAt + seconds * 1000 : Date.now() + seconds * 1000;
+  const delay = Math.max(1000, dueAt - Date.now());
+  const cappedDelay = Math.min(delay, 2_147_483_647);
+
+  cartDeleteTimers.set(order.id, setTimeout(() => deleteClosedCartChannel(order), cappedDelay));
+  return true;
+}
+function scheduleExistingClosedCarts() {
+  const db = readOrders();
+  Object.values(db.orders || {}).forEach(scheduleCartDeletion);
+}
+function maskCustomerName(value) {
+  const clean = String(value || "cliente").replace(/\s+/g, "");
+  return `${clean.slice(0, 4) || "clie"}****`;
+}
+function successFeedTime(date = new Date()) {
+  return date.toLocaleString("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+function successOrderLine(order, panel) {
+  const lines = (order.items || []).map(item => {
+    const details = orderItemDetails(item, panel);
+    const quantity = Math.max(1, Number(item.quantity) || 1);
+    return `${details.name} ${quantity}x`;
+  });
+  return lines.join(", ") || "Pedido personalizado 1x";
+}
+function configuredCustomerRoleId(guildId) {
+  const staff = getStaffGuild(guildId);
+  return staff.customerRoleId || process.env.CUSTOMER_ROLE_ID || config.customerRoleId || "";
+}
+async function grantCustomerRole(guild, userId) {
+  const roleId = configuredCustomerRoleId(guild.id);
+  if (!roleId) return false;
+
+  try {
+    const member = await guild.members.fetch(userId);
+    await member.roles.add(roleId, "Compra finalizada na Dragon Store");
+    return true;
+  } catch (error) {
+    console.log(`Nao consegui adicionar cargo cliente para ${userId}: ${error.message}`);
+    return false;
+  }
+}
+async function sendSuccessFeed(guild, order, panel) {
+  const staff = getStaffGuild(guild.id);
+  if (!staff.successMessageEnabled || !staff.successChannelId) return false;
+
+  const channel = await guild.channels.fetch(staff.successChannelId).catch(() => null);
+  if (!channel?.isTextBased()) return false;
+
+  const embed = new EmbedBuilder()
+    .setTitle("Produto entregue!")
+    .setDescription(`${maskCustomerName(order.username)} - ${successOrderLine(order, panel)}\n${successFeedTime(new Date(order.closedAt || Date.now()))}`)
+    .setColor(parseColor(panel.color, 0x28f6a1))
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+  return true;
+}
+async function setupSuccessFeed(interactionOrMessage, options = {}) {
+  const guild = interactionOrMessage.guild;
+  const channel = interactionOrMessage.channel;
+  const member = interactionOrMessage.member;
+
+  if (!isAdmin(member)) {
+    const text = "So ADM pode configurar o canal de vendas concluidas.";
+    if (interactionOrMessage.isRepliable?.()) return interactionOrMessage.reply({ content: text, ephemeral: true });
+    return channel.send(text);
+  }
+
+  const staff = getStaffGuild(guild.id);
+  staff.successChannelId = channel.id;
+  staff.successMessageEnabled = options.enabled ?? true;
+  if (options.customerRoleId) staff.customerRoleId = options.customerRoleId;
+  saveStaffGuild(guild.id, staff);
+
+  const roleText = staff.customerRoleId ? `<@&${staff.customerRoleId}>` : "`CUSTOMER_ROLE_ID`/cargo cliente ainda nao definido";
+  const statusText = staff.successMessageEnabled ? "ativado" : "desativado";
+  const embed = new EmbedBuilder()
+    .setTitle("Feed de vendas configurado")
+    .setDescription(`Este canal vai receber as vendas concluidas com nome mascarado.\n\nStatus: **${statusText}**\nCargo cliente: ${roleText}\nLimpeza de carrinhos: **3 dias apos encerrar**.`)
+    .setColor(0x28f6a1)
+    .setTimestamp();
+
+  if (interactionOrMessage.isRepliable?.()) {
+    return interactionOrMessage.reply({ embeds: [embed], ephemeral: true });
+  }
+  return channel.send({ embeds: [embed] });
+}
+function saoPauloDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const part = type => parts.find(item => item.type === type)?.value || "01";
+  return { year: part("year"), month: part("month"), day: part("day") };
+}
+function isoWeekKeyFromParts(parts) {
+  const local = new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day)));
+  const day = local.getUTCDay() || 7;
+  local.setUTCDate(local.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(local.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((local - yearStart) / 86400000) + 1) / 7);
+  return `${local.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+function periodKeys(date = new Date()) {
+  const parts = saoPauloDateParts(date);
+  return {
+    day: `${parts.year}-${parts.month}-${parts.day}`,
+    week: isoWeekKeyFromParts(parts),
+    month: `${parts.year}-${parts.month}`,
+    year: parts.year
+  };
+}
+function emptyCustomerStats(userId, username) {
+  return {
+    userId,
+    username: username || "cliente",
+    totalSpent: 0,
+    orderCount: 0,
+    periods: { day: {}, week: {}, month: {}, year: {} },
+    lastOrderAt: ""
+  };
+}
+function recordPeriodSpend(customer, period, key, amount) {
+  if (!customer.periods) customer.periods = { day: {}, week: {}, month: {}, year: {} };
+  if (!customer.periods[period]) customer.periods[period] = {};
+  const bucket = customer.periods[period][key] || { amount: 0, orders: 0 };
+  bucket.amount += amount;
+  bucket.orders += 1;
+  customer.periods[period][key] = bucket;
+}
+function recordCustomerSpend(db, order, panel) {
+  if (order.spendRecordedAt) return;
+  const totals = orderTotals(order, panel);
+  order.spentAmount = totals.amount;
+  order.totalQuantity = totals.quantity;
+  if (!order.userId || totals.amount <= 0) return;
+
+  const guildId = order.guildId || "default";
+  if (!db.customers[guildId]) db.customers[guildId] = {};
+  const customer = db.customers[guildId][order.userId] || emptyCustomerStats(order.userId, order.username);
+  const now = new Date(order.closedAt || Date.now());
+  const keys = periodKeys(now);
+
+  customer.username = order.username || customer.username;
+  customer.totalSpent += totals.amount;
+  customer.orderCount += 1;
+  customer.lastOrderAt = now.toISOString();
+  for (const [period, key] of Object.entries(keys)) recordPeriodSpend(customer, period, key, totals.amount);
+
+  db.customers[guildId][order.userId] = customer;
+  order.spendRecordedAt = now.toISOString();
+}
+const RANKING_PERIODS = {
+  day: "Dia",
+  week: "Semana",
+  month: "Mes",
+  year: "Ano"
+};
+function customerPeriodAmount(customer, period, key) {
+  return Number(customer?.periods?.[period]?.[key]?.amount || 0);
+}
+function rankingData(guildId, period = "month", page = 0) {
+  const db = readOrders();
+  const key = periodKeys()[period] || periodKeys().month;
+  const rows = Object.values(db.customers?.[guildId] || {})
+    .map(customer => ({ ...customer, periodAmount: customerPeriodAmount(customer, period, key) }))
+    .filter(customer => customer.periodAmount > 0)
+    .sort((a, b) => b.periodAmount - a.periodAmount || String(a.username).localeCompare(String(b.username)));
+  const pageSize = 10;
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(Math.max(0, Number(page) || 0), totalPages - 1);
+  return { rows, pageRows: rows.slice(safePage * pageSize, safePage * pageSize + pageSize), page: safePage, totalPages, key };
+}
+function rankingEmbed(guildId, period = "month", page = 0) {
+  const selectedPeriod = RANKING_PERIODS[period] ? period : "month";
+  const data = rankingData(guildId, selectedPeriod, page);
+  const lines = data.pageRows.length
+    ? data.pageRows.map((customer, index) => {
+        const pos = data.page * 10 + index + 1;
+        return `**${pos}.** <@${customer.userId}> - ${money(customer.periodAmount)} (${customer.periods?.[selectedPeriod]?.[data.key]?.orders || 0} compra(s))`;
+      }).join("\n")
+    : "Nenhuma venda registrada nesse periodo.";
+
+  return new EmbedBuilder()
+    .setTitle("Ranking de gastos")
+    .setDescription(lines)
+    .setColor(0x28f6a1)
+    .addFields(
+      { name: "Periodo", value: `${RANKING_PERIODS[selectedPeriod]} atual`, inline: true },
+      { name: "Pagina", value: `${data.page + 1}/${data.totalPages}`, inline: true }
+    )
+    .setTimestamp();
+}
+function rankingComponents(guildId, period = "month", page = 0) {
+  const selectedPeriod = RANKING_PERIODS[period] ? period : "month";
+  const data = rankingData(guildId, selectedPeriod, page);
+  return [
+    new ActionRowBuilder().addComponents(
+      Object.entries(RANKING_PERIODS).map(([key, label]) =>
+        new ButtonBuilder()
+          .setCustomId(`rank:${key}:0`)
+          .setLabel(label)
+          .setStyle(key === selectedPeriod ? ButtonStyle.Primary : ButtonStyle.Secondary)
+      )
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`rank:${selectedPeriod}:${Math.max(0, data.page - 1)}`)
+        .setLabel("Anterior")
+        .setEmoji("⬅️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(data.page <= 0),
+      new ButtonBuilder()
+        .setCustomId(`rank:${selectedPeriod}:${data.page + 1}`)
+        .setLabel("Proxima")
+        .setEmoji("➡️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(data.page >= data.totalPages - 1)
+    )
+  ];
+}
+async function showSpendRanking(interaction, period = "month", page = 0) {
+  if (!await requireAdminInteraction(interaction, "Voce precisa ser ADM para ver o ranking de gastos.")) return;
+  const selectedPeriod = RANKING_PERIODS[period] ? period : "month";
+  const data = rankingData(interaction.guildId, selectedPeriod, page);
+  const payload = {
+    embeds: [rankingEmbed(interaction.guildId, selectedPeriod, data.page)],
+    components: rankingComponents(interaction.guildId, selectedPeriod, data.page)
+  };
+
+  if (interaction.isButton()) return interaction.update(payload);
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+async function sendSpendRankingMessage(message, period = "month", page = 0) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode ver o ranking de gastos.");
+  const selectedPeriod = RANKING_PERIODS[period] ? period : "month";
+  const data = rankingData(message.guild.id, selectedPeriod, page);
+  await message.delete().catch(() => null);
+  return message.channel.send({
+    content: `<@${message.author.id}> ranking de gastos atualizado.`,
+    embeds: [rankingEmbed(message.guild.id, selectedPeriod, data.page)],
+    components: rankingComponents(message.guild.id, selectedPeriod, data.page)
+  });
 }
 function orderId(type) {
   const db = readOrders();
@@ -2167,6 +2521,7 @@ ${mysteryResultsText(order.mysteryResults)}`;
 }
 function cartEmbed(order, panel) {
   const totals = orderTotals(order, panel);
+  const statusLabel = order.status === "open" ? "Aberto" : order.status === "cancelled" ? "Cancelado" : "Fechado";
   const firstImage = (order.items || [])
     .map(item => orderItemDetails(item, panel).imageUrl)
     .find(url => url && validUrl(url));
@@ -2176,7 +2531,7 @@ function cartEmbed(order, panel) {
     .setColor(parseColor(panel.color))
     .addFields(
       { name: "Cliente", value: `<@${order.userId}>`, inline: true },
-      { name: "Status", value: order.status === "open" ? "Aberto" : "Fechado", inline: true },
+      { name: "Status", value: statusLabel, inline: true },
       { name: "Atendente", value: order.assignedAdminId ? `<@${order.assignedAdminId}>` : "Ainda não assumido", inline: true },
       { name: "Itens", value: String(totals.quantity), inline: true },
       { name: "Total estimado", value: totalLine(order, panel), inline: true }
@@ -2190,7 +2545,8 @@ function cartButtons(orderId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`call:${orderId}`).setLabel("Chamar ADM").setEmoji("📣").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`view:${orderId}`).setLabel("Ver carrinho").setEmoji("🧾").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar compra").setEmoji("✅").setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar compra").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`cancel:${orderId}`).setLabel("Cancelar compra").setEmoji("✖️").setStyle(ButtonStyle.Danger)
   );
 }
 function buildStoreStatusEmbed(guildId, scopeId = "default") {
@@ -2423,6 +2779,42 @@ async function viewCart(interaction, id) {
   if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissão.", ephemeral: true });
   return interaction.reply({ embeds: [cartEmbed(order, getOrderPanel(order, interaction.guildId))], ephemeral: true });
 }
+async function cancelCart(interaction, id) {
+  const db = readOrders(); const order = db.orders[id];
+  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissao para cancelar esse carrinho.", ephemeral: true });
+
+  const panel = getOrderPanel(order, interaction.guildId);
+  const now = new Date().toISOString();
+  order.status = "cancelled";
+  order.cancelledAt = now;
+  order.closedAt = now;
+  order.cancelledById = interaction.user.id;
+  order.cancelledByName = interaction.member?.displayName || interaction.user.username;
+  db.orders[id] = order;
+  writeOrders(db);
+
+  await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "cancelado") : `carrinho-${safeName(order.username)}-cancelado-${id}`).catch(() => null);
+  if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
+  await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
+  await interaction.channel.send({
+    content: `<@${order.userId}> carrinho cancelado. Este canal sera apagado automaticamente em 3 dias.`,
+    embeds: [cartEmbed(order, panel)]
+  });
+
+  await sendSafeDM(order.userId, {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("Compra cancelada")
+        .setDescription(`O carrinho #${id} foi cancelado.\n\nResumo:\n${cartText(order, panel)}`.slice(0, 4096))
+        .setColor(0xff5c7a)
+        .setTimestamp()
+    ]
+  });
+
+  scheduleCartDeletion(order);
+  return interaction.reply({ content: `Carrinho #${id} cancelado.`, ephemeral: true });
+}
 async function finishCart(interaction, id) {
   const db = readOrders(); const order = db.orders[id];
   if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
@@ -2436,14 +2828,18 @@ async function finishCart(interaction, id) {
   order.closedAt = new Date().toISOString();
   order.closedByAdminId = interaction.user.id;
   order.closedByAdminName = interaction.member?.displayName || interaction.user.username;
+  recordCustomerSpend(db, order, panel);
   db.orders[id] = order;
   writeOrders(db);
   await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "fechado") : `carrinho-${safeName(order.username)}-fechado-${id}`).catch(() => null);
   if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
+  await grantCustomerRole(interaction.guild, order.userId);
+  await sendSuccessFeed(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar feed da venda ${id}: ${error.message}`));
+  scheduleCartDeletion(order);
   const thanks = config.messages.purchaseThanks.replaceAll("{id}", id);
   const extraEmbed = mysteryResultsEmbed(mysteryResults, panel);
-  await interaction.channel.send({ content: `<@${order.userId}> ${thanks}`, embeds: [cartEmbed(order, panel), extraEmbed].filter(Boolean) });
+  await interaction.channel.send({ content: `<@${order.userId}> ${thanks}\nEste canal sera apagado automaticamente em 3 dias.`, embeds: [cartEmbed(order, panel), extraEmbed].filter(Boolean) });
 
   await sendSafeDM(order.userId, {
     embeds: [
@@ -2561,7 +2957,10 @@ async function handlePendingImageUpload(message) {
   return true;
 }
 
-client.once("ready", () => console.log(`Bot online como ${client.user.tag}`));
+client.once("ready", () => {
+  console.log(`Bot online como ${client.user.tag}`);
+  scheduleExistingClosedCarts();
+});
 
 client.on("messageCreate", async message => {
   if (message.author.bot || !message.guild) return;
@@ -2576,6 +2975,12 @@ client.on("messageCreate", async message => {
   if (content === `${config.prefix || "!"}atendimento`) {
     await message.delete().catch(() => null);
     return setupStaffPanel(message);
+  }
+
+  if (content.startsWith(`${config.prefix || "!"}setupsucess`)) {
+    await message.delete().catch(() => null);
+    const enabled = !/\b(off|false|desativar|desligar)\b/.test(content);
+    return setupSuccessFeed(message, { enabled });
   }
 
   if (content === `${config.prefix || "!"}configpix`) {
@@ -2597,6 +3002,9 @@ client.on("messageCreate", async message => {
       ? `<@${message.author.id}> enviei o status da loja no seu privado.`
       : `<@${message.author.id}> não consegui mandar DM. Use \`/status-loja\` para ver em modo privado.`);
   }
+  if (content === `${config.prefix || "!"}ranking-gastos`) {
+    return sendSpendRankingMessage(message);
+  }
 });
 
 client.on("interactionCreate", async interaction => {
@@ -2609,6 +3017,11 @@ client.on("interactionCreate", async interaction => {
       }
       if (interaction.commandName === "setup-ticket") return setupTicket(interaction);
       if (interaction.commandName === "setup-atendimento") return setupStaffPanel(interaction);
+      if (interaction.commandName === "setupsucess") {
+        const enabled = interaction.options.getBoolean("ativo") ?? true;
+        const role = interaction.options.getRole("cargo-cliente");
+        return setupSuccessFeed(interaction, { enabled, customerRoleId: role?.id || "" });
+      }
       if (interaction.commandName === "configpix") {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para configurar Pix.")) return;
         return interaction.showModal(pixConfigModal(interaction.guildId, interaction.user));
@@ -2617,12 +3030,17 @@ client.on("interactionCreate", async interaction => {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para ver o status da loja.")) return;
         return interaction.reply({ embeds: [buildStoreStatusEmbed(interaction.guildId, interaction.channelId)], ephemeral: true });
       }
+      if (interaction.commandName === "ranking-gastos") return showSpendRanking(interaction);
     }
     if (interaction.isButton()) {
       if (interaction.customId.startsWith("rmconfirm:")) return handleRemoveConfirm(interaction);
       if (interaction.customId.startsWith("rmcancel:")) return handleRemoveCancel(interaction);
       if (interaction.customId.startsWith("cfg:")) return handleConfigButton(interaction);
       if (interaction.customId.startsWith("staff:")) return handleStaffButton(interaction);
+      if (interaction.customId.startsWith("rank:")) {
+        const [, period, page] = interaction.customId.split(":");
+        return showSpendRanking(interaction, period, Number(page) || 0);
+      }
       if (interaction.customId.startsWith("quickbuy:")) {
         const [, panelId] = interaction.customId.split(":");
         return handleQuickBuyButton(interaction, panelId);
@@ -2632,6 +3050,7 @@ client.on("interactionCreate", async interaction => {
       if (act === "call") return callAdmin(interaction, id, "order");
       if (act === "view") return viewCart(interaction, id);
       if (act === "finish") return finishCart(interaction, id);
+      if (act === "cancel") return cancelCart(interaction, id);
       if (act === "assume") return assumeOrder(interaction, id);
       if (act === "sendpix") return resendPix(interaction, id);
       if (act === "tcall") return callAdmin(interaction, id, "ticket");

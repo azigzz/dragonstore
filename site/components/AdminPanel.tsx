@@ -132,7 +132,8 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
       setStatus(data.error || "Falha ao sincronizar.");
       return;
     }
-    setStatus(`Sincronizado: ${productLabel(data.products || 0)} salvos no fallback runtime.`);
+    const categoryCount = Number(data.categories || 0);
+    setStatus(`Sincronizado: ${productLabel(data.products || 0)} em ${categoryCount} ${categoryCount === 1 ? "categoria" : "categorias"} salvos no fallback runtime.`);
     await loadConfig();
   }
 

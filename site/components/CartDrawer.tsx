@@ -1,7 +1,7 @@
 "use client";
 
 import { Copy, ExternalLink, Minus, Plus, ShoppingCart, Trash2, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { cartTotal, formatBRL, hasUnknownPrices, parsePrice } from "@/lib/money";
 import type { SiteConfig, StoreData, StoreProduct } from "@/lib/types";
 
@@ -41,12 +41,16 @@ export default function CartDrawer({
   onRemove,
   onClear
 }: CartDrawerProps) {
-  const [code] = useState(orderCode);
+  const [code, setCode] = useState("DS-000000");
   const [message, setMessage] = useState("");
   const products = expandedItems(items);
   const total = cartTotal(products);
   const unknown = hasUnknownPrices(products);
   const discordUrl = config.ticketChannelUrl || store.discordInviteUrl || config.discordInviteUrl;
+
+  useEffect(() => {
+    setCode(orderCode());
+  }, []);
 
   const summary = useMemo(() => {
     const lines = items.map(item => `${item.quantity}x ${item.product.name} - ${item.product.price}`);

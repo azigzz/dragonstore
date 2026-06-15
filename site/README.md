@@ -1,6 +1,6 @@
 # Dragon Store Site
 
-Site profissional em Next.js para divulgar os produtos digitais da Dragon Store e finalizar pedidos pelo Discord.
+Site profissional em Next.js para divulgar as categorias e produtos digitais da Dragon Store e finalizar pedidos pelo Discord.
 
 O site tenta buscar produtos do bot em `GET /api/public-store`. Se o bot estiver offline ou sem token correto, usa `data/fallback-store.json` e a config local.
 
@@ -39,7 +39,7 @@ DRAGON_STORE_NAME=Dragon Store
 STORE_SUBTITLE=Loja digital pelo Discord
 STORE_HERO_TITLE=Produtos digitais com compra rapida pelo Discord
 STORE_HERO_TEXT=Escolha seus produtos, monte seu carrinho e finalize a compra abrindo um ticket no nosso servidor.
-DISCORD_INVITE_URL=https://discord.gg/rapp28qmR4
+DISCORD_INVITE_URL=https://discord.gg/Y2MqnVwXnq
 PRIMARY_COLOR=#28f6a1
 ```
 
@@ -89,7 +89,7 @@ No Render do bot, configure:
 
 ```env
 PUBLIC_STORE_API_TOKEN=o-mesmo-token-usado-no-site
-DISCORD_INVITE_URL=https://discord.gg/rapp28qmR4
+DISCORD_INVITE_URL=https://discord.gg/Y2MqnVwXnq
 PUBLIC_STORE_NAME=Dragon Store
 PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
 PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado
@@ -98,7 +98,7 @@ PUBLIC_STORE_MESSAGE_ID=id_da_mensagem_do_painel_publicado
 
 Depois redeploye o bot.
 
-O endpoint do bot junta os produtos dos paineis salvos. Se o bot perdeu `data/panels.json` no redeploy, mas o painel antigo ainda esta publicado no Discord, preencha `PUBLIC_STORE_CHANNEL_ID` e `PUBLIC_STORE_MESSAGE_ID` para recuperar os produtos existentes a partir da mensagem.
+O endpoint do bot junta os produtos dos paineis salvos e devolve cada painel como uma categoria do site. Se o bot perdeu `data/panels.json` no redeploy, mas o painel antigo ainda esta publicado no Discord, preencha `PUBLIC_STORE_CHANNEL_ID` e `PUBLIC_STORE_MESSAGE_ID` para recuperar os produtos existentes a partir da mensagem.
 
 No site/Vercel, configure:
 
@@ -119,6 +119,7 @@ Resposta esperada:
 {
   "storeName": "Dragon Store",
   "title": "Titulo do painel",
+  "categories": [],
   "products": []
 }
 ```
@@ -129,7 +130,7 @@ Resposta esperada:
 2. Entre com `ADMIN_PASSWORD`.
 3. Configure textos, links, API do bot, cor, imagem e fallback.
 4. Clique em **Testar bot** para validar a conexao.
-5. Clique em **Sincronizar** para salvar produtos do bot como fallback runtime.
+5. Clique em **Sincronizar** para salvar categorias e produtos do bot como fallback runtime.
 6. Clique em **Salvar** para persistir a config no ambiente atual.
 
 ## Atualizar produtos
@@ -139,7 +140,8 @@ O fluxo principal continua no Discord:
 1. Use `!configds` ou `/configds`.
 2. Edite produtos, preco, estoque e imagens no bot.
 3. Publique/atualize o painel.
-4. O site busca esses dados pela API do bot.
+4. O site mostra cada painel como uma categoria clicavel, com imagem, descricao e menor preco.
+5. A pagina da categoria lista todos os produtos daquela secao.
 
 Se o bot estiver offline, o site mostra os produtos fallback.
 

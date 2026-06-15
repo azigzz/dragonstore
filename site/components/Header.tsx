@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element */
+
 import { ExternalLink, ShoppingCart } from "lucide-react";
 import type { SiteConfig } from "@/lib/types";
 
@@ -14,8 +16,12 @@ export default function Header({ config, cartCount, onCartClick }: HeaderProps) 
     <header className="fixed inset-x-0 top-0 z-40 border-b border-white/10 bg-[#07090f]/82 backdrop-blur-xl">
       <div className="dragon-container flex h-16 items-center justify-between gap-3">
         <a href="/" className="flex min-w-0 items-center gap-3">
-          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-emerald-300/30 bg-emerald-300/10 text-lg font-black text-emerald-200">
-            DS
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-md border border-emerald-300/30 bg-[#061b2d]">
+            <img
+              src="/dragon-store-logo.png"
+              alt="Dragon Store"
+              className="h-full w-full object-cover"
+            />
           </span>
           <span className="min-w-0">
             <span className="block truncate text-sm font-black uppercase text-white">{config.storeName}</span>

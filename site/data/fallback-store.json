@@ -1,39 +1,139 @@
 {
   "storeName": "Dragon Store",
   "title": "Produtos digitais com compra rapida pelo Discord",
-  "description": "Escolha seus produtos, monte seu carrinho e finalize a compra abrindo um ticket no nosso servidor.",
+  "description": "Escolha uma categoria, monte seu carrinho e finalize com a equipe no Discord.",
   "imageUrl": "/dragon-store-hero.png",
-  "thumbnailUrl": "",
+  "thumbnailUrl": "/dragon-store-logo.png",
   "color": "#28f6a1",
-  "discordInviteUrl": "https://discord.gg/rapp28qmR4",
+  "discordInviteUrl": "https://discord.gg/Y2MqnVwXnq",
   "ticketChannelId": "",
-  "products": [
+  "categories": [
     {
-      "id": "fallback-tft",
-      "name": "Set TFT personalizado",
-      "price": "R$ 9,90",
-      "description": "Produto digital entregue pelo atendimento da Dragon Store.",
-      "stock": "sob consulta",
+      "id": "steam-keys",
+      "title": "Steam Keys",
+      "description": "Steam Keys digitais separadas por categorias. A entrega e o suporte acontecem no atendimento da Dragon Store.",
       "imageUrl": "/dragon-store-hero.png",
-      "type": "normal"
+      "color": "#28f6a1",
+      "products": [
+        {
+          "id": "steam-black-premium",
+          "name": "Steam Key Black Premium",
+          "price": "R$ 3,49",
+          "description": "Steam key digital com entrega manual no carrinho.",
+          "stock": "infinito",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "steam-ruby",
+          "name": "Steam Key Ruby",
+          "price": "R$ 2,09",
+          "description": "Steam key digital com entrega manual no carrinho.",
+          "stock": "infinito",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "steam-aleatorias",
+          "name": "Steam Keys Aleatorias",
+          "price": "R$ 0,69",
+          "description": "Steam key digital com entrega manual no carrinho.",
+          "stock": "infinito",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "steam-plus-18",
+          "name": "Steam Key +18",
+          "price": "R$ 0,40",
+          "description": "Jogos +18 aleatorios.",
+          "stock": "infinito",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "steam-cartas",
+          "name": "Steam Key Cartas",
+          "price": "R$ 2,29",
+          "description": "Produto da loja.",
+          "stock": "infinito",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        }
+      ]
     },
     {
-      "id": "fallback-steam",
-      "name": "Steam Key aleatoria",
-      "price": "R$ 3,99",
-      "description": "Key digital com entrega manual pelo Discord.",
-      "stock": "sob consulta",
+      "id": "tft-sets",
+      "title": "TFT Sets",
+      "description": "Sets digitais com atendimento manual pelo Discord.",
       "imageUrl": "/dragon-store-hero.png",
-      "type": "normal"
+      "color": "#28f6a1",
+      "products": [
+        {
+          "id": "set-party-balloons",
+          "name": "Set Party Balloons",
+          "price": "R$ 18,90",
+          "description": "Set TFT com entrega combinada no carrinho.",
+          "stock": "sob consulta",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "set-lovesick",
+          "name": "Set Lovesick",
+          "price": "R$ 11,80",
+          "description": "Set TFT com entrega combinada no carrinho.",
+          "stock": "sob consulta",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "set-spooky-brew",
+          "name": "Set Spooky Brew",
+          "price": "R$ 9,40",
+          "description": "Set TFT com entrega combinada no carrinho.",
+          "stock": "sob consulta",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        }
+      ]
     },
     {
-      "id": "fallback-smm",
-      "name": "Pacote SMM inicial",
-      "price": "R$ 4,90",
-      "description": "Servico digital combinado com a equipe no ticket.",
-      "stock": "sob demanda",
+      "id": "smm",
+      "title": "SMM",
+      "description": "Servicos digitais para redes sociais com detalhes confirmados no atendimento.",
       "imageUrl": "/dragon-store-hero.png",
-      "type": "normal"
+      "color": "#28f6a1",
+      "products": [
+        {
+          "id": "smm-seguidores-1000",
+          "name": "1.000 Seguidores",
+          "price": "R$ 2,00",
+          "description": "Servico SMM combinado com a equipe no carrinho.",
+          "stock": "sob demanda",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "smm-curtidas-5000",
+          "name": "5.000 Curtidas Mundiais",
+          "price": "R$ 3,00",
+          "description": "Servico SMM combinado com a equipe no carrinho.",
+          "stock": "sob demanda",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        },
+        {
+          "id": "smm-views-100000",
+          "name": "100.000 Visualizacoes",
+          "price": "R$ 4,00",
+          "description": "Servico SMM combinado com a equipe no carrinho.",
+          "stock": "sob demanda",
+          "imageUrl": "/dragon-store-hero.png",
+          "type": "normal"
+        }
+      ]
     }
-  ]
+  ],
+  "products": []
 }
