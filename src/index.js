@@ -41,6 +41,7 @@ const client = new Client({
 const sessions = new Map();
 const imageUploads = new Map();
 const cartDeleteTimers = new Map();
+const publicPanelScanCache = new Map();
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
 
@@ -908,7 +909,19 @@ async function recoverPublicPanelsFromDiscord(guildId, guildStore) {
 
   if (configuredChannelId && !configuredMessageId) {
     const channel = await guild.channels.fetch(configuredChannelId).catch(() => null);
-    if (channel?.isTextBased()) await findRecoverableSalePanel(channel, guildId, configuredChannelId).catch(() => null);
+    if (channel?.isTextBased()) await findRecoverableSalePanels(channel, guildId, null).catch(() => []);
+  }
+
+  const savedProducts = publicProductsFromPanels(guildStore, pickPublicPanel(guildStore));
+  const shouldScanAll = process.env.PUBLIC_STORE_SCAN_CHANNELS !== "false" ||
+    process.env.PUBLIC_STORE_RECOVER_ON_REQUEST === "true" ||
+    !savedProducts.length;
+
+  if (shouldScanAll) {
+    await scanGuildForPublishedSalePanels(guild, guildId, !savedProducts.length || process.env.PUBLIC_STORE_RECOVER_ON_REQUEST === "true").catch(error => {
+      console.log("Nao consegui varrer paineis publicados:", error.message);
+      return [];
+    });
   }
 }
 async function publicStorePayload() {
@@ -922,7 +935,7 @@ async function publicStorePayload() {
     ? categories.flatMap(category => category.products).slice(0, 200)
     : publicProductsFromPanels(guildStore, panel);
 
-  if (!products.length || process.env.PUBLIC_STORE_RECOVER_ON_REQUEST === "true") {
+  if (!products.length || process.env.PUBLIC_STORE_RECOVER_ON_REQUEST === "true" || process.env.PUBLIC_STORE_SCAN_CHANNELS !== "false") {
     await recoverPublicPanelsFromDiscord(guildId, guildStore);
     const freshStore = readPanels();
     guildStore = freshStore.guilds?.[guildId] || Object.values(freshStore.guilds || {})[0] || guildStore;
@@ -1616,6 +1629,75 @@ async function findRecoverableSalePanel(channel, guildId, scopeId) {
   });
 
   return found ? recoverPanelFromPublishedMessage(found, guildId, scopeId) : null;
+}
+async function findRecoverableSalePanels(channel, guildId, scopeId = null, limit = 75) {
+  if (!channel?.messages?.fetch) return [];
+  const messages = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!messages?.size) return [];
+
+  const sorted = [...messages.values()].sort((a, b) => {
+    const left = BigInt(a.id);
+    const right = BigInt(b.id);
+    if (right > left) return 1;
+    if (right < left) return -1;
+    return 0;
+  });
+  const recovered = [];
+  const seen = new Set();
+  const seenPanelKeys = new Set();
+
+  for (const message of sorted) {
+    const sameBot = !client.user?.id || message.author?.id === client.user.id;
+    if (!sameBot || !saleSelectComponentFromMessage(message) || seen.has(message.id)) continue;
+    const select = saleSelectComponentFromMessage(message);
+    const panelKey = panelIdFromComponentCustomId(componentCustomId(select)) || message.channelId;
+    if (seenPanelKeys.has(panelKey)) continue;
+    seen.add(message.id);
+    seenPanelKeys.add(panelKey);
+    const panel = await recoverPanelFromPublishedMessage(message, guildId, scopeId).catch(() => null);
+    if (panel) recovered.push(panel);
+  }
+
+  return recovered;
+}
+function publicPanelScanFresh(guildId) {
+  const ttl = Math.max(10, Number(process.env.PUBLIC_STORE_SCAN_CACHE_SECONDS || 60) || 60) * 1000;
+  const last = publicPanelScanCache.get(guildId) || 0;
+  if (Date.now() - last < ttl) return true;
+  publicPanelScanCache.set(guildId, Date.now());
+  return false;
+}
+function isScannablePublicChannel(channel) {
+  return Boolean(
+    channel?.messages?.fetch &&
+    channel?.isTextBased?.() &&
+    !channel.isThread?.() &&
+    [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)
+  );
+}
+async function scanGuildForPublishedSalePanels(guild, guildId, force = false) {
+  if (process.env.PUBLIC_STORE_SCAN_CHANNELS === "false") return [];
+  if (!force && publicPanelScanFresh(guildId)) return [];
+  publicPanelScanCache.set(guildId, Date.now());
+
+  const channels = await guild.channels.fetch().catch(() => null);
+  if (!channels?.size) return [];
+
+  const maxChannels = Math.max(1, Number(process.env.PUBLIC_STORE_SCAN_CHANNEL_LIMIT || 80) || 80);
+  const messageLimit = Math.min(100, Math.max(10, Number(process.env.PUBLIC_STORE_SCAN_MESSAGE_LIMIT || 75) || 75));
+  const candidates = [...channels.values()]
+    .filter(isScannablePublicChannel)
+    .sort((a, b) => (a.rawPosition ?? 9999) - (b.rawPosition ?? 9999))
+    .slice(0, maxChannels);
+  const recovered = [];
+
+  for (const channel of candidates) {
+    const panels = await findRecoverableSalePanels(channel, guildId, null, messageLimit).catch(() => []);
+    recovered.push(...panels);
+  }
+
+  if (recovered.length) console.log(`API publica recuperou ${recovered.length} painel(is) publicados do Discord.`);
+  return recovered;
 }
 async function resetSelectMessage(interaction, payload) {
   try {

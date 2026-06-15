@@ -49,6 +49,9 @@ DISCORD_INVITE_URL=https://discord.gg/Y2MqnVwXnq
 PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
 PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado
 PUBLIC_STORE_MESSAGE_ID=id_da_mensagem_do_painel_publicado
+PUBLIC_STORE_SCAN_CHANNELS=true
+PUBLIC_STORE_SCAN_CHANNEL_LIMIT=80
+PUBLIC_STORE_SCAN_MESSAGE_LIMIT=75
 ```
 
 Nunca coloque token real no codigo.
@@ -241,7 +244,7 @@ Os IDs ficam em `config.json`:
     "channelId": "1515799364574904531"
   },
   "review": {
-    "channelId": "canal_de_avaliacoes",
+    "channelId": "1515799364155478138",
     "message": "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.",
     "channelPingMessage": "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.",
     "deletePingAfterSeconds": 10
@@ -262,9 +265,9 @@ Os dados ficam em JSON dentro da pasta `data`:
 
 Em hospedagem gratis, esses arquivos podem sumir em redeploy/restart dependendo da plataforma. Para loja em producao, o proximo passo recomendado e migrar esses dados para Neon/PostgreSQL.
 
-Quando o painel publicado ainda existe no chat, o bot tenta recuperar automaticamente o embed e as opcoes do menu ao abrir `!configds` no mesmo canal ou quando um cliente clica no menu antigo. Se a mensagem estiver mais antiga, use **Vincular painel** no configurador e cole o link ou ID da mensagem publicada.
+Quando o painel publicado ainda existe no chat, o bot tenta recuperar automaticamente o embed e as opcoes do menu ao abrir `!configds` no mesmo canal, quando um cliente clica no menu antigo e quando o site chama a API publica. Se o JSON sumir no redeploy, a API varre mensagens recentes do proprio bot nos canais do servidor e salva de novo os paineis encontrados. Essa varredura vem ligada por padrao; use `PUBLIC_STORE_SCAN_CHANNELS=false` se precisar desligar. Se a mensagem estiver muito antiga, use **Vincular painel** no configurador e cole o link ou ID da mensagem publicada.
 
-A recuperacao pelo Discord preserva titulo, descricao, cor, banner, thumbnail, nome, preco, descricao curta e estoque que aparecem no menu publicado. Fotos individuais de produto e regras internas de caixa surpresa dependem do JSON/DB original.
+A recuperacao pelo Discord preserva titulo, descricao, cor, banner, thumbnail, nome, preco, descricao curta e estoque que aparecem no menu publicado. O site usa a imagem/banner do painel recuperado para a categoria. Fotos individuais de produto e regras internas de caixa surpresa dependem do JSON/DB original.
 
 ## Como testar no Discord
 

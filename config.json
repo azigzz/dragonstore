@@ -22,7 +22,7 @@
     "ticketWelcome": "Explique seu problema ou dúvida aqui. Um administrador irá te atender."
   },
   "review": {
-    "channelId": "",
+    "channelId": "1515799364155478138",
     "message": "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.",
     "channelPingMessage": "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.",
     "deletePingAfterSeconds": 10
