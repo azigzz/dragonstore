@@ -76,6 +76,14 @@ function normalizeColor(value?: string) {
   return /^#[0-9a-fA-F]{6}$/.test(color) ? color : "#28f6a1";
 }
 
+export function normalizeDiscordInvite(value?: string) {
+  const target = "https://discord.gg/ZyxwUekHWh";
+  const raw = String(value || "").trim();
+  if (!raw) return target;
+  if (/5fyPxMXBTC|Y2MqnVwXnq|rapp28qmR4/i.test(raw)) return target;
+  return raw;
+}
+
 async function readJsonFile(file: string) {
   try {
     return JSON.parse(await fs.readFile(file, "utf8")) as Partial<SiteConfig>;
@@ -106,7 +114,7 @@ export async function readSiteConfig(): Promise<SiteConfig> {
     subtitle: merged.subtitle || "Loja digital pelo Discord",
     heroTitle: merged.heroTitle || "Produtos digitais com compra rapida pelo Discord",
     heroText: merged.heroText || "Escolha seus produtos, monte seu carrinho e finalize pelo Discord.",
-    discordInviteUrl: merged.discordInviteUrl || "",
+    discordInviteUrl: normalizeDiscordInvite(merged.discordInviteUrl),
     ticketChannelUrl: merged.ticketChannelUrl || "",
     botApiUrl: merged.botApiUrl || "",
     botApiToken: merged.botApiToken || "",

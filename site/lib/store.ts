@@ -1,5 +1,5 @@
 import fallbackStore from "@/data/fallback-store.json";
-import { readSiteConfig, saveSiteConfig } from "@/lib/config";
+import { normalizeDiscordInvite, readSiteConfig, saveSiteConfig } from "@/lib/config";
 import { parsePrice } from "@/lib/money";
 import type { SiteConfig, StoreCategory, StoreData, StoreProduct } from "@/lib/types";
 
@@ -108,7 +108,7 @@ function fallbackData(config: SiteConfig, message?: string): StoreData {
     imageUrl: image,
     thumbnailUrl: fallbackStore.thumbnailUrl,
     color: config.primaryColor || fallbackStore.color,
-    discordInviteUrl: config.discordInviteUrl || fallbackStore.discordInviteUrl,
+    discordInviteUrl: normalizeDiscordInvite(config.discordInviteUrl || fallbackStore.discordInviteUrl),
     ticketChannelId: fallbackStore.ticketChannelId,
     categories: finalCategories,
     products,
@@ -144,7 +144,7 @@ function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
     imageUrl: image,
     thumbnailUrl: raw.thumbnailUrl || "",
     color: raw.color || config.primaryColor,
-    discordInviteUrl: config.discordInviteUrl || raw.discordInviteUrl || "",
+    discordInviteUrl: normalizeDiscordInvite(config.discordInviteUrl || raw.discordInviteUrl || ""),
     ticketChannelId: raw.ticketChannelId || "",
     categories: finalCategories,
     products: finalProducts,

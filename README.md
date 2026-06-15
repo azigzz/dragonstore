@@ -44,7 +44,7 @@ DISCORD_TOKEN=token_do_bot
 CLIENT_ID=id_da_aplicacao
 GUILD_ID=id_do_servidor
 PUBLIC_STORE_API_TOKEN=gere_um_token_grande_e_dificil
-DISCORD_INVITE_URL=https://discord.gg/Y2MqnVwXnq
+DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
 # opcionais para escolher/recuperar painel antigo
 PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
 PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado

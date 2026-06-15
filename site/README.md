@@ -39,7 +39,7 @@ DRAGON_STORE_NAME=Dragon Store
 STORE_SUBTITLE=Loja digital pelo Discord
 STORE_HERO_TITLE=Produtos digitais com compra rapida pelo Discord
 STORE_HERO_TEXT=Escolha seus produtos, monte seu carrinho e finalize a compra abrindo um ticket no nosso servidor.
-DISCORD_INVITE_URL=https://discord.gg/Y2MqnVwXnq
+DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
 PRIMARY_COLOR=#28f6a1
 ```
 
@@ -89,7 +89,7 @@ No Render do bot, configure:
 
 ```env
 PUBLIC_STORE_API_TOKEN=o-mesmo-token-usado-no-site
-DISCORD_INVITE_URL=https://discord.gg/Y2MqnVwXnq
+DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
 PUBLIC_STORE_NAME=Dragon Store
 PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
 PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado

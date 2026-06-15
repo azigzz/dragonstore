@@ -192,6 +192,13 @@ function parsePrice(value) {
 function money(value) {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
+function publicDiscordInviteUrl(value) {
+  const target = "https://discord.gg/ZyxwUekHWh";
+  const raw = String(value || "").trim();
+  if (!raw) return target;
+  if (/5fyPxMXBTC|Y2MqnVwXnq|rapp28qmR4/i.test(raw)) return target;
+  return raw;
+}
 function isAdmin(member) {
   return Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator) || member?.roles?.cache?.has(config.adminRoleId));
 }
@@ -953,7 +960,7 @@ async function publicStorePayload() {
     imageUrl: panel.imageUrl || "",
     thumbnailUrl: panel.thumbnailUrl || "",
     color: normColor(panel.color || "#9b00ff"),
-    discordInviteUrl: process.env.DISCORD_INVITE_URL?.trim() || "https://discord.gg/Y2MqnVwXnq",
+    discordInviteUrl: publicDiscordInviteUrl(process.env.DISCORD_INVITE_URL),
     ticketChannelId: config.ticketPanel?.channelId || "",
     categories,
     products,
