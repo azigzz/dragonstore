@@ -1,18 +1,18 @@
 {
   "storeName": "Dragon Store",
-  "subtitle": "Loja digital pelo Discord",
+  "subtitle": "Produtos digitais premium",
   "heroTitle": "Produtos digitais com compra rapida pelo Discord",
   "heroText": "Escolha seus produtos, monte seu carrinho e finalize a compra abrindo um ticket no nosso servidor.",
-  "discordInviteUrl": "https://discord.gg/seu-convite",
+  "discordInviteUrl": "https://discord.gg/rapp28qmR4",
   "ticketChannelUrl": "",
   "botApiUrl": "",
   "primaryColor": "#28f6a1",
   "heroImageUrl": "/dragon-store-hero.png",
   "trustBadges": [
-    "Carrinho rapido",
-    "Atendimento por ADM",
+    "Pedido em poucos cliques",
+    "Atendimento humano",
     "Pagamento via Pix",
-    "Produtos digitais",
-    "Suporte no Discord"
+    "Entrega digital",
+    "Suporte dedicado"
   ]
 }

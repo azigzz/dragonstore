@@ -39,7 +39,7 @@ DRAGON_STORE_NAME=Dragon Store
 STORE_SUBTITLE=Loja digital pelo Discord
 STORE_HERO_TITLE=Produtos digitais com compra rapida pelo Discord
 STORE_HERO_TEXT=Escolha seus produtos, monte seu carrinho e finalize a compra abrindo um ticket no nosso servidor.
-DISCORD_INVITE_URL=https://discord.gg/seu-convite
+DISCORD_INVITE_URL=https://discord.gg/rapp28qmR4
 PRIMARY_COLOR=#28f6a1
 ```
 
@@ -89,11 +89,16 @@ No Render do bot, configure:
 
 ```env
 PUBLIC_STORE_API_TOKEN=o-mesmo-token-usado-no-site
-DISCORD_INVITE_URL=https://discord.gg/seu-convite
+DISCORD_INVITE_URL=https://discord.gg/rapp28qmR4
 PUBLIC_STORE_NAME=Dragon Store
+PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
+PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado
+PUBLIC_STORE_MESSAGE_ID=id_da_mensagem_do_painel_publicado
 ```
 
 Depois redeploye o bot.
+
+O endpoint do bot junta os produtos dos paineis salvos. Se o bot perdeu `data/panels.json` no redeploy, mas o painel antigo ainda esta publicado no Discord, preencha `PUBLIC_STORE_CHANNEL_ID` e `PUBLIC_STORE_MESSAGE_ID` para recuperar os produtos existentes a partir da mensagem.
 
 No site/Vercel, configure:
 

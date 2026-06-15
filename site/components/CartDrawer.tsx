@@ -2,7 +2,7 @@
 
 import { Copy, ExternalLink, Minus, Plus, ShoppingCart, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
-import { cartTotal, formatBRL, hasUnknownPrices } from "@/lib/money";
+import { cartTotal, formatBRL, hasUnknownPrices, parsePrice } from "@/lib/money";
 import type { SiteConfig, StoreData, StoreProduct } from "@/lib/types";
 
 export type CartItem = {
@@ -63,8 +63,12 @@ export default function CartDrawer({
 
   async function copyOrder() {
     if (!items.length) return;
-    await navigator.clipboard.writeText(summary);
-    setMessage("Resumo copiado. Abra um ticket no Discord e envie o codigo para o ADM.");
+    try {
+      await navigator.clipboard.writeText(summary);
+      setMessage("Resumo copiado. Abra o Discord e envie o codigo para a equipe finalizar.");
+    } catch {
+      setMessage("Nao consegui copiar automaticamente. Selecione o resumo do pedido e copie manualmente.");
+    }
   }
 
   async function finishOnDiscord() {
@@ -85,7 +89,10 @@ export default function CartDrawer({
         <div className="flex h-16 items-center justify-between border-b border-white/10 px-4">
           <div className="flex items-center gap-2">
             <ShoppingCart className="h-5 w-5 text-emerald-200" />
-            <strong>Carrinho</strong>
+            <div>
+              <strong>Carrinho</strong>
+              <p className="text-xs text-slate-500">Pedido #{code}</p>
+            </div>
           </div>
           <button type="button" onClick={onClose} className="rounded-md p-2 text-slate-300 transition hover:bg-white/10 hover:text-white" aria-label="Fechar carrinho">
             <X className="h-5 w-5" />
@@ -99,6 +106,9 @@ export default function CartDrawer({
                 <div>
                   <strong className="text-sm text-white">{item.product.name}</strong>
                   <p className="mt-1 text-sm text-slate-400">{item.product.price}</p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Subtotal: {parsePrice(item.product.price) === null ? "a combinar" : formatBRL((parsePrice(item.product.price) || 0) * item.quantity)}
+                  </p>
                 </div>
                 <button type="button" onClick={() => onRemove(item.product.id)} className="rounded-md p-2 text-slate-400 transition hover:bg-red-400/10 hover:text-red-200" aria-label="Remover item">
                   <Trash2 className="h-4 w-4" />
@@ -119,7 +129,7 @@ export default function CartDrawer({
             </div>
           )) : (
             <div className="rounded-lg border border-dashed border-white/15 p-5 text-sm text-slate-400">
-              Nenhum produto no carrinho.
+              Seu carrinho esta vazio. Escolha um produto para montar o pedido.
             </div>
           )}
         </div>
@@ -129,6 +139,18 @@ export default function CartDrawer({
             <p className="text-xs uppercase text-slate-400">Total estimado</p>
             <p className="mt-1 text-xl font-black text-white">{unknown ? `${formatBRL(total)} + a combinar` : formatBRL(total)}</p>
           </div>
+
+          {items.length ? (
+            <label className="block">
+              <span className="text-xs uppercase text-slate-500">Resumo do pedido</span>
+              <textarea
+                value={summary}
+                readOnly
+                rows={6}
+                className="mt-2 w-full resize-none rounded-md border border-white/10 bg-black/25 p-3 font-mono text-xs leading-5 text-slate-200 outline-none"
+              />
+            </label>
+          ) : null}
 
           {message ? <p className="rounded-md border border-emerald-300/30 bg-emerald-300/10 p-3 text-sm text-emerald-100">{message}</p> : null}
 
@@ -160,7 +182,7 @@ export default function CartDrawer({
             className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-black text-black transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-45"
           >
             <ExternalLink className="h-4 w-4" />
-            Finalizar compra pelo Discord
+            Copiar e abrir Discord
           </button>
         </div>
       </aside>

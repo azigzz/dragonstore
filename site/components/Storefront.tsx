@@ -1,8 +1,8 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { ArrowRight, BadgeCheck, Headphones, ShieldCheck, ShoppingCart, Sparkles, WalletCards } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ArrowRight, BadgeCheck, Headphones, Search, ShieldCheck, ShoppingCart, Sparkles, WalletCards } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import CartDrawer, { type CartItem } from "@/components/CartDrawer";
 import Header from "@/components/Header";
 import ProductCard from "@/components/ProductCard";
@@ -14,14 +14,47 @@ type StorefrontProps = {
 };
 
 const icons = [ShoppingCart, Headphones, WalletCards, Sparkles, ShieldCheck];
+const CART_STORAGE_KEY = "dragon-store-cart";
 
 export default function Storefront({ store, config }: StorefrontProps) {
   const [cartOpen, setCartOpen] = useState(false);
   const [cart, setCart] = useState<CartItem[]>([]);
+  const [query, setQuery] = useState("");
+  const [notice, setNotice] = useState("");
   const heroImage = store.imageUrl || config.heroImageUrl || "/dragon-store-hero.png";
   const products = store.products || [];
   const cartCount = cart.reduce((total, item) => total + item.quantity, 0);
   const trust = useMemo(() => config.trustBadges.slice(0, 5), [config.trustBadges]);
+  const productCountText = `${products.length} ${products.length === 1 ? "produto disponivel" : "produtos disponiveis"} para atendimento.`;
+  const filteredProducts = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    if (!term) return products;
+    return products.filter(product => {
+      return [product.name, product.description, product.price, product.stock]
+        .join(" ")
+        .toLowerCase()
+        .includes(term);
+    });
+  }, [products, query]);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(CART_STORAGE_KEY);
+      if (saved) setCart(JSON.parse(saved));
+    } catch {
+      setCart([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(cart));
+  }, [cart]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 2200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   function addProduct(product: StoreProduct) {
     setCart(current => {
@@ -31,7 +64,7 @@ export default function Storefront({ store, config }: StorefrontProps) {
       }
       return [...current, { product, quantity: 1 }];
     });
-    setCartOpen(true);
+    setNotice(`${product.name} adicionado ao carrinho.`);
   }
 
   function decreaseProduct(productId: string) {
@@ -51,11 +84,11 @@ export default function Storefront({ store, config }: StorefrontProps) {
       <section
         className="relative min-h-[76vh] overflow-hidden border-b border-white/10 bg-cover bg-center pt-24"
         style={{
-          backgroundImage: `linear-gradient(90deg, rgba(7,9,15,.98) 0%, rgba(7,9,15,.86) 36%, rgba(7,9,15,.32) 100%), url(${heroImage})`
+          backgroundImage: `linear-gradient(90deg, rgba(7,9,15,.48) 0%, rgba(7,9,15,.72) 38%, rgba(7,9,15,.98) 100%), url(${heroImage})`
         }}
       >
         <div className="grid-texture pointer-events-none absolute inset-0 opacity-35" />
-        <div className="dragon-container relative grid min-h-[calc(76vh-96px)] content-center pb-20">
+        <div className="dragon-container relative grid min-h-[calc(76vh-96px)] content-center pb-20 lg:justify-items-end">
           <motion.div
             initial={{ opacity: 0, y: 18 }}
             animate={{ opacity: 1, y: 0 }}
@@ -64,7 +97,7 @@ export default function Storefront({ store, config }: StorefrontProps) {
           >
             <div className="mb-5 inline-flex items-center gap-2 rounded-md border border-emerald-300/30 bg-black/35 px-3 py-2 text-xs font-bold uppercase text-emerald-100 backdrop-blur">
               <BadgeCheck className="h-4 w-4" />
-              {store.source === "bot" ? "Produtos sincronizados" : "Loja pronta para vender"}
+              Catalogo atualizado
             </div>
             <h1 className="text-4xl font-black leading-[1.05] text-white sm:text-5xl lg:text-6xl">
               {config.heroTitle || store.title}
@@ -117,15 +150,22 @@ export default function Storefront({ store, config }: StorefrontProps) {
             <div>
               <p className="text-sm font-bold uppercase text-emerald-200">Catalogo</p>
               <h2 className="mt-2 text-3xl font-black text-white">Produtos digitais</h2>
+              <p className="mt-2 text-sm text-slate-400">{productCountText}</p>
             </div>
-            <p className="max-w-xl text-sm leading-6 text-slate-400">
-              Precos e nomes seguem o painel configurado no Discord. Quando o bot estiver offline, a loja usa o fallback local.
-            </p>
+            <label className="relative w-full sm:max-w-sm">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+              <input
+                value={query}
+                onChange={event => setQuery(event.target.value)}
+                placeholder="Buscar produto"
+                className="h-11 w-full rounded-md border border-white/10 bg-white/[.06] pl-10 pr-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-emerald-300/50"
+              />
+            </label>
           </div>
 
-          {products.length ? (
+          {filteredProducts.length ? (
             <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-              {products.map(product => (
+              {filteredProducts.map(product => (
                 <ProductCard
                   key={product.id}
                   product={product}
@@ -136,9 +176,25 @@ export default function Storefront({ store, config }: StorefrontProps) {
             </div>
           ) : (
             <div className="rounded-lg border border-dashed border-white/15 p-8 text-slate-300">
-              Nenhum produto disponivel agora.
+              Nenhum produto encontrado nessa busca.
             </div>
           )}
+        </div>
+      </section>
+
+      <section className="border-t border-white/10 bg-[#090d15] py-12">
+        <div className="dragon-container grid gap-4 md:grid-cols-3">
+          {[
+            ["1", "Monte seu pedido", "Adicione os produtos desejados ao carrinho."],
+            ["2", "Copie o resumo", "O site gera um codigo organizado para atendimento."],
+            ["3", "Finalize no Discord", "Abra o servidor e envie o pedido para a equipe."]
+          ].map(([step, title, text]) => (
+            <div key={step} className="rounded-lg border border-white/10 bg-white/[.04] p-5">
+              <span className="flex h-9 w-9 items-center justify-center rounded-md bg-emerald-300 text-sm font-black text-black">{step}</span>
+              <h3 className="mt-4 text-lg font-black text-white">{title}</h3>
+              <p className="mt-2 text-sm leading-6 text-slate-400">{text}</p>
+            </div>
+          ))}
         </div>
       </section>
 
@@ -170,6 +226,16 @@ export default function Storefront({ store, config }: StorefrontProps) {
         onRemove={removeProduct}
         onClear={() => setCart([])}
       />
+
+      {notice ? (
+        <button
+          type="button"
+          onClick={() => setCartOpen(true)}
+          className="fixed bottom-4 left-1/2 z-40 w-[calc(100%-32px)] max-w-md -translate-x-1/2 rounded-lg border border-emerald-300/30 bg-[#10141f] px-4 py-3 text-left text-sm font-bold text-emerald-100 shadow-neon transition hover:bg-[#151b29]"
+        >
+          {notice} <span className="text-white">Ver carrinho</span>
+        </button>
+      ) : null}
     </main>
   );
 }

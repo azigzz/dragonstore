@@ -40,7 +40,11 @@ DISCORD_TOKEN=token_do_bot
 CLIENT_ID=id_da_aplicacao
 GUILD_ID=id_do_servidor
 PUBLIC_STORE_API_TOKEN=gere_um_token_grande_e_dificil
-DISCORD_INVITE_URL=https://discord.gg/seu-convite
+DISCORD_INVITE_URL=https://discord.gg/rapp28qmR4
+# opcionais para escolher/recuperar painel antigo
+PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
+PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado
+PUBLIC_STORE_MESSAGE_ID=id_da_mensagem_do_painel_publicado
 ```
 
 Nunca coloque token real no codigo.
@@ -101,7 +105,9 @@ GET /api/public-store
 Authorization: Bearer PUBLIC_STORE_API_TOKEN
 ```
 
-Esse endpoint retorna apenas dados publicos da loja: titulo, descricao, cor, imagens, link do Discord e produtos. Ele nao retorna pedidos, Pix, tokens ou dados internos.
+Esse endpoint retorna apenas dados publicos da loja: titulo, descricao, cor, imagens, link do Discord e produtos. Ele junta produtos dos paineis salvos do servidor e nao retorna pedidos, Pix, tokens ou dados internos.
+
+Se o JSON local perdeu os produtos, mas a mensagem publicada ainda existe no Discord, configure `PUBLIC_STORE_CHANNEL_ID` e `PUBLIC_STORE_MESSAGE_ID` no Render para o bot recuperar esse painel quando a API do site for chamada.
 
 Para testar:
 

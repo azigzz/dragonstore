@@ -35,6 +35,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
   const [busy, setBusy] = useState(false);
 
   const tokenLabel = useMemo(() => config.botApiTokenConfigured ? "Token ja configurado" : "Token ainda nao salvo", [config.botApiTokenConfigured]);
+  const productLabel = (count: number) => `${count} ${count === 1 ? "produto" : "produtos"}`;
 
   async function loadConfig() {
     const response = await fetch("/api/admin/config", { cache: "no-store" });
@@ -118,7 +119,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
     });
     const data = await response.json().catch(() => ({}));
     setBusy(false);
-    setStatus(response.ok ? `Conexao OK: ${data.products} produto(s).` : data.error || "Falha ao testar bot.");
+    setStatus(response.ok ? `Conexao OK: ${productLabel(data.products || 0)}.` : data.error || "Falha ao testar bot.");
   }
 
   async function syncProducts() {
@@ -131,7 +132,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
       setStatus(data.error || "Falha ao sincronizar.");
       return;
     }
-    setStatus(`Sincronizado: ${data.products} produto(s) salvos no fallback runtime.`);
+    setStatus(`Sincronizado: ${productLabel(data.products || 0)} salvos no fallback runtime.`);
     await loadConfig();
   }
 

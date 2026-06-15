@@ -40,6 +40,8 @@ function fallbackData(config: SiteConfig, message?: string): StoreData {
 
 function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
   const image = raw.imageUrl || config.heroImageUrl || "/dragon-store-hero.png";
+  const botProducts = normalizeProducts(raw.products, image);
+  const fallbackProducts = normalizeProducts(config.fallbackProducts || fallbackStore.products, image);
   return {
     storeName: config.storeName || raw.storeName || "Dragon Store",
     title: raw.title || config.heroTitle,
@@ -49,7 +51,7 @@ function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
     color: raw.color || config.primaryColor,
     discordInviteUrl: config.discordInviteUrl || raw.discordInviteUrl || "",
     ticketChannelId: raw.ticketChannelId || "",
-    products: normalizeProducts(raw.products, image),
+    products: botProducts.length ? botProducts : fallbackProducts,
     updatedAt: raw.updatedAt,
     source: "bot",
     sourceMessage: "Produtos sincronizados do bot."

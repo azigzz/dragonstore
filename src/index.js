@@ -748,11 +748,25 @@ function getPanelById(guildId, panelId) {
   if (!found && guildStore.panel?.id === panelId) return guildStore.panel;
   return found || null;
 }
+function allPublicPanels(guildStore) {
+  const seen = new Set();
+  const panels = [];
+  const add = panel => {
+    if (!panel) return;
+    const key = panel.id || panel.scopeId || panel.configMessageId || panels.length;
+    if (seen.has(key)) return;
+    seen.add(key);
+    panels.push(panel);
+  };
+
+  Object.values(guildStore?.panels || {}).forEach(add);
+  add(guildStore?.panel);
+  return panels;
+}
 function pickPublicPanel(guildStore) {
-  const panels = Object.values(guildStore?.panels || {});
+  const panels = allPublicPanels(guildStore);
   const preferredScope = process.env.PUBLIC_STORE_PANEL_SCOPE?.trim();
   if (preferredScope && guildStore?.panels?.[preferredScope]) return guildStore.panels[preferredScope];
-  if (guildStore?.panel) panels.push(guildStore.panel);
 
   return panels.find(panel => panel?.publishedMessageId && (panel.products || []).length) ||
     panels.find(panel => (panel.products || []).length) ||
@@ -770,13 +784,81 @@ function publicStoreProduct(p, panel) {
     type: p.type || "normal"
   };
 }
-function publicStorePayload() {
+function publicProductKey(product) {
+  const name = String(product.name || "").trim().toLowerCase();
+  const price = String(product.price || "").trim().toLowerCase();
+  return name || price ? `${name}|${price}` : String(product.id || "");
+}
+function publicProductsFromPanels(guildStore, preferredPanel) {
+  const panels = [
+    preferredPanel,
+    ...allPublicPanels(guildStore).sort((a, b) => {
+      const aCount = (a.products || []).length;
+      const bCount = (b.products || []).length;
+      return bCount - aCount;
+    })
+  ];
+  const seen = new Set();
+  const products = [];
+
+  for (const panel of panels) {
+    for (const p of panel?.products || []) {
+      const publicProduct = publicStoreProduct(p, panel);
+      const key = publicProductKey(publicProduct);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      products.push(publicProduct);
+    }
+  }
+
+  return products.slice(0, 200);
+}
+async function recoverPublicPanelsFromDiscord(guildId, guildStore) {
+  if (!client.isReady?.()) return;
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) return;
+
+  const configuredChannelId = process.env.PUBLIC_STORE_CHANNEL_ID?.trim();
+  const configuredMessageId = process.env.PUBLIC_STORE_MESSAGE_ID?.trim();
+
+  if (configuredChannelId && configuredMessageId) {
+    const channel = await guild.channels.fetch(configuredChannelId).catch(() => null);
+    if (channel?.isTextBased()) {
+      const message = await channel.messages.fetch(configuredMessageId).catch(() => null);
+      if (message) await recoverPanelFromPublishedMessage(message, guildId, configuredChannelId).catch(() => null);
+    }
+  }
+
+  for (const panel of allPublicPanels(guildStore)) {
+    if (!panel?.publishedChannelId || !panel?.publishedMessageId) continue;
+    if ((panel.products || []).length && process.env.PUBLIC_STORE_RECOVER_ON_REQUEST !== "true") continue;
+
+    const channel = await guild.channels.fetch(panel.publishedChannelId).catch(() => null);
+    if (!channel?.isTextBased()) continue;
+    const message = await channel.messages.fetch(panel.publishedMessageId).catch(() => null);
+    if (message) await recoverPanelFromPublishedMessage(message, guildId, panel.scopeId || panel.publishedChannelId).catch(() => null);
+  }
+
+  if (configuredChannelId && !configuredMessageId) {
+    const channel = await guild.channels.fetch(configuredChannelId).catch(() => null);
+    if (channel?.isTextBased()) await findRecoverableSalePanel(channel, guildId, configuredChannelId).catch(() => null);
+  }
+}
+async function publicStorePayload() {
   const store = readPanels();
   const configuredGuildId = process.env.PUBLIC_STORE_GUILD_ID?.trim() || process.env.GUILD_ID?.trim();
   const guildId = configuredGuildId || Object.keys(store.guilds || {})[0] || "public-store";
-  const guildStore = store.guilds?.[guildId] || Object.values(store.guilds || {})[0] || { panels: {} };
-  const panel = pickPublicPanel(guildStore);
-  const products = (panel.products || []).slice(0, 25).map(p => publicStoreProduct(p, panel));
+  let guildStore = store.guilds?.[guildId] || Object.values(store.guilds || {})[0] || { panels: {} };
+  let panel = pickPublicPanel(guildStore);
+  let products = publicProductsFromPanels(guildStore, panel);
+
+  if (!products.length || process.env.PUBLIC_STORE_RECOVER_ON_REQUEST === "true") {
+    await recoverPublicPanelsFromDiscord(guildId, guildStore);
+    const freshStore = readPanels();
+    guildStore = freshStore.guilds?.[guildId] || Object.values(freshStore.guilds || {})[0] || guildStore;
+    panel = pickPublicPanel(guildStore);
+    products = publicProductsFromPanels(guildStore, panel);
+  }
 
   return {
     storeName: process.env.PUBLIC_STORE_NAME?.trim() || "Dragon Store",
@@ -785,7 +867,7 @@ function publicStorePayload() {
     imageUrl: panel.imageUrl || "",
     thumbnailUrl: panel.thumbnailUrl || "",
     color: normColor(panel.color || "#9b00ff"),
-    discordInviteUrl: process.env.DISCORD_INVITE_URL?.trim() || "",
+    discordInviteUrl: process.env.DISCORD_INVITE_URL?.trim() || "https://discord.gg/rapp28qmR4",
     ticketChannelId: config.ticketPanel?.channelId || "",
     products,
     updatedAt: panel.updatedAt || new Date().toISOString()
@@ -801,7 +883,7 @@ function sendHttpJson(res, statusCode, payload) {
   });
   res.end(JSON.stringify(payload));
 }
-function handleHttpRequest(req, res) {
+async function handleHttpRequest(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
   if (req.method === "OPTIONS") {
@@ -824,7 +906,12 @@ function handleHttpRequest(req, res) {
       return sendHttpJson(res, 401, { error: "Nao autorizado." });
     }
 
-    return sendHttpJson(res, 200, publicStorePayload());
+    try {
+      return sendHttpJson(res, 200, await publicStorePayload());
+    } catch (error) {
+      console.error("Erro na API publica da loja:", error?.message || error);
+      return sendHttpJson(res, 500, { error: "Nao foi possivel carregar a loja." });
+    }
   }
 
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });

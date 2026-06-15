@@ -5,5 +5,9 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   const store = await getStoreData();
-  return NextResponse.json(store);
+  return NextResponse.json(store, {
+    headers: {
+      "Cache-Control": "no-store"
+    }
+  });
 }
