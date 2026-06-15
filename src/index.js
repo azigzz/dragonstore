@@ -2952,27 +2952,22 @@ async function finishCurrentCartWithReview(context, options = {}) {
   return finishCart(context, order.id, { ...options, requestReview: true });
 }
 async function cancelCart(interaction, id) {
+  const actor = actionUser(interaction);
+  const guildId = actionGuildId(interaction);
   const db = readOrders(); const order = db.orders[id];
   if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
-  if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissao para cancelar esse carrinho.", ephemeral: true });
+  if (actor.id !== order.userId && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Sem permissao para cancelar esse carrinho.", ephemeral: true });
 
   const panel = getOrderPanel(order, guildId);
   const now = new Date().toISOString();
   order.status = "cancelled";
   order.cancelledAt = now;
   order.closedAt = now;
-  order.cancelledById = interaction.user.id;
-  order.cancelledByName = interaction.member?.displayName || interaction.user.username;
+  order.cancelledById = actor.id;
+  order.cancelledByName = interaction.member?.displayName || actor.username;
+  order.channelDeletedAt = now;
   db.orders[id] = order;
   writeOrders(db);
-
-  await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "cancelado") : `carrinho-${safeName(order.username)}-cancelado-${id}`).catch(() => null);
-  if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
-  await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
-  await interaction.channel.send({
-    content: `<@${order.userId}> carrinho cancelado. Este canal sera apagado automaticamente em 3 dias.`,
-    embeds: [cartEmbed(order, panel)]
-  });
 
   await sendSafeDM(order.userId, {
     embeds: [
@@ -2984,8 +2979,10 @@ async function cancelCart(interaction, id) {
     ]
   });
 
-  scheduleCartDeletion(order);
-  return interaction.reply({ content: `Carrinho #${id} cancelado.`, ephemeral: true });
+  await actionReply(interaction, { content: `Carrinho #${id} cancelado. Apagando este chat agora.`, ephemeral: true });
+  setTimeout(() => interaction.channel.delete(`Carrinho ${id} cancelado`).catch(error => {
+    console.log(`Nao consegui apagar carrinho cancelado ${id}: ${error.message}`);
+  }), 1500);
 }
 async function finishCart(interaction, id, options = {}) {
   const actor = actionUser(interaction);

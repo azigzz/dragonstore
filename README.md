@@ -27,7 +27,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - `/setupsucess` para definir o canal publico de vendas entregues, com nome do cliente mascarado.
 - `/avaliacao` e `!avaliação` para finalizar carrinho pedindo avaliacao ao cliente.
 - `/ranking-gastos` com ranking paginado de gastos por dia, semana, mes e ano.
-- Cancelamento de compra pelo cliente ou ADM e limpeza automatica de carrinhos finalizados apos 3 dias.
+- Cancelamento de compra pelo cliente ou ADM apagando o chat do carrinho na hora.
 
 ## Instalar
 
@@ -190,7 +190,7 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 4. Use `/ranking-gastos` para ver o ranking por dia, semana, mes ou ano, com 10 clientes por pagina.
 5. Se o slash command ainda nao aparecer, use `!setupsucess` e `!ranking-gastos`.
 
-Carrinhos finalizados ou cancelados ficam visiveis para historico por 3 dias e depois sao apagados automaticamente. Para mudar esse tempo, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
+Carrinhos finalizados ficam visiveis para historico por 3 dias e depois sao apagados automaticamente. Carrinhos cancelados apagam o chat na hora. Para mudar o tempo dos finalizados, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
 
 ## Pedido de avaliacao
 
