@@ -25,6 +25,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - Ticket de suporte privado.
 - `/status-loja` com produtos, carrinhos abertos, vendas fechadas, faturamento estimado e ADMs online.
 - `/setupsucess` para definir o canal publico de vendas entregues, com nome do cliente mascarado.
+- `/avaliacao` e `!avaliação` para finalizar carrinho pedindo avaliacao ao cliente.
 - `/ranking-gastos` com ranking paginado de gastos por dia, semana, mes e ano.
 - Cancelamento de compra pelo cliente ou ADM e limpeza automatica de carrinhos finalizados apos 3 dias.
 
@@ -71,6 +72,9 @@ No Discord:
 /setup-ticket
 /setupsucess
 !setupsucess
+/avaliacao
+!avaliação
+!avaliacao
 /ranking-gastos
 !ranking-gastos
 /status-loja
@@ -185,6 +189,25 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 
 Carrinhos finalizados ou cancelados ficam visiveis para historico por 3 dias e depois sao apagados automaticamente. Para mudar esse tempo, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
 
+## Pedido de avaliacao
+
+Use `/avaliacao` dentro do canal do carrinho para finalizar a compra e pedir avaliacao ao cliente. O Discord nao aceita acento no nome do slash command, entao o slash e sem acento; por prefixo, `!avaliação` e `!avaliacao` funcionam.
+
+O comando faz o mesmo fechamento de **Finalizar compra**: bloqueia o chat para o cliente, registra gasto, tenta dar o cargo cliente, manda feed de venda e agenda a limpeza do carrinho. Alem disso, ele marca o cliente com a mensagem configurada e pinga o cliente no canal de avaliacoes, apagando esse ping depois de 10 segundos.
+
+Formas de usar:
+
+```txt
+/avaliacao
+/avaliacao canal:#avaliacoes
+/avaliacao canal:#avaliacoes mensagem:Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.
+!avaliação
+!avaliação 123456789012345678
+!avaliação 123456789012345678 Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.
+```
+
+Configure o padrao no `config.json` em `review.channelId`, `review.message`, `review.channelPingMessage` e `review.deletePingAfterSeconds`. Use `{channel}` ou `{canal}` para mencionar o canal de avaliacoes na mensagem.
+
 ## Caixa surpresa
 
 A caixa surpresa e apenas para brinde digital, produto, pack ou cupom. Nao use Pix, saldo real, dinheiro real ou premio financeiro.
@@ -216,6 +239,12 @@ Os IDs ficam em `config.json`:
   },
   "ticketPanel": {
     "channelId": "1515799364574904531"
+  },
+  "review": {
+    "channelId": "canal_de_avaliacoes",
+    "message": "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.",
+    "channelPingMessage": "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.",
+    "deletePingAfterSeconds": 10
   },
   "settings": {
     "deleteClosedCartAfterSeconds": 259200

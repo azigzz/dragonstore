@@ -2755,7 +2755,7 @@ async function handleQuickOrderSubmit(interaction) {
 async function addCart(interaction) {
   const [, id] = interaction.customId.split(":");
   const db = readOrders(); const order = db.orders[id];
-  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Você não pode alterar esse carrinho.", ephemeral: true });
   const panel = getOrderPanel(order, interaction.guildId); const p = product(panel, interaction.values[0]);
   if (!p) return interaction.reply({ content: "Produto não encontrado.", ephemeral: true });
@@ -2779,12 +2779,95 @@ async function viewCart(interaction, id) {
   if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissão.", ephemeral: true });
   return interaction.reply({ embeds: [cartEmbed(order, getOrderPanel(order, interaction.guildId))], ephemeral: true });
 }
+function actionUser(context) {
+  return context.user || context.author;
+}
+function actionGuildId(context) {
+  return context.guildId || context.guild?.id;
+}
+function stripEphemeral(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const { ephemeral, ...rest } = payload;
+  return rest;
+}
+async function actionReply(context, payload) {
+  if (context.isRepliable?.()) return context.reply(payload);
+  return context.channel.send(stripEphemeral(payload));
+}
+function openOrderByChannel(guildId, channelId) {
+  const db = readOrders();
+  return Object.values(db.orders || {}).find(order =>
+    order.guildId === guildId &&
+    order.channelId === channelId &&
+    order.status === "open"
+  ) || null;
+}
+function normalizeChannelId(value) {
+  const raw = String(value || "").trim();
+  return raw.match(/\d{15,25}/)?.[0] || "";
+}
+function reviewConfig(options = {}) {
+  const channelId = normalizeChannelId(options.reviewChannelId || config.review?.channelId || process.env.REVIEW_CHANNEL_ID || "");
+  return {
+    channelId,
+    message: clampText(options.reviewMessage || config.review?.message || "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.", 1000),
+    channelPingMessage: clampText(config.review?.channelPingMessage || "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.", 500),
+    deletePingAfterSeconds: Math.max(1, Number(config.review?.deletePingAfterSeconds ?? 10) || 10)
+  };
+}
+function reviewMessageText(order, review) {
+  const channelText = review.channelId ? `<#${review.channelId}>` : "canal de avaliacoes";
+  return review.message
+    .replaceAll("{cliente}", `<@${order.userId}>`)
+    .replaceAll("{channel}", channelText)
+    .replaceAll("{canal}", channelText)
+    .replaceAll("{id}", order.id);
+}
+function reviewOptionsFromText(rawContent) {
+  const args = String(rawContent || "").trim().split(/\s+/).slice(1).join(" ").trim();
+  const channelId = normalizeChannelId(args);
+  const reviewMessage = channelId
+    ? args.replace(/<#\d{15,25}>|\d{15,25}/, "").trim()
+    : args;
+
+  return {
+    reviewChannelId: channelId,
+    reviewMessage
+  };
+}
+async function sendReviewRequest(context, order, options = {}) {
+  const review = reviewConfig(options);
+  const text = reviewMessageText(order, review);
+  await context.channel.send({
+    content: `<@${order.userId}> ${text}`,
+    allowedMentions: { users: [order.userId] }
+  }).catch(() => null);
+
+  if (!review.channelId) return { ok: false, message: "Canal de avaliacoes nao configurado." };
+  const channel = await context.guild.channels.fetch(review.channelId).catch(() => null);
+  if (!channel?.isTextBased()) return { ok: false, message: "Canal de avaliacoes invalido." };
+
+  const ping = await channel.send({
+    content: `<@${order.userId}> ${review.channelPingMessage}`,
+    allowedMentions: { users: [order.userId] }
+  }).catch(() => null);
+  if (ping) setTimeout(() => ping.delete().catch(() => null), review.deletePingAfterSeconds * 1000);
+  return { ok: true, message: `Pedido de avaliacao enviado em <#${review.channelId}>.` };
+}
+async function finishCurrentCartWithReview(context, options = {}) {
+  const guildId = actionGuildId(context);
+  const order = openOrderByChannel(guildId, context.channel.id);
+  if (!order) {
+    return actionReply(context, { content: "Nao encontrei carrinho aberto neste canal.", ephemeral: true });
+  }
+  return finishCart(context, order.id, { ...options, requestReview: true });
+}
 async function cancelCart(interaction, id) {
   const db = readOrders(); const order = db.orders[id];
-  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissao para cancelar esse carrinho.", ephemeral: true });
 
-  const panel = getOrderPanel(order, interaction.guildId);
+  const panel = getOrderPanel(order, guildId);
   const now = new Date().toISOString();
   order.status = "cancelled";
   order.cancelledAt = now;
@@ -2815,7 +2898,9 @@ async function cancelCart(interaction, id) {
   scheduleCartDeletion(order);
   return interaction.reply({ content: `Carrinho #${id} cancelado.`, ephemeral: true });
 }
-async function finishCart(interaction, id) {
+async function finishCart(interaction, id, options = {}) {
+  const actor = actionUser(interaction);
+  const guildId = actionGuildId(interaction);
   const db = readOrders(); const order = db.orders[id];
   if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
   if (config.settings.finalizeCartOnlyAdmins && !isAdmin(interaction.member)) return interaction.reply({ content: "Só admin finaliza. Clique em **Chamar ADM**.", ephemeral: true });
@@ -2826,8 +2911,8 @@ async function finishCart(interaction, id) {
   if (mysteryResults.length) order.mysteryResults = mysteryResults;
   order.status = "closed";
   order.closedAt = new Date().toISOString();
-  order.closedByAdminId = interaction.user.id;
-  order.closedByAdminName = interaction.member?.displayName || interaction.user.username;
+  order.closedByAdminId = actor.id;
+  order.closedByAdminName = interaction.member?.displayName || actor.username;
   recordCustomerSpend(db, order, panel);
   db.orders[id] = order;
   writeOrders(db);
@@ -2839,6 +2924,9 @@ async function finishCart(interaction, id) {
   scheduleCartDeletion(order);
   const thanks = config.messages.purchaseThanks.replaceAll("{id}", id);
   const extraEmbed = mysteryResultsEmbed(mysteryResults, panel);
+  const reviewResult = options.requestReview
+    ? await sendReviewRequest(interaction, order, options).catch(error => ({ ok: false, message: `Nao consegui enviar avaliacao: ${error.message}` }))
+    : null;
   await interaction.channel.send({ content: `<@${order.userId}> ${thanks}\nEste canal sera apagado automaticamente em 3 dias.`, embeds: [cartEmbed(order, panel), extraEmbed].filter(Boolean) });
 
   await sendSafeDM(order.userId, {
@@ -2857,7 +2945,8 @@ ${cartText(order, panel)}`.slice(0, 4096))
     ].filter(Boolean)
   });
 
-  return interaction.reply({ content: mysteryResults.length ? `Compra #${id} finalizada e caixa surpresa sorteada.` : `Compra #${id} finalizada.`, ephemeral: true });
+  const reviewText = reviewResult ? ` ${reviewResult.message}` : "";
+  return actionReply(interaction, { content: mysteryResults.length ? `Compra #${id} finalizada e caixa surpresa sorteada.${reviewText}` : `Compra #${id} finalizada.${reviewText}`, ephemeral: true });
 }
 
 function ticketPanelEmbed() { return new EmbedBuilder().setTitle(config.ticketPanel.title).setDescription(config.ticketPanel.description).setColor(parseColor(config.ticketPanel.embedColor, 0x2b2d31)); }
@@ -2965,7 +3054,9 @@ client.once("ready", () => {
 client.on("messageCreate", async message => {
   if (message.author.bot || !message.guild) return;
   if (await handlePendingImageUpload(message)) return;
-  const content = message.content.trim().toLowerCase();
+  const rawContent = message.content.trim();
+  const content = rawContent.toLowerCase();
+  const plainContent = content.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
   if (content === `${config.prefix || "!"}configds`) {
     await message.delete().catch(() => null);
@@ -2981,6 +3072,13 @@ client.on("messageCreate", async message => {
     await message.delete().catch(() => null);
     const enabled = !/\b(off|false|desativar|desligar)\b/.test(content);
     return setupSuccessFeed(message, { enabled });
+  }
+
+  if (plainContent.startsWith(`${config.prefix || "!"}avaliacao`)) {
+    if (!isAdmin(message.member)) return message.reply("So ADM pode finalizar compra com pedido de avaliacao.");
+    const options = reviewOptionsFromText(rawContent);
+    await message.delete().catch(() => null);
+    return finishCurrentCartWithReview(message, options);
   }
 
   if (content === `${config.prefix || "!"}configpix`) {
@@ -3021,6 +3119,14 @@ client.on("interactionCreate", async interaction => {
         const enabled = interaction.options.getBoolean("ativo") ?? true;
         const role = interaction.options.getRole("cargo-cliente");
         return setupSuccessFeed(interaction, { enabled, customerRoleId: role?.id || "" });
+      }
+      if (interaction.commandName === "avaliacao") {
+        const reviewChannel = interaction.options.getChannel("canal");
+        const reviewMessage = interaction.options.getString("mensagem") || "";
+        return finishCurrentCartWithReview(interaction, {
+          reviewChannelId: reviewChannel?.id || "",
+          reviewMessage
+        });
       }
       if (interaction.commandName === "configpix") {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para configurar Pix.")) return;

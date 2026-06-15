@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { REST, Routes, SlashCommandBuilder } = require("discord.js");
+const { ChannelType, REST, Routes, SlashCommandBuilder } = require("discord.js");
 
 const token = process.env.DISCORD_TOKEN?.trim();
 const clientId = process.env.CLIENT_ID?.trim();
@@ -33,6 +33,23 @@ const commands = [
       option
         .setName("cargo-cliente")
         .setDescription("Cargo que o cliente recebe quando a compra for finalizada.")
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("avaliacao")
+    .setDescription("Finaliza o carrinho e pede avaliacao ao cliente.")
+    .addChannelOption(option =>
+      option
+        .setName("canal")
+        .setDescription("Canal onde o cliente deve deixar a avaliacao.")
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+        .setRequired(false)
+    )
+    .addStringOption(option =>
+      option
+        .setName("mensagem")
+        .setDescription("Mensagem personalizada. Use {channel} para mencionar o canal.")
+        .setMaxLength(1000)
         .setRequired(false)
     ),
   new SlashCommandBuilder()

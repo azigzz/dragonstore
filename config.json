@@ -21,6 +21,12 @@
     "purchaseThanks": "Obrigado pela compra, qualquer dúvida abra ticket. ID da compra: **{id}**. Volte sempre!",
     "ticketWelcome": "Explique seu problema ou dúvida aqui. Um administrador irá te atender."
   },
+  "review": {
+    "channelId": "",
+    "message": "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.",
+    "channelPingMessage": "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.",
+    "deletePingAfterSeconds": 10
+  },
   "settings": {
     "finalizeCartOnlyAdmins": true,
     "deleteTicketAfterCloseSeconds": 5,
