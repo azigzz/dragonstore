@@ -222,13 +222,29 @@ function parsePixRangeFromText(value) {
     max: Math.max(first, second)
   };
 }
+function parsePixNamedAmount(value) {
+  const text = String(value || "");
+  const centavos = text.match(/(\d+(?:[,.]\d{1,2})?)\s*centavo/i);
+  if (centavos) {
+    const amount = parsePixAmount(centavos[1]);
+    return amount === null ? null : amount / 100;
+  }
+
+  const reais = text.match(/(?:r\$\s*)?(\d+(?:[,.]\d{1,2})?)\s*(?:real|reais)/i);
+  if (reais) return parsePixAmount(reais[1]);
+
+  const currency = text.match(/r\$\s*(\d+(?:[,.]\d{1,2})?)/i);
+  return currency ? parsePixAmount(currency[1]) : null;
+}
 function normalizePixRange(minValue, maxValue, fallbackText = "") {
   const defaults = pixBoxDefaults();
   const fromColumns = parsePixAmount(minValue) !== null && parsePixAmount(maxValue) !== null
     ? { min: parsePixAmount(minValue), max: parsePixAmount(maxValue) }
     : null;
   const fromText = parsePixRangeFromText(fallbackText);
-  const range = fromColumns || fromText || defaults;
+  const namedAmount = parsePixNamedAmount(fallbackText);
+  const fromName = namedAmount === null ? null : { min: namedAmount, max: namedAmount };
+  const range = fromColumns || fromText || fromName || defaults;
   return {
     min: Math.min(range.min, range.max),
     max: Math.max(range.min, range.max)
@@ -642,6 +658,45 @@ function defaultPanel(guildId, scopeId = "default") {
     updatedAt: new Date().toISOString()
   };
 }
+function pixReward(name, chance, amount) {
+  return {
+    name,
+    description: `Pix de ${money(amount)}`,
+    weight: chance,
+    chance,
+    type: "pix",
+    pixMin: amount,
+    pixMax: amount
+  };
+}
+function completePixRewardChances(rewards) {
+  const list = rewards.map(reward => ({ ...reward }));
+  const total = list.reduce((sum, reward) => sum + rewardChanceValue(reward), 0);
+  if (total <= 0 || total >= 100) return list;
+
+  const candidate = list
+    .map((reward, index) => ({ reward, index, range: pixRewardRange(reward) }))
+    .filter(item => isPixReward(item.reward))
+    .sort((a, b) => a.range.max - b.range.max || a.index - b.index)[0];
+  const targetIndex = candidate?.index ?? 0;
+  const missing = 100 - total;
+  const current = rewardChanceValue(list[targetIndex]);
+
+  list[targetIndex].chance = Number((current + missing).toFixed(5));
+  list[targetIndex].weight = list[targetIndex].chance;
+  return list;
+}
+function pixBoxPresetRewards() {
+  return completePixRewardChances([
+    pixReward("5 centavos", 20, 0.05),
+    pixReward("10 centavos", 8, 0.10),
+    pixReward("20 centavos", 5, 0.20),
+    pixReward("1 real", 2, 1),
+    pixReward("10 reais", 0.5, 10),
+    pixReward("100 reais", 0.01, 100),
+    pixReward("1000 reais", 0.00001, 1000)
+  ]);
+}
 const PRODUCT_PRESETS = {
   empty: {
     label: "Vazio",
@@ -651,6 +706,22 @@ const PRODUCT_PRESETS = {
       "🛒 **Loja em configuracao**\n\nAdicione produtos, imagem, cor e canal pelo configurador.\n\nQuando tudo estiver pronto, clique em **Publicar painel** para enviar ou atualizar a mensagem da loja.",
     productDescription: "Produto da loja.",
     items: []
+  },
+  pixbox: {
+    label: "Caixa Pix",
+    title: "Caixa Pix",
+    color: "#28f6a1",
+    description:
+      "🎁 **Caixa Pix**\n\nCompre sua caixa e receba um valor Pix aleatorio ao finalizar a compra.",
+    productDescription: "Caixa Pix com sorteio automatico ao finalizar a compra.",
+    items: [{
+      name: "Caixa Pix",
+      price: "R$ 0,20",
+      description: "Caixa Pix com sorteio automatico ao finalizar a compra.",
+      stock: "infinito",
+      type: "mystery_box",
+      rewards: pixBoxPresetRewards()
+    }]
   },
   tft: {
     label: "TFT Sets",
@@ -737,14 +808,30 @@ function defaultQuickOrder() {
   };
 }
 function productsFromPreset(preset) {
-  return preset.items.map(([name, price]) => ({
-    id: "p" + random7(),
-    name,
-    price,
-    description: preset.productDescription,
-    stock: "infinito",
-    imageUrl: ""
-  }));
+  return preset.items.map(item => {
+    if (Array.isArray(item)) {
+      const [name, price] = item;
+      return {
+        id: "p" + random7(),
+        name,
+        price,
+        description: preset.productDescription,
+        stock: "infinito",
+        imageUrl: ""
+      };
+    }
+
+    return {
+      id: "p" + random7(),
+      name: item.name || "Produto",
+      price: item.price || "R$ 0,00",
+      description: item.description || preset.productDescription || "Produto da loja",
+      stock: item.stock || "infinito",
+      imageUrl: item.imageUrl || "",
+      type: item.type || "product",
+      rewards: Array.isArray(item.rewards) ? item.rewards : undefined
+    };
+  });
 }
 function applyProductPreset(panel, presetKey) {
   const preset = PRODUCT_PRESETS[presetKey];
@@ -1429,7 +1516,7 @@ function defaultPixReward(item = {}) {
 }
 function itemRewards(item) {
   const rewards = Array.isArray(item?.rewards) ? item.rewards.filter(reward => rewardChanceValue(reward) > 0) : [];
-  return rewards.length ? rewards : isPixBox(item) ? [defaultPixReward(item)] : [];
+  return rewards.length ? completePixRewardChances(rewards) : isPixBox(item) ? [defaultPixReward(item)] : [];
 }
 function isMysteryBox(item) {
   return (item?.type === "mystery_box" || isPixBox(item)) && itemRewards(item).length > 0;
@@ -1452,7 +1539,7 @@ function parseRewardLines(raw) {
       const reward = { name: name.slice(0, 100), description: description.slice(0, 200), weight: chance, chance };
 
       if (pixLike) {
-        const range = normalizePixRange(parts[3], parts[4], extraText);
+        const range = normalizePixRange(parts[3], parts[4], `${name} ${extraText}`);
         reward.type = "pix";
         reward.pixMin = range.min;
         reward.pixMax = range.max;
@@ -1463,7 +1550,7 @@ function parseRewardLines(raw) {
     })
     .filter(reward => rewardChanceValue(reward) > 0);
 
-  return rewards.length ? rewards : [
+  return rewards.length ? completePixRewardChances(rewards) : [
     { name: "Mini Pack Digital", description: "Brinde digital padrão", weight: 100 }
   ];
 }
@@ -1481,6 +1568,20 @@ function rewardChanceText(rewards) {
         })()
       : reward.description || "brinde digital";
     return `• **${reward.name}** — ${chance}% (${description})`;
+  }).join("\n");
+}
+function rewardPublicText(rewards) {
+  const list = Array.isArray(rewards) && rewards.length ? completePixRewardChances(rewards) : [defaultPixReward()];
+  return list.map(reward => {
+    if (isPixReward(reward)) {
+      const range = pixRewardRange(reward);
+      const value = range.min === range.max
+        ? money(range.min)
+        : `${money(range.min)} a ${money(range.max)}`;
+      return `• **${reward.name}** — ${value}`;
+    }
+
+    return `• **${reward.name}**${reward.description ? ` — ${reward.description}` : ""}`;
   }).join("\n");
 }
 function rewardConfigLine(reward) {
@@ -1513,7 +1614,7 @@ function pickWeightedReward(rewards) {
       roll -= rewardChanceValue(reward);
       if (roll <= 0) return reward;
     }
-    return { name: "Sem premio", description: "Nenhum premio sorteado nesta unidade.", type: "empty", weight: 0, chance: Math.max(0, 100 - total) };
+    return valid[0] || { name: "Brinde digital", description: "Brinde digital", weight: 100, chance: 100 };
   }
 
   let roll = Math.random() * total;
@@ -1526,13 +1627,6 @@ function pickWeightedReward(rewards) {
   return valid[valid.length - 1] || { name: "Brinde digital", description: "Brinde digital", weight: 1 };
 }
 function resolveRewardResult(reward) {
-  if (reward?.type === "empty") {
-    return {
-      rewardName: reward.name || "Sem premio",
-      rewardDescription: reward.description || "Nenhum premio sorteado nesta unidade."
-    };
-  }
-
   if (!isPixReward(reward)) {
     return {
       rewardName: reward.name,
@@ -1999,7 +2093,7 @@ function productInfoEmbed(item, panel, title = "Produto selecionado") {
     );
 
   if (isMysteryBox(details)) {
-    embed.addFields({ name: "Possíveis brindes", value: rewardChanceText(details.rewards).slice(0, 1024), inline: false });
+    embed.addFields({ name: "Possíveis prêmios", value: rewardPublicText(itemRewards(details)).slice(0, 1024), inline: false });
   }
 
   if (details.imageUrl && validUrl(details.imageUrl)) embed.setImage(details.imageUrl);
@@ -2009,7 +2103,7 @@ function productInfoEmbed(item, panel, title = "Produto selecionado") {
 function configEmbed(panel, ownerId) {
   const lines = panel.products.length
     ? panel.products.slice(0, 15).map((p, i) => {
-        const extra = isMysteryBox(p) ? ` | 🎁 ${p.rewards.length} brindes` : "";
+        const extra = isMysteryBox(p) ? ` | 🎁 ${itemRewards(p).length} prêmios` : "";
         const image = p.imageUrl ? " | 🖼️ imagem" : "";
         return `\`${i + 1}.\` ${productIcon(p)} **${p.name}** — ${p.price} | Estoque: ${p.stock || "infinito"}${image}${extra}`;
       }).join("\n")
@@ -2329,7 +2423,7 @@ function rewardEditModal(sessionId, p) {
   const currentRewards = itemRewards(p);
   const currentValue = currentRewards.length
     ? currentRewards.map(rewardConfigLine).join("\n")
-    : `${p.name || "Brinde"} | 100 | Brinde digital`;
+    : pixBoxPresetRewards().map(rewardConfigLine).join("\n");
 
   return new ModalBuilder()
     .setCustomId(`modal:${sessionId}:rewards:${p.id}`)
@@ -2339,7 +2433,7 @@ function rewardEditModal(sessionId, p) {
         new TextInputBuilder()
           .setCustomId("rewards")
           .setLabel("Nome | porcentagem | desc/pix")
-          .setPlaceholder("Caixa Pix | 100 | Pix aleatorio | 0 | 1000")
+          .setPlaceholder("5 centavos | 84.48999 | Pix")
           .setStyle(TextInputStyle.Paragraph)
           .setMaxLength(1000)
           .setRequired(true)
