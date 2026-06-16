@@ -27,6 +27,10 @@
     "channelPingMessage": "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.",
     "deletePingAfterSeconds": 10
   },
+  "completion": {
+    "enabled": true,
+    "channelId": "1515799364155478138"
+  },
   "settings": {
     "finalizeCartOnlyAdmins": true,
     "deleteTicketAfterCloseSeconds": 5,

@@ -21,6 +21,7 @@ const {
 
 const config = require("../config.json");
 const DEFAULT_CUSTOMER_ROLE_ID = "1515799363149103138";
+const DEFAULT_COMPLETION_CHANNEL_ID = "1515799364155478138";
 
 const PORT = process.env.PORT || 3000;
 http.createServer(handleHttpRequest).listen(PORT, () => console.log(`Health server rodando na porta ${PORT}`));
@@ -1371,6 +1372,12 @@ function successOrderLine(order, panel) {
   });
   return lines.join(", ") || "Pedido personalizado 1x";
 }
+function completionChannelId() {
+  return String(process.env.COMPLETION_CHANNEL_ID || config.completion?.channelId || DEFAULT_COMPLETION_CHANNEL_ID).trim();
+}
+function completionFeedEnabled() {
+  return config.completion?.enabled !== false && process.env.COMPLETION_FEED_ENABLED !== "false";
+}
 function configuredCustomerRoleId(guildId) {
   return configuredCustomerRoleIds(guildId)[0] || "";
 }
@@ -1401,6 +1408,7 @@ async function grantCustomerRole(guild, userId) {
 async function sendSuccessFeed(guild, order, panel) {
   const staff = getStaffGuild(guild.id);
   if (!staff.successMessageEnabled || !staff.successChannelId) return false;
+  if (staff.successChannelId === completionChannelId()) return false;
 
   const channel = await guild.channels.fetch(staff.successChannelId).catch(() => null);
   if (!channel?.isTextBased()) return false;
@@ -1412,6 +1420,34 @@ async function sendSuccessFeed(guild, order, panel) {
     .setTimestamp();
 
   await channel.send({ embeds: [embed] });
+  return true;
+}
+async function sendCompletionReceipt(guild, order, panel) {
+  if (!completionFeedEnabled()) return false;
+
+  const channelId = completionChannelId();
+  if (!channelId) return false;
+
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased()) return false;
+
+  const products = successOrderLine(order, panel);
+  const embed = new EmbedBuilder()
+    .setTitle("Compra finalizada!")
+    .setDescription(`<@${order.userId}> comprou: **${products}**`)
+    .setColor(parseColor(panel.color, 0x28f6a1))
+    .addFields(
+      { name: "Cliente", value: `<@${order.userId}>`, inline: true },
+      { name: "Pedido", value: `#${order.id}`, inline: true },
+      { name: "Produtos", value: products.slice(0, 1024), inline: false }
+    )
+    .setTimestamp(new Date(order.closedAt || Date.now()));
+
+  await channel.send({
+    content: `Compra finalizada! <@${order.userId}> - ${products}`,
+    embeds: [embed],
+    allowedMentions: { users: [order.userId] }
+  });
   return true;
 }
 async function setupSuccessFeed(interactionOrMessage, options = {}) {
@@ -3437,6 +3473,7 @@ async function finishCart(interaction, id, options = {}) {
   if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
   await grantCustomerRole(interaction.guild, order.userId);
+  await sendCompletionReceipt(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar recibo da venda ${order.id}: ${error.message}`));
   await sendSuccessFeed(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar feed da venda ${order.id}: ${error.message}`));
   scheduleCartDeletion(order);
   const thanks = config.messages.purchaseThanks.replaceAll("{id}", order.id);
