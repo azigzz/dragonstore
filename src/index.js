@@ -210,7 +210,7 @@ function parsePixAmount(value) {
 }
 function parsePixRangeFromText(value) {
   const text = String(value || "");
-  const match = text.match(/(?:pix|valor|faixa|range)?[^0-9]*(\d+(?:[,.]\d{1,2})?)\s*(?:a|ate|até|para|to|-|~|\s+)\s*(\d+(?:[,.]\d{1,2})?)/i);
+  const match = text.match(/(?:pix|valor|faixa|range)?[^0-9]*(\d+(?:[,.]\d{1,2})?)\s*(?:a|ate|até|e|para|to|-|~|\s+)\s*(\d+(?:[,.]\d{1,2})?)/i);
   if (!match) return null;
 
   const first = parsePixAmount(match[1]);
@@ -1428,7 +1428,7 @@ function defaultPixReward(item = {}) {
   };
 }
 function itemRewards(item) {
-  const rewards = Array.isArray(item?.rewards) ? item.rewards.filter(reward => Number(reward.weight) > 0) : [];
+  const rewards = Array.isArray(item?.rewards) ? item.rewards.filter(reward => rewardChanceValue(reward) > 0) : [];
   return rewards.length ? rewards : isPixBox(item) ? [defaultPixReward(item)] : [];
 }
 function isMysteryBox(item) {
@@ -1445,11 +1445,11 @@ function parseRewardLines(raw) {
     .map(line => {
       const parts = line.split("|").map(part => part.trim());
       const name = parts[0] || "Brinde surpresa";
-      const weight = Math.max(0, Number.parseFloat((parts[1] || "1").replace(",", ".")) || 1);
+      const chance = Math.max(0, Number.parseFloat((parts[1] || "1").replace(",", ".")) || 1);
       const description = parts[2] || "Brinde digital";
       const extraText = parts.slice(2).join(" | ");
       const pixLike = /\bpix\b/.test(plainText(`${name} ${extraText}`));
-      const reward = { name: name.slice(0, 100), description: description.slice(0, 200), weight };
+      const reward = { name: name.slice(0, 100), description: description.slice(0, 200), weight: chance, chance };
 
       if (pixLike) {
         const range = normalizePixRange(parts[3], parts[4], extraText);
@@ -1461,7 +1461,7 @@ function parseRewardLines(raw) {
 
       return reward;
     })
-    .filter(reward => reward.weight > 0);
+    .filter(reward => rewardChanceValue(reward) > 0);
 
   return rewards.length ? rewards : [
     { name: "Mini Pack Digital", description: "Brinde digital padrão", weight: 100 }
@@ -1469,9 +1469,11 @@ function parseRewardLines(raw) {
 }
 function rewardChanceText(rewards) {
   const list = Array.isArray(rewards) && rewards.length ? rewards : [defaultPixReward()];
-  const total = list.reduce((sum, reward) => sum + (Number(reward.weight) || 0), 0) || 1;
+  const absolute = usesAbsoluteChances(list);
+  const total = list.reduce((sum, reward) => sum + rewardChanceValue(reward), 0) || 1;
   return list.map(reward => {
-    const chance = (((Number(reward.weight) || 0) / total) * 100).toFixed(2).replace(".00", "");
+    const rawChance = rewardChanceValue(reward);
+    const chance = (absolute ? rawChance : (rawChance / total) * 100).toFixed(2).replace(".00", "");
     const description = isPixReward(reward)
       ? (() => {
           const range = pixRewardRange(reward);
@@ -1484,24 +1486,53 @@ function rewardChanceText(rewards) {
 function rewardConfigLine(reward) {
   if (isPixReward(reward)) {
     const range = pixRewardRange(reward);
-    return `${reward.name} | ${reward.weight || 1} | Pix aleatorio | ${range.min} | ${range.max}`;
+    return `${reward.name} | ${rewardChanceValue(reward) || 1} | Pix aleatorio | ${range.min} | ${range.max}`;
   }
 
-  return `${reward.name} | ${reward.weight || 1} | ${reward.description || ""}`;
+  return `${reward.name} | ${rewardChanceValue(reward) || 1} | ${reward.description || ""}`;
+}
+function rewardChanceValue(reward) {
+  const raw = reward?.chance ?? reward?.weight;
+  const value = Number.parseFloat(String(raw ?? "0").replace(",", "."));
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+function usesAbsoluteChances(rewards) {
+  const list = Array.isArray(rewards) ? rewards : [];
+  if (!list.some(reward => reward.chance !== undefined)) return false;
+  const total = list.reduce((sum, reward) => sum + rewardChanceValue(reward), 0);
+  return total > 0 && total <= 100;
 }
 function pickWeightedReward(rewards) {
-  const valid = rewards.filter(reward => Number(reward.weight) > 0);
-  const total = valid.reduce((sum, reward) => sum + Number(reward.weight), 0);
+  const valid = rewards.filter(reward => rewardChanceValue(reward) > 0);
+  const absolute = usesAbsoluteChances(valid);
+  const total = valid.reduce((sum, reward) => sum + rewardChanceValue(reward), 0);
+
+  if (absolute) {
+    let roll = Math.random() * 100;
+    for (const reward of valid) {
+      roll -= rewardChanceValue(reward);
+      if (roll <= 0) return reward;
+    }
+    return { name: "Sem premio", description: "Nenhum premio sorteado nesta unidade.", type: "empty", weight: 0, chance: Math.max(0, 100 - total) };
+  }
+
   let roll = Math.random() * total;
 
   for (const reward of valid) {
-    roll -= Number(reward.weight);
+    roll -= rewardChanceValue(reward);
     if (roll <= 0) return reward;
   }
 
   return valid[valid.length - 1] || { name: "Brinde digital", description: "Brinde digital", weight: 1 };
 }
 function resolveRewardResult(reward) {
+  if (reward?.type === "empty") {
+    return {
+      rewardName: reward.name || "Sem premio",
+      rewardDescription: reward.description || "Nenhum premio sorteado nesta unidade."
+    };
+  }
+
   if (!isPixReward(reward)) {
     return {
       rewardName: reward.name,
@@ -2042,6 +2073,9 @@ function configRows(sessionId) {
       new ButtonBuilder().setCustomId(`cfg:${sessionId}:preset`).setLabel("Presets").setEmoji("📋").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`cfg:${sessionId}:quickedit`).setLabel("Editar compra").setEmoji("🧾").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`cfg:${sessionId}:quickpublish`).setLabel("Publicar compra").setEmoji("🛍️").setStyle(ButtonStyle.Success)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`cfg:${sessionId}:rewards`).setLabel("Sorteio/Chances").setEmoji("🎲").setStyle(ButtonStyle.Primary)
     )
   ];
 }
@@ -2277,6 +2311,42 @@ function productImageUploadMenu(sessionId, panel) {
       })))
   );
 }
+function rewardProductMenu(sessionId, panel) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`reward:${sessionId}`)
+      .setPlaceholder("Produto que vai receber sorteio/chances")
+      .setMinValues(1)
+      .setMaxValues(1)
+      .addOptions(panel.products.slice(0, 25).map(p => ({
+        label: `${productIcon(p)} ${String(p.name).slice(0, 95)}`,
+        description: isMysteryBox(p) ? "Editar chances ja configuradas" : "Transformar este produto em sorteio",
+        value: p.id
+      })))
+  );
+}
+function rewardEditModal(sessionId, p) {
+  const currentRewards = itemRewards(p);
+  const currentValue = currentRewards.length
+    ? currentRewards.map(rewardConfigLine).join("\n")
+    : `${p.name || "Brinde"} | 100 | Brinde digital`;
+
+  return new ModalBuilder()
+    .setCustomId(`modal:${sessionId}:rewards:${p.id}`)
+    .setTitle("Configurar sorteio")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("rewards")
+          .setLabel("Nome | porcentagem | desc/pix")
+          .setPlaceholder("Caixa Pix | 100 | Pix aleatorio | 0 | 1000")
+          .setStyle(TextInputStyle.Paragraph)
+          .setMaxLength(1000)
+          .setRequired(true)
+          .setValue(currentValue.slice(0, 1000))
+      )
+    );
+}
 function presetMenu(sessionId) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
@@ -2439,6 +2509,14 @@ async function handleConfigButton(interaction) {
   if (action === "uploadproduct") {
     if (!panel.products.length) return interaction.reply({ content: "Cadastre um produto antes de enviar foto.", ephemeral: true });
     return interaction.reply({ content: "Escolha o produto que vai receber a foto:", components: [productImageUploadMenu(sessionId, panel)], ephemeral: true });
+  }
+  if (action === "rewards") {
+    if (!panel.products.length) return interaction.reply({ content: "Cadastre um produto antes de configurar sorteio.", ephemeral: true });
+    return interaction.reply({
+      content: "Escolha o produto que vai receber/editar porcentagens de sorteio.",
+      components: [rewardProductMenu(sessionId, panel)],
+      ephemeral: true
+    });
   }
   if (action === "publish") {
     const result = await publishPanelMessage(interaction, panel, s.guildId);
@@ -2608,6 +2686,13 @@ async function handleModal(interaction) {
       target.imageUrl = imageUrl;
     }
   }
+  if (field === "rewards") {
+    const target = product(panel, productId);
+    if (!target) return interaction.reply({ content: "Produto nao encontrado. Reabra o configurador e tente de novo.", ephemeral: true });
+
+    target.type = "mystery_box";
+    target.rewards = parseRewardLines(interaction.fields.getTextInputValue("rewards"));
+  }
   savePanel(s.guildId, panel, s.scopeId);
   await refreshConfig(sessionId);
   return interaction.reply({ content: "Atualizado.", ephemeral: true });
@@ -2680,6 +2765,17 @@ async function handleProductImageUploadTarget(interaction) {
   if (!p) return interaction.reply({ content: "Produto não encontrado. Reabra o configurador e tente de novo.", ephemeral: true });
 
   return queueImageUpload(interaction, sessionId, { target: "product", productId: p.id });
+}
+async function handleRewardProduct(interaction) {
+  const [, sessionId] = interaction.customId.split(":");
+  const s = await sessionOrReply(interaction, sessionId);
+  if (!s) return;
+
+  const panel = getPanel(s.guildId, s.scopeId);
+  const p = product(panel, interaction.values[0]);
+  if (!p) return interaction.reply({ content: "Produto nao encontrado. Reabra o configurador e tente de novo.", ephemeral: true });
+
+  return interaction.showModal(rewardEditModal(sessionId, p));
 }
 async function handlePresetSelect(interaction) {
   const [, sessionId] = interaction.customId.split(":");
@@ -3380,6 +3476,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("edit:")) return handleEditProduct(interaction);
       if (interaction.customId.startsWith("uploadpanel:")) return handlePanelImageUploadTarget(interaction);
       if (interaction.customId.startsWith("uploadproduct:")) return handleProductImageUploadTarget(interaction);
+      if (interaction.customId.startsWith("reward:")) return handleRewardProduct(interaction);
       if (interaction.customId.startsWith("buy:")) return openCart(interaction);
       if (interaction.customId.startsWith("cartadd:")) return addCart(interaction);
     }

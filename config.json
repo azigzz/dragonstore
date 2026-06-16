@@ -30,6 +30,8 @@
   "settings": {
     "finalizeCartOnlyAdmins": true,
     "deleteTicketAfterCloseSeconds": 5,
-    "deleteClosedCartAfterSeconds": 259200
+    "deleteClosedCartAfterSeconds": 259200,
+    "pixBoxMin": 0,
+    "pixBoxMax": 1000
   }
 }
