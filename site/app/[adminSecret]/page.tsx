@@ -8,8 +8,13 @@ export const metadata = {
   title: "Painel Dragon Store"
 };
 
-export default async function SecretAdminPage({ params }: { params: { adminSecret: string } }) {
-  if (params.adminSecret !== adminRouteSecret()) notFound();
+type SecretAdminPageProps = {
+  params: Promise<{ adminSecret: string }>;
+};
+
+export default async function SecretAdminPage({ params }: SecretAdminPageProps) {
+  const { adminSecret } = await params;
+  if (adminSecret !== adminRouteSecret()) notFound();
 
   const loggedIn = await isAdminAuthenticated();
   const initialConfig = loggedIn ? toAdminPayload(await readSiteConfig()) : null;

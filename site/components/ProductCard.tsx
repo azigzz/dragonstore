@@ -4,16 +4,29 @@
 
 import { Plus, PackageCheck } from "lucide-react";
 import { motion } from "framer-motion";
+import { trackEvent } from "@/lib/client-analytics";
 import type { StoreProduct } from "@/lib/types";
 
 type ProductCardProps = {
   product: StoreProduct;
   fallbackImage: string;
+  categoryId?: string;
+  categoryTitle?: string;
   onAdd: (product: StoreProduct) => void;
 };
 
-export default function ProductCard({ product, fallbackImage, onAdd }: ProductCardProps) {
+export default function ProductCard({ product, fallbackImage, categoryId, categoryTitle, onAdd }: ProductCardProps) {
   const image = product.imageUrl || fallbackImage || "/dragon-store-hero.png";
+  function handleAdd() {
+    trackEvent({
+      type: "product_click",
+      productId: product.id,
+      productName: product.name,
+      categoryId,
+      categoryTitle
+    });
+    onAdd(product);
+  }
 
   return (
     <motion.article
@@ -49,7 +62,7 @@ export default function ProductCard({ product, fallbackImage, onAdd }: ProductCa
 
         <button
           type="button"
-          onClick={() => onAdd(product)}
+          onClick={handleAdd}
           className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-white px-3 text-sm font-black text-black transition hover:bg-emerald-200"
         >
           <Plus className="h-4 w-4" />

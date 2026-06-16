@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import CartDrawer, { type CartItem } from "@/components/CartDrawer";
 import CategoryCard from "@/components/CategoryCard";
 import Header from "@/components/Header";
+import { trackEvent } from "@/lib/client-analytics";
 import type { SiteConfig, StoreData, StoreProduct } from "@/lib/types";
 
 type StorefrontProps = {
@@ -48,6 +49,10 @@ export default function Storefront({ store, config }: StorefrontProps) {
     } catch {
       setCart([]);
     }
+  }, []);
+
+  useEffect(() => {
+    trackEvent({ type: "page_view", path: "/" });
   }, []);
 
   useEffect(() => {

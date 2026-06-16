@@ -4,7 +4,7 @@ import { cookies } from "next/headers";
 const COOKIE_NAME = "dragon_store_admin";
 
 export function adminRouteSecret() {
-  return process.env.ADMIN_ROUTE_SECRET || "1po2e3-local";
+  return process.env.ADMIN_ROUTE_SECRET || process.env.NEXT_PUBLIC_ADMIN_ROUTE_SECRET || "jpo33i48j";
 }
 
 function adminPassword() {

@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import CartDrawer, { type CartItem } from "@/components/CartDrawer";
 import Header from "@/components/Header";
 import ProductCard from "@/components/ProductCard";
+import { trackEvent } from "@/lib/client-analytics";
 import { formatBRL } from "@/lib/money";
 import type { SiteConfig, StoreCategory, StoreData, StoreProduct } from "@/lib/types";
 
@@ -56,6 +57,15 @@ export default function CategoryStorefront({ store, config, category }: Category
       setCart([]);
     }
   }, []);
+
+  useEffect(() => {
+    trackEvent({
+      type: "page_view",
+      path: `/categoria/${category.id}`,
+      categoryId: category.id,
+      categoryTitle: category.title
+    });
+  }, [category.id, category.title]);
 
   useEffect(() => {
     window.localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(cart));
@@ -162,6 +172,8 @@ export default function CategoryStorefront({ store, config, category }: Category
                   key={product.id}
                   product={product}
                   fallbackImage={heroImage}
+                  categoryId={category.id}
+                  categoryTitle={category.title}
                   onAdd={addProduct}
                 />
               ))}

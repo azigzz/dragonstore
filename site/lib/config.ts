@@ -62,6 +62,7 @@ function cleanConfig(input: Partial<SiteConfig>): Partial<SiteConfig> {
   if (typeof input.botApiToken === "string" && input.botApiToken.trim()) output.botApiToken = input.botApiToken.trim();
   if (typeof input.primaryColor === "string") output.primaryColor = normalizeColor(input.primaryColor);
   if (typeof input.heroImageUrl === "string") output.heroImageUrl = input.heroImageUrl.slice(0, 500);
+  if (typeof input.manualCatalogEnabled === "boolean") output.manualCatalogEnabled = input.manualCatalogEnabled;
   if (Array.isArray(input.trustBadges)) {
     output.trustBadges = input.trustBadges.map(item => String(item).slice(0, 60)).filter(Boolean).slice(0, 8);
   }
@@ -121,6 +122,7 @@ export async function readSiteConfig(): Promise<SiteConfig> {
     primaryColor: normalizeColor(merged.primaryColor),
     heroImageUrl: merged.heroImageUrl || "/dragon-store-hero.png",
     trustBadges: merged.trustBadges?.length ? merged.trustBadges : baseConfig.trustBadges,
+    manualCatalogEnabled: Boolean(merged.manualCatalogEnabled),
     fallbackCategories: merged.fallbackCategories?.length
       ? merged.fallbackCategories
       : asCategories((fallbackStore as { categories?: unknown }).categories),

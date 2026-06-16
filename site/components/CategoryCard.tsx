@@ -4,6 +4,7 @@
 
 import { ArrowRight, Boxes, PackageCheck } from "lucide-react";
 import Link from "next/link";
+import { trackEvent } from "@/lib/client-analytics";
 import { formatBRL } from "@/lib/money";
 import type { StoreCategory } from "@/lib/types";
 
@@ -32,6 +33,12 @@ export default function CategoryCard({ category, fallbackImage }: CategoryCardPr
   return (
     <Link
       href={`/categoria/${category.id}`}
+      onClick={() => trackEvent({
+        type: "category_click",
+        categoryId: category.id,
+        categoryTitle: category.title,
+        path: `/categoria/${category.id}`
+      })}
       className="group overflow-hidden rounded-lg border border-white/10 bg-[#10141f] shadow-neon transition hover:-translate-y-1 hover:border-emerald-300/35"
     >
       <div className="relative aspect-[16/10] overflow-hidden bg-slate-950">

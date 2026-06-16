@@ -124,10 +124,13 @@ function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
   const botCategories = normalizeCategories(raw.categories, image, raw.title);
   const fallbackProducts = normalizeProducts(config.fallbackProducts || fallbackStore.products, image);
   const fallbackCategories = normalizeCategories(config.fallbackCategories || fallbackCategoriesSource, image, raw.title || config.heroTitle);
-  const products = botCategories.length ? botCategories.flatMap(category => category.products) : botProducts;
+  const manualCategories = config.manualCatalogEnabled ? fallbackCategories : [];
+  const products = manualCategories.length ? manualCategories.flatMap(category => category.products) : botCategories.length ? botCategories.flatMap(category => category.products) : botProducts;
   const finalProducts = products.length ? products : fallbackProducts;
-  const finalCategories = botCategories.length
-    ? botCategories
+  const finalCategories = manualCategories.length
+    ? manualCategories
+    : botCategories.length
+      ? botCategories
     : fallbackCategories.length
       ? fallbackCategories
       : categoryFromProducts(finalProducts, {
@@ -150,7 +153,7 @@ function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
     products: finalProducts,
     updatedAt: raw.updatedAt,
     source: "bot",
-    sourceMessage: "Produtos sincronizados do bot."
+    sourceMessage: config.manualCatalogEnabled ? "Catalogo manual do painel admin." : "Produtos sincronizados do bot."
   };
 }
 

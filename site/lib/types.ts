@@ -49,6 +49,7 @@ export type SiteConfig = {
   primaryColor: string;
   heroImageUrl: string;
   trustBadges: string[];
+  manualCatalogEnabled?: boolean;
   fallbackCategories?: StoreCategory[];
   fallbackProducts?: StoreProduct[];
 };
@@ -56,4 +57,35 @@ export type SiteConfig = {
 export type AdminConfigPayload = Omit<SiteConfig, "botApiToken"> & {
   botApiToken?: string;
   botApiTokenConfigured?: boolean;
+};
+
+export type AnalyticsProductSummary = {
+  productId: string;
+  productName: string;
+  categoryId?: string;
+  categoryTitle?: string;
+  totalClicks: number;
+  todayClicks: number;
+  weekClicks: number;
+  lastClickedAt?: string;
+};
+
+export type AnalyticsSummary = {
+  updatedAt: string;
+  totals: {
+    todayVisitors: number;
+    weekVisitors: number;
+    todayPageViews: number;
+    weekPageViews: number;
+    totalPageViews: number;
+    totalProductClicks: number;
+  };
+  topProducts: AnalyticsProductSummary[];
+  recentEvents: Array<{
+    type: string;
+    path?: string;
+    productName?: string;
+    categoryTitle?: string;
+    createdAt: string;
+  }>;
 };
