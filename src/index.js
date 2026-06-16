@@ -20,14 +20,23 @@ const {
 } = require("discord.js");
 
 const config = require("../config.json");
+const DEFAULT_CUSTOMER_ROLE_ID = "1515799363149103138";
 
 const PORT = process.env.PORT || 3000;
 http.createServer(handleHttpRequest).listen(PORT, () => console.log(`Health server rodando na porta ${PORT}`));
 
-const DATA_DIR = path.join(__dirname, "..", "data");
+const DATA_DIR = process.env.BOT_DATA_DIR || path.join(__dirname, "..", "data");
 const PANELS_FILE = path.join(DATA_DIR, "panels.json");
 const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
 const STAFF_FILE = path.join(DATA_DIR, "staff.json");
+const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "";
+const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const BOT_KV_PREFIX = process.env.BOT_KV_PREFIX || "dragon-store:bot";
+const KV_FILE_KEYS = {
+  [PANELS_FILE]: `${BOT_KV_PREFIX}:panels`,
+  [ORDERS_FILE]: `${BOT_KV_PREFIX}:orders`,
+  [STAFF_FILE]: `${BOT_KV_PREFIX}:staff`
+};
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PANELS_FILE)) fs.writeFileSync(PANELS_FILE, JSON.stringify({ guilds: {} }, null, 2));
@@ -49,10 +58,90 @@ function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); }
   catch { return fallback; }
 }
-function writeJson(file, data) {
+function writeJsonLocal(file, data) {
   const tmpFile = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
   fs.renameSync(tmpFile, file);
+}
+function writeJson(file, data) {
+  writeJsonLocal(file, data);
+  persistJsonToKv(file, data).catch(error => {
+    console.log(`Nao consegui salvar ${path.basename(file)} no KV: ${error.message}`);
+  });
+}
+function kvEnabled() {
+  return Boolean(KV_REST_API_URL && KV_REST_API_TOKEN);
+}
+function kvBaseUrl() {
+  return KV_REST_API_URL.replace(/\/$/, "");
+}
+async function readJsonFromKv(key) {
+  if (!kvEnabled()) return null;
+  const response = await fetch(`${kvBaseUrl()}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` },
+    cache: "no-store"
+  });
+  if (!response.ok) throw new Error(`KV GET HTTP ${response.status}`);
+  const payload = await response.json();
+  if (!payload?.result) return null;
+  return typeof payload.result === "string" ? JSON.parse(payload.result) : payload.result;
+}
+async function writeJsonToKv(key, data) {
+  if (!kvEnabled()) return false;
+  const response = await fetch(`${kvBaseUrl()}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${KV_REST_API_TOKEN}`,
+      "Content-Type": "text/plain"
+    },
+    body: JSON.stringify(data)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.error) throw new Error(payload.error || `KV SET HTTP ${response.status}`);
+  return true;
+}
+function hasUsefulPersistedData(file, data) {
+  if (!data || typeof data !== "object") return false;
+  if (file === PANELS_FILE || file === STAFF_FILE) return Object.keys(data.guilds || {}).length > 0;
+  if (file === ORDERS_FILE) {
+    return Object.keys(data.orders || {}).length > 0 ||
+      Object.keys(data.tickets || {}).length > 0 ||
+      Object.keys(data.customers || {}).length > 0;
+  }
+  return Object.keys(data).length > 0;
+}
+async function hydrateJsonFromKv(file, fallback) {
+  const key = KV_FILE_KEYS[file];
+  if (!key || !kvEnabled()) return false;
+  const remote = await readJsonFromKv(key).catch(error => {
+    console.log(`Nao consegui carregar ${path.basename(file)} do KV: ${error.message}`);
+    return null;
+  });
+  if (!hasUsefulPersistedData(file, remote)) return false;
+  writeJsonLocal(file, remote || fallback);
+  console.log(`${path.basename(file)} carregado do KV.`);
+  return true;
+}
+async function persistJsonToKv(file, data) {
+  const key = KV_FILE_KEYS[file];
+  if (!key || !kvEnabled()) return false;
+  return writeJsonToKv(key, data);
+}
+async function hydratePersistentFiles() {
+  if (!kvEnabled()) {
+    console.log("KV do bot nao configurado; usando JSON local para paineis, pedidos e Pix.");
+    return;
+  }
+
+  await Promise.all([
+    hydrateJsonFromKv(PANELS_FILE, { guilds: {} }),
+    hydrateJsonFromKv(ORDERS_FILE, { orders: {}, tickets: {}, customers: {} }),
+    hydrateJsonFromKv(STAFF_FILE, { guilds: {} })
+  ]);
+}
+async function flushPersistentFile(file) {
+  const data = readJson(file, {});
+  await persistJsonToKv(file, data);
 }
 function ensureOrdersStore(db) {
   const store = db && typeof db === "object" ? db : {};
@@ -510,7 +599,7 @@ async function sendStaffChoiceMessage(channel, order, guildId) {
 }
 async function assumeOrder(interaction, id) {
   const db = readOrders();
-  const order = db.orders[id];
+  const order = orderForAction(db, id, interaction);
 
   if (!order || order.status !== "open") {
     return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
@@ -537,15 +626,15 @@ async function assumeOrder(interaction, id) {
   order.assignedAdminId = interaction.user.id;
   order.assignedAdminName = profile.displayName || interaction.user.username;
   order.assignedAt = new Date().toISOString();
-  db.orders[id] = order;
+  db.orders[order.id] = order;
   writeOrders(db);
 
-  const panel = getOrderPanel(order, interaction.guildId);
+  const panel = getOrderPanel(order, actionGuildId(interaction));
 
   await interaction.channel.send({
-    content: `✅ Compra #${id} assumida por **${order.assignedAdminName}** (<@${interaction.user.id}>).`,
+    content: `✅ Compra #${order.id} assumida por **${order.assignedAdminName}** (<@${interaction.user.id}>).`,
     embeds: [buildPixEmbed(order, panel, profile)],
-    components: staffChoiceRows(id, true)
+    components: staffChoiceRows(order.id, true)
   });
 
   await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
@@ -554,7 +643,7 @@ async function assumeOrder(interaction, id) {
 }
 async function resendPix(interaction, id) {
   const db = readOrders();
-  const order = db.orders[id];
+  const order = orderForAction(db, id, interaction);
 
   if (!order || order.status !== "open") {
     return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
@@ -573,7 +662,7 @@ async function resendPix(interaction, id) {
     return interaction.reply({ content: "O ADM responsável não tem Pix configurado mais.", ephemeral: true });
   }
 
-  const panel = getOrderPanel(order, interaction.guildId);
+  const panel = getOrderPanel(order, actionGuildId(interaction));
   await interaction.channel.send({ embeds: [buildPixEmbed(order, panel, profile)] });
   await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
 
@@ -632,6 +721,9 @@ async function handlePixModal(interaction) {
     qrCodeUrl,
     note,
     online: false
+  });
+  await flushPersistentFile(STAFF_FILE).catch(error => {
+    console.log(`Nao consegui confirmar Pix no KV agora: ${error.message}`);
   });
 
   await refreshStaffPanel(interaction.guildId);
@@ -1149,6 +1241,22 @@ function getOrderPanel(order, guildId) {
   return (order?.panelId && getPanelById(guildId, order.panelId)) ||
     getPanel(guildId, order?.panelScopeId || order?.scopeId || "default");
 }
+function findOrderInChannel(db, context, openOnly = true) {
+  const guildId = actionGuildId(context);
+  const channelId = context?.channel?.id || context?.channelId;
+  if (!guildId || !channelId) return null;
+
+  return Object.values(db.orders || {}).find(order =>
+    order.guildId === guildId &&
+    order.channelId === channelId &&
+    (!openOnly || order.status === "open")
+  ) || null;
+}
+function orderForAction(db, id, context, openOnly = true) {
+  const order = db.orders?.[id];
+  if (order && (!openOnly || order.status === "open")) return order;
+  return findOrderInChannel(db, context, openOnly) || order || null;
+}
 function product(panel, id) { return (panel.products || []).find(p => p.id === id); }
 function normalizeProductInput({ name, price, description, stock, imageUrl }) {
   const cleanImage = clampText(imageUrl, 500);
@@ -1264,16 +1372,26 @@ function successOrderLine(order, panel) {
   return lines.join(", ") || "Pedido personalizado 1x";
 }
 function configuredCustomerRoleId(guildId) {
+  return configuredCustomerRoleIds(guildId)[0] || "";
+}
+function configuredCustomerRoleIds(guildId) {
   const staff = getStaffGuild(guildId);
-  return staff.customerRoleId || process.env.CUSTOMER_ROLE_ID || config.customerRoleId || "";
+  return [
+    staff.customerRoleId,
+    process.env.CUSTOMER_ROLE_ID,
+    config.customerRoleId,
+    DEFAULT_CUSTOMER_ROLE_ID
+  ].map(value => String(value || "").trim()).filter(Boolean).filter((value, index, list) => list.indexOf(value) === index);
 }
 async function grantCustomerRole(guild, userId) {
-  const roleId = configuredCustomerRoleId(guild.id);
-  if (!roleId) return false;
+  const roleIds = configuredCustomerRoleIds(guild.id);
+  if (!roleIds.length) return false;
 
   try {
     const member = await guild.members.fetch(userId);
-    await member.roles.add(roleId, "Compra finalizada na Dragon Store");
+    for (const roleId of roleIds) {
+      await member.roles.add(roleId, "Compra finalizada na Dragon Store");
+    }
     return true;
   } catch (error) {
     console.log(`Nao consegui adicionar cargo cliente para ${userId}: ${error.message}`);
@@ -3156,30 +3274,30 @@ async function handleQuickOrderSubmit(interaction) {
 }
 async function addCart(interaction) {
   const [, id] = interaction.customId.split(":");
-  const db = readOrders(); const order = db.orders[id];
+  const db = readOrders(); const order = orderForAction(db, id, interaction);
   if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Você não pode alterar esse carrinho.", ephemeral: true });
-  const panel = getOrderPanel(order, interaction.guildId); const p = product(panel, interaction.values[0]);
+  const panel = getOrderPanel(order, actionGuildId(interaction)); const p = product(panel, interaction.values[0]);
   if (!p) return interaction.reply({ content: "Produto não encontrado.", ephemeral: true });
-  await resetSelectMessage(interaction, { components: [productSelect(panel, `cartadd:${id}`), cartButtons(id)] });
+  await resetSelectMessage(interaction, { components: [productSelect(panel, `cartadd:${order.id}`), cartButtons(order.id)] });
   const item = order.items.find(i => i.productId === p.id);
   if (item) item.quantity += 1; else order.items.push(orderItemFromProduct(p));
-  db.orders[id] = order; writeOrders(db);
+  db.orders[order.id] = order; writeOrders(db);
   await interaction.reply({ content: `Adicionado: ${productIcon(p)} **${p.name}** — ${p.price}`, ephemeral: true });
   return interaction.channel.send({ embeds: [productInfoEmbed(p, panel, "Produto adicionado"), cartEmbed(order, panel)] });
 }
 async function callAdmin(interaction, id, type = "order") {
-  const db = readOrders(); const record = type === "ticket" ? db.tickets[id] : db.orders[id];
+  const db = readOrders(); const record = type === "ticket" ? db.tickets[id] : orderForAction(db, id, interaction);
   if (!record || record.status !== "open") return interaction.reply({ content: "Canal fechado ou inexistente.", ephemeral: true });
   if (interaction.user.id !== record.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissão.", ephemeral: true });
-  await interaction.channel.send({ content: `<@&${config.adminRoleId}> ${config.messages.adminCall}\nID: **${id}** | Cliente: <@${record.userId}>` });
+  await interaction.channel.send({ content: `<@&${config.adminRoleId}> ${config.messages.adminCall}\nID: **${record.id || id}** | Cliente: <@${record.userId}>` });
   return interaction.reply({ content: "ADM chamado.", ephemeral: true });
 }
 async function viewCart(interaction, id) {
-  const db = readOrders(); const order = db.orders[id];
+  const db = readOrders(); const order = orderForAction(db, id, interaction, false);
   if (!order) return interaction.reply({ content: "Carrinho não encontrado.", ephemeral: true });
   if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissão.", ephemeral: true });
-  return interaction.reply({ embeds: [cartEmbed(order, getOrderPanel(order, interaction.guildId))], ephemeral: true });
+  return interaction.reply({ embeds: [cartEmbed(order, getOrderPanel(order, actionGuildId(interaction)))], ephemeral: true });
 }
 function actionUser(context) {
   return context.user || context.author;
@@ -3267,7 +3385,7 @@ async function finishCurrentCartWithReview(context, options = {}) {
 async function cancelCart(interaction, id) {
   const actor = actionUser(interaction);
   const guildId = actionGuildId(interaction);
-  const db = readOrders(); const order = db.orders[id];
+  const db = readOrders(); const order = orderForAction(db, id, interaction);
   if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   if (actor.id !== order.userId && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Sem permissao para cancelar esse carrinho.", ephemeral: true });
 
@@ -3279,31 +3397,31 @@ async function cancelCart(interaction, id) {
   order.cancelledById = actor.id;
   order.cancelledByName = interaction.member?.displayName || actor.username;
   order.channelDeletedAt = now;
-  db.orders[id] = order;
+  db.orders[order.id] = order;
   writeOrders(db);
 
   await sendSafeDM(order.userId, {
     embeds: [
       new EmbedBuilder()
         .setTitle("Compra cancelada")
-        .setDescription(`O carrinho #${id} foi cancelado.\n\nResumo:\n${cartText(order, panel)}`.slice(0, 4096))
+        .setDescription(`O carrinho #${order.id} foi cancelado.\n\nResumo:\n${cartText(order, panel)}`.slice(0, 4096))
         .setColor(0xff5c7a)
         .setTimestamp()
     ]
   });
 
-  await actionReply(interaction, { content: `Carrinho #${id} cancelado. Apagando este chat agora.`, ephemeral: true });
-  setTimeout(() => interaction.channel.delete(`Carrinho ${id} cancelado`).catch(error => {
-    console.log(`Nao consegui apagar carrinho cancelado ${id}: ${error.message}`);
+  await actionReply(interaction, { content: `Carrinho #${order.id} cancelado. Apagando este chat agora.`, ephemeral: true });
+  setTimeout(() => interaction.channel.delete(`Carrinho ${order.id} cancelado`).catch(error => {
+    console.log(`Nao consegui apagar carrinho cancelado ${order.id}: ${error.message}`);
   }), 1500);
 }
 async function finishCart(interaction, id, options = {}) {
   const actor = actionUser(interaction);
   const guildId = actionGuildId(interaction);
-  const db = readOrders(); const order = db.orders[id];
-  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
-  if (config.settings.finalizeCartOnlyAdmins && !isAdmin(interaction.member)) return interaction.reply({ content: "Só admin finaliza. Clique em **Chamar ADM**.", ephemeral: true });
-  const panel = getOrderPanel(order, interaction.guildId);
+  const db = readOrders(); const order = orderForAction(db, id, interaction);
+  if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (config.settings.finalizeCartOnlyAdmins && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Só admin finaliza. Clique em **Chamar ADM**.", ephemeral: true });
+  const panel = getOrderPanel(order, guildId);
   const mysteryResults = Array.isArray(order.mysteryResults) && order.mysteryResults.length
     ? order.mysteryResults
     : rollMysteryBoxes(order, panel);
@@ -3313,15 +3431,15 @@ async function finishCart(interaction, id, options = {}) {
   order.closedByAdminId = actor.id;
   order.closedByAdminName = interaction.member?.displayName || actor.username;
   recordCustomerSpend(db, order, panel);
-  db.orders[id] = order;
+  db.orders[order.id] = order;
   writeOrders(db);
-  await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "fechado") : `carrinho-${safeName(order.username)}-fechado-${id}`).catch(() => null);
+  await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "fechado") : `carrinho-${safeName(order.username)}-fechado-${order.id}`).catch(() => null);
   if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
   await grantCustomerRole(interaction.guild, order.userId);
-  await sendSuccessFeed(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar feed da venda ${id}: ${error.message}`));
+  await sendSuccessFeed(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar feed da venda ${order.id}: ${error.message}`));
   scheduleCartDeletion(order);
-  const thanks = config.messages.purchaseThanks.replaceAll("{id}", id);
+  const thanks = config.messages.purchaseThanks.replaceAll("{id}", order.id);
   const extraEmbed = mysteryResultsEmbed(mysteryResults, panel);
   const reviewResult = options.requestReview
     ? await sendReviewRequest(interaction, order, options).catch(error => ({ ok: false, message: `Nao consegui enviar avaliacao: ${error.message}` }))
@@ -3345,7 +3463,7 @@ ${cartText(order, panel)}`.slice(0, 4096))
   });
 
   const reviewText = reviewResult ? ` ${reviewResult.message}` : "";
-  return actionReply(interaction, { content: mysteryResults.length ? `Compra #${id} finalizada e caixa surpresa sorteada.${reviewText}` : `Compra #${id} finalizada.${reviewText}`, ephemeral: true });
+  return actionReply(interaction, { content: mysteryResults.length ? `Compra #${order.id} finalizada e caixa surpresa sorteada.${reviewText}` : `Compra #${order.id} finalizada.${reviewText}`, ephemeral: true });
 }
 
 function ticketPanelEmbed() { return new EmbedBuilder().setTitle(config.ticketPanel.title).setDescription(config.ticketPanel.description).setColor(parseColor(config.ticketPanel.embedColor, 0x2b2d31)); }
@@ -3587,4 +3705,11 @@ if (!token) {
   console.error("DISCORD_TOKEN não configurado.");
   process.exit(1);
 }
-client.login(token);
+async function boot() {
+  await hydratePersistentFiles();
+  await client.login(token);
+}
+boot().catch(error => {
+  console.error("Falha ao iniciar bot:", error);
+  process.exit(1);
+});
