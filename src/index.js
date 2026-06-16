@@ -192,6 +192,53 @@ function parsePrice(value) {
 function money(value) {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
+function plainText(value) {
+  return String(value || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+function pixBoxDefaults() {
+  const min = Number.parseFloat(String(process.env.PIX_BOX_MIN ?? config.settings?.pixBoxMin ?? 0).replace(",", "."));
+  const max = Number.parseFloat(String(process.env.PIX_BOX_MAX ?? config.settings?.pixBoxMax ?? 1000).replace(",", "."));
+  const cleanMin = Number.isFinite(min) ? Math.max(0, min) : 0;
+  const cleanMax = Number.isFinite(max) ? Math.max(cleanMin, max) : 1000;
+  return { min: cleanMin, max: cleanMax };
+}
+function parsePixAmount(value) {
+  const parsed = parsePrice(value);
+  return parsed === null ? null : Math.max(0, parsed);
+}
+function parsePixRangeFromText(value) {
+  const text = String(value || "");
+  const match = text.match(/(?:pix|valor|faixa|range)?[^0-9]*(\d+(?:[,.]\d{1,2})?)\s*(?:a|ate|até|para|to|-|~|\s+)\s*(\d+(?:[,.]\d{1,2})?)/i);
+  if (!match) return null;
+
+  const first = parsePixAmount(match[1]);
+  const second = parsePixAmount(match[2]);
+  if (first === null || second === null) return null;
+
+  return {
+    min: Math.min(first, second),
+    max: Math.max(first, second)
+  };
+}
+function normalizePixRange(minValue, maxValue, fallbackText = "") {
+  const defaults = pixBoxDefaults();
+  const fromColumns = parsePixAmount(minValue) !== null && parsePixAmount(maxValue) !== null
+    ? { min: parsePixAmount(minValue), max: parsePixAmount(maxValue) }
+    : null;
+  const fromText = parsePixRangeFromText(fallbackText);
+  const range = fromColumns || fromText || defaults;
+  return {
+    min: Math.min(range.min, range.max),
+    max: Math.max(range.min, range.max)
+  };
+}
+function randomPixAmount(min, max) {
+  const low = Math.round(Math.min(min, max) * 100);
+  const high = Math.round(Math.max(min, max) * 100);
+  return (Math.floor(Math.random() * (high - low + 1)) + low) / 100;
+}
 function publicDiscordInviteUrl(value) {
   const target = "https://discord.gg/ZyxwUekHWh";
   const raw = String(value || "").trim();
@@ -1358,8 +1405,34 @@ function orderId(type) {
   return id;
 }
 
+function isPixBox(item) {
+  const text = plainText(`${item?.name || ""} ${item?.description || ""}`);
+  return item?.type === "pix_box" || /\bcaixa\b/.test(text) && /\bpix\b/.test(text);
+}
+function isPixReward(reward) {
+  const text = plainText(`${reward?.name || ""} ${reward?.description || ""}`);
+  return reward?.type === "pix" || /\bpix\b/.test(text);
+}
+function pixRewardRange(reward = {}) {
+  return normalizePixRange(reward.pixMin, reward.pixMax, `${reward.name || ""} ${reward.description || ""}`);
+}
+function defaultPixReward(item = {}) {
+  const range = pixBoxDefaults();
+  return {
+    name: item.name || "Caixa Pix",
+    description: `Pix aleatorio entre ${money(range.min)} e ${money(range.max)}`,
+    weight: 100,
+    type: "pix",
+    pixMin: range.min,
+    pixMax: range.max
+  };
+}
+function itemRewards(item) {
+  const rewards = Array.isArray(item?.rewards) ? item.rewards.filter(reward => Number(reward.weight) > 0) : [];
+  return rewards.length ? rewards : isPixBox(item) ? [defaultPixReward(item)] : [];
+}
 function isMysteryBox(item) {
-  return item?.type === "mystery_box" && Array.isArray(item.rewards) && item.rewards.length > 0;
+  return (item?.type === "mystery_box" || isPixBox(item)) && itemRewards(item).length > 0;
 }
 function productIcon(item) {
   return isMysteryBox(item) ? "🎁" : "🛒";
@@ -1373,8 +1446,20 @@ function parseRewardLines(raw) {
       const parts = line.split("|").map(part => part.trim());
       const name = parts[0] || "Brinde surpresa";
       const weight = Math.max(0, Number.parseFloat((parts[1] || "1").replace(",", ".")) || 1);
-      const description = parts.slice(2).join(" | ") || "Brinde digital";
-      return { name: name.slice(0, 100), description: description.slice(0, 200), weight };
+      const description = parts[2] || "Brinde digital";
+      const extraText = parts.slice(2).join(" | ");
+      const pixLike = /\bpix\b/.test(plainText(`${name} ${extraText}`));
+      const reward = { name: name.slice(0, 100), description: description.slice(0, 200), weight };
+
+      if (pixLike) {
+        const range = normalizePixRange(parts[3], parts[4], extraText);
+        reward.type = "pix";
+        reward.pixMin = range.min;
+        reward.pixMax = range.max;
+        reward.description = `Pix aleatorio entre ${money(range.min)} e ${money(range.max)}`;
+      }
+
+      return reward;
     })
     .filter(reward => reward.weight > 0);
 
@@ -1383,11 +1468,26 @@ function parseRewardLines(raw) {
   ];
 }
 function rewardChanceText(rewards) {
-  const total = rewards.reduce((sum, reward) => sum + (Number(reward.weight) || 0), 0) || 1;
-  return rewards.map(reward => {
+  const list = Array.isArray(rewards) && rewards.length ? rewards : [defaultPixReward()];
+  const total = list.reduce((sum, reward) => sum + (Number(reward.weight) || 0), 0) || 1;
+  return list.map(reward => {
     const chance = (((Number(reward.weight) || 0) / total) * 100).toFixed(2).replace(".00", "");
-    return `• **${reward.name}** — ${chance}% (${reward.description || "brinde digital"})`;
+    const description = isPixReward(reward)
+      ? (() => {
+          const range = pixRewardRange(reward);
+          return `Pix de ${money(range.min)} ate ${money(range.max)}`;
+        })()
+      : reward.description || "brinde digital";
+    return `• **${reward.name}** — ${chance}% (${description})`;
   }).join("\n");
+}
+function rewardConfigLine(reward) {
+  if (isPixReward(reward)) {
+    const range = pixRewardRange(reward);
+    return `${reward.name} | ${reward.weight || 1} | Pix aleatorio | ${range.min} | ${range.max}`;
+  }
+
+  return `${reward.name} | ${reward.weight || 1} | ${reward.description || ""}`;
 }
 function pickWeightedReward(rewards) {
   const valid = rewards.filter(reward => Number(reward.weight) > 0);
@@ -1401,6 +1501,25 @@ function pickWeightedReward(rewards) {
 
   return valid[valid.length - 1] || { name: "Brinde digital", description: "Brinde digital", weight: 1 };
 }
+function resolveRewardResult(reward) {
+  if (!isPixReward(reward)) {
+    return {
+      rewardName: reward.name,
+      rewardDescription: reward.description || "Brinde digital"
+    };
+  }
+
+  const range = pixRewardRange(reward);
+  const amount = randomPixAmount(range.min, range.max);
+  return {
+    rewardName: `${reward.name} - ${money(amount)}`,
+    rewardDescription: `Valor Pix sorteado: **${money(amount)}**`,
+    rewardType: "pix",
+    pixAmount: amount,
+    pixMin: range.min,
+    pixMax: range.max
+  };
+}
 function rollMysteryBoxes(order, panel) {
   const results = [];
 
@@ -1408,14 +1527,15 @@ function rollMysteryBoxes(order, panel) {
     const p = orderItemDetails(item, panel);
     if (!isMysteryBox(p)) continue;
 
+    const rewards = itemRewards(p);
     const quantity = Math.max(1, Number(item.quantity) || 1);
     for (let i = 0; i < quantity; i++) {
-      const reward = pickWeightedReward(p.rewards);
+      const reward = pickWeightedReward(rewards);
+      const resolved = resolveRewardResult(reward);
       results.push({
         boxProductId: p.productId,
         boxName: p.name,
-        rewardName: reward.name,
-        rewardDescription: reward.description || "Brinde digital",
+        ...resolved,
         rolledAt: new Date().toISOString()
       });
     }
@@ -1437,7 +1557,7 @@ function mysteryResultsEmbed(results, panel) {
     .setTitle("🎁 Resultado da Caixa Surpresa")
     .setDescription(mysteryResultsText(results).slice(0, 4096))
     .setColor(parseColor(panel.color))
-    .setFooter({ text: "Sorteio de brindes digitais, sem prêmio em dinheiro/Pix." })
+    .setFooter({ text: "Resultado gerado automaticamente ao finalizar a compra." })
     .setTimestamp();
 }
 
@@ -1999,7 +2119,7 @@ function editModal(sessionId, field, panel) {
     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("price").setLabel("Valor").setPlaceholder("R$ 0,10").setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true)),
     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("pdesc").setLabel("Descrição curta").setPlaceholder("Sorteia um brinde digital após finalizar").setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false)),
     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("stock").setLabel("Estoque").setPlaceholder("infinito").setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(false)),
-    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("rewards").setLabel("Brindes: nome | peso | descrição").setPlaceholder("Mini Pack | 70 | 10 cortes aleatórios\nPack Premium | 5 | pack raro").setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true))
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("rewards").setLabel("Brindes: nome | peso | desc/pix").setPlaceholder("Caixa Pix | 100 | Pix aleatorio | 0 | 1000\nPack Premium | 5 | pack raro").setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true))
   );
   return modal;
 }
@@ -2053,11 +2173,12 @@ function productEditModal(sessionId, p) {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId("rewards")
-          .setLabel("Brindes: nome | peso | descrição")
+          .setLabel("Brindes: nome | peso | desc/pix")
+          .setPlaceholder("Caixa Pix | 100 | Pix aleatorio | 0 | 1000")
           .setStyle(TextInputStyle.Paragraph)
           .setMaxLength(1000)
           .setRequired(true)
-          .setValue((p.rewards || []).map(reward => `${reward.name} | ${reward.weight} | ${reward.description || ""}`).join("\n").slice(0, 1000))
+          .setValue(itemRewards(p).map(rewardConfigLine).join("\n").slice(0, 1000))
       )
     );
   } else {
@@ -2463,6 +2584,7 @@ async function handleModal(interaction) {
   if (field === "edit") {
     const target = product(panel, productId);
     if (!target) return interaction.reply({ content: "Produto não encontrado. Reabra o configurador e tente de novo.", ephemeral: true });
+    const wasMysteryBox = isMysteryBox(target);
 
     const patch = normalizeProductInput({
       name: interaction.fields.getTextInputValue("name"),
@@ -2477,7 +2599,8 @@ async function handleModal(interaction) {
     target.description = patch.description;
     target.stock = patch.stock;
 
-    if (isMysteryBox(target)) {
+    if (wasMysteryBox || isMysteryBox(target)) {
+      if (target.type !== "mystery_box" && target.type !== "pix_box") target.type = "mystery_box";
       target.rewards = parseRewardLines(interaction.fields.getTextInputValue("rewards"));
     } else {
       const imageUrl = interaction.fields.getTextInputValue("imageUrl").trim();
