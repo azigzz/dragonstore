@@ -31,10 +31,15 @@
     "enabled": true,
     "channelId": "1515799364155478138"
   },
+  "cancellation": {
+    "enabled": true,
+    "channelId": "1516561891919528037"
+  },
   "settings": {
     "finalizeCartOnlyAdmins": true,
     "deleteTicketAfterCloseSeconds": 5,
     "deleteClosedCartAfterSeconds": 259200,
+    "adminCallCooldownSeconds": 20,
     "pixBoxMin": 0,
     "pixBoxMax": 1000
   }

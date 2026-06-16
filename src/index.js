@@ -22,6 +22,7 @@ const {
 const config = require("../config.json");
 const DEFAULT_CUSTOMER_ROLE_ID = "1515799363149103138";
 const DEFAULT_COMPLETION_CHANNEL_ID = "1515799364155478138";
+const DEFAULT_CANCELLATION_CHANNEL_ID = "1516561891919528037";
 
 const PORT = process.env.PORT || 3000;
 http.createServer(handleHttpRequest).listen(PORT, () => console.log(`Health server rodando na porta ${PORT}`));
@@ -584,9 +585,10 @@ async function sendStaffChoiceMessage(channel, order, guildId) {
     }
 
     await channel.send({
-      content: `✅ Compra assumida automaticamente por **${profile.displayName || "ADM"}**, único ADM online.`,
+      content: `<@${order.userId}> ✅ Compra assumida automaticamente por **${profile.displayName || "ADM"}**, único ADM online.`,
       embeds: [buildPixEmbed(order, panel, profile)],
-      components: staffChoiceRows(order.id, true)
+      components: staffChoiceRows(order.id, true),
+      allowedMentions: { users: [order.userId] }
     });
 
     await sendSafeDM(order.userId, {
@@ -633,9 +635,10 @@ async function assumeOrder(interaction, id) {
   const panel = getOrderPanel(order, actionGuildId(interaction));
 
   await interaction.channel.send({
-    content: `✅ Compra #${order.id} assumida por **${order.assignedAdminName}** (<@${interaction.user.id}>).`,
+    content: `<@${order.userId}> ✅ Compra #${order.id} assumida por **${order.assignedAdminName}** (<@${interaction.user.id}>).`,
     embeds: [buildPixEmbed(order, panel, profile)],
-    components: staffChoiceRows(order.id, true)
+    components: staffChoiceRows(order.id, true),
+    allowedMentions: { users: [order.userId, interaction.user.id] }
   });
 
   await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
@@ -1378,6 +1381,22 @@ function completionChannelId() {
 function completionFeedEnabled() {
   return config.completion?.enabled !== false && process.env.COMPLETION_FEED_ENABLED !== "false";
 }
+function cancellationChannelId() {
+  return String(process.env.CANCELLATION_CHANNEL_ID || config.cancellation?.channelId || DEFAULT_CANCELLATION_CHANNEL_ID).trim();
+}
+function cancellationFeedEnabled() {
+  return config.cancellation?.enabled !== false && process.env.CANCELLATION_FEED_ENABLED !== "false";
+}
+function adminCallCooldownSeconds() {
+  const configured = Number(process.env.ADMIN_CALL_COOLDOWN_SECONDS ?? config.settings?.adminCallCooldownSeconds ?? 20);
+  return Number.isFinite(configured) && configured > 0 ? configured : 20;
+}
+function adminCallCooldownRemaining(record) {
+  const last = Date.parse(record?.lastAdminCallAt || "");
+  if (!Number.isFinite(last)) return 0;
+  const remaining = Math.ceil((last + adminCallCooldownSeconds() * 1000 - Date.now()) / 1000);
+  return Math.max(0, remaining);
+}
 function configuredCustomerRoleId(guildId) {
   return configuredCustomerRoleIds(guildId)[0] || "";
 }
@@ -1445,6 +1464,35 @@ async function sendCompletionReceipt(guild, order, panel) {
 
   await channel.send({
     content: `Compra finalizada! <@${order.userId}> - ${products}`,
+    embeds: [embed],
+    allowedMentions: { users: [order.userId] }
+  });
+  return true;
+}
+async function sendCancellationNotice(guild, order, panel, actor) {
+  if (!cancellationFeedEnabled()) return false;
+  if (actor?.id && actor.id !== order.userId && config.cancellation?.notifyAdminCancels !== true) return false;
+
+  const channelId = cancellationChannelId();
+  if (!channelId) return false;
+
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased()) return false;
+
+  const products = successOrderLine(order, panel);
+  const embed = new EmbedBuilder()
+    .setTitle("Compra cancelada")
+    .setDescription(`<@${order.userId}> cancelou a compra.`)
+    .setColor(0xff5c7a)
+    .addFields(
+      { name: "Cliente", value: `<@${order.userId}>`, inline: true },
+      { name: "Pedido", value: `#${order.id}`, inline: true },
+      { name: "Produtos", value: products.slice(0, 1024), inline: false }
+    )
+    .setTimestamp(new Date(order.cancelledAt || Date.now()));
+
+  await channel.send({
+    content: `<@${order.userId}> compra cancelada.`,
     embeds: [embed],
     allowedMentions: { users: [order.userId] }
   });
@@ -3326,6 +3374,17 @@ async function callAdmin(interaction, id, type = "order") {
   const db = readOrders(); const record = type === "ticket" ? db.tickets[id] : orderForAction(db, id, interaction);
   if (!record || record.status !== "open") return interaction.reply({ content: "Canal fechado ou inexistente.", ephemeral: true });
   if (interaction.user.id !== record.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Sem permissão.", ephemeral: true });
+
+  const remaining = adminCallCooldownRemaining(record);
+  if (remaining > 0) {
+    return interaction.reply({ content: `Aguarde ${remaining}s para chamar ADM de novo.`, ephemeral: true });
+  }
+
+  record.lastAdminCallAt = new Date().toISOString();
+  if (type === "ticket") db.tickets[record.id || id] = record;
+  else db.orders[record.id] = record;
+  writeOrders(db);
+
   await interaction.channel.send({ content: `<@&${config.adminRoleId}> ${config.messages.adminCall}\nID: **${record.id || id}** | Cliente: <@${record.userId}>` });
   return interaction.reply({ content: "ADM chamado.", ephemeral: true });
 }
@@ -3435,6 +3494,9 @@ async function cancelCart(interaction, id) {
   order.channelDeletedAt = now;
   db.orders[order.id] = order;
   writeOrders(db);
+  await sendCancellationNotice(interaction.guild, order, panel, actor).catch(error => {
+    console.log(`Nao consegui enviar aviso de cancelamento ${order.id}: ${error.message}`);
+  });
 
   await sendSafeDM(order.userId, {
     embeds: [
