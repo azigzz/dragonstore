@@ -66,6 +66,8 @@ npm start
 No Discord:
 
 ```txt
+/help
+!help
 /configds
 !configds
 /setup-atendimento
@@ -117,6 +119,7 @@ Se `/configpix` nao aparecer ou disser que falta permissao, use `!configpix`: o 
 
 Comandos operacionais uteis:
 
+- `/help` ou `!help`: mostra a lista de comandos; ADMs veem tambem a area administrativa.
 - `/salvarpix` ou `!salvarpix`: salva o backup do Pix/painel de atendimento no Discord.
 - `/caixapix quantidade:5` ou `!caixapix 5`: sorteia Caixa Pix com o preset padrao, sem mostrar porcentagens ao cliente.
 - `/carrinho cliente:@usuario` ou `!carrinho @usuario`: abre um carrinho privado manual para o cliente.

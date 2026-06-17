@@ -3776,6 +3776,66 @@ function cartButtons(orderId) {
     new ButtonBuilder().setCustomId(`cancel:${orderId}`).setLabel("Cancelar compra").setEmoji("✖️").setStyle(ButtonStyle.Danger)
   );
 }
+function commandHelpEmbed(member) {
+  const prefix = config.prefix || "!";
+  const admin = isAdmin(member);
+  const publicCommands = [
+    "`/help` ou `!help` - mostra esta lista.",
+    "`/rankinggastos` ou `!rankinggastos` - top 10 publico de quem mais gastou.",
+    "`/saldogasto` ou `!saldogasto` - mostra seu saldo gasto em modo privado."
+  ];
+  const setupCommands = [
+    "`/configds` ou `!configds` - abre o configurador da loja no canal.",
+    "`/setup-atendimento` ou `!atendimento` - cria/atualiza o painel ON/OFF dos ADMs.",
+    "`/configpix` ou `!configpix` - configura Pix do ADM.",
+    "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
+    "`/setup-ticket` - envia o painel de ticket.",
+    "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
+    "`/status-loja` ou `!status-loja` - mostra resumo da loja."
+  ];
+  const salesCommands = [
+    "`/avaliacao` ou `!avaliacao` - finaliza carrinho e pede avaliacao.",
+    "`/carrinho cliente:@user` ou `!carrinho @user` - abre carrinho manual.",
+    "`/caixapix quantidade:5` ou `!caixapix 5` - sorteia Caixa Pix manual.",
+    "`/lock` e `/unlock` ou `!lock` e `!unlock` - trava/libera chat atual.",
+    "`/ranking-gastos` ou `!ranking-gastos` - ranking admin paginado por periodo.",
+    "`/vendas` ou `!vendas` - ranking privado de vendas por ADM.",
+    "`/vendasreset` - reseta vendas dos ADMs para testes.",
+    "`/gastos-add` - adiciona saldo gasto manual para cliente.",
+    "`/gastos-remover` - remove saldo gasto manual de cliente.",
+    "`/gastos-reset` - remove cliente do ranking de gastos."
+  ];
+
+  const embed = new EmbedBuilder()
+    .setTitle("Comandos da Dragon Store")
+    .setDescription("Lista rapida dos comandos disponiveis neste bot.")
+    .setColor(0x28f6a1)
+    .addFields(
+      { name: "Publicos", value: publicCommands.join("\n"), inline: false }
+    )
+    .setFooter({ text: `Prefixo atual: ${prefix}` })
+    .setTimestamp();
+
+  if (admin) {
+    embed.addFields(
+      { name: "Admin - Setup", value: setupCommands.join("\n"), inline: false },
+      { name: "Admin - Vendas", value: salesCommands.join("\n"), inline: false }
+    );
+  } else {
+    embed.addFields({ name: "Administracao", value: "Comandos de admin aparecem aqui apenas para quem tem permissao.", inline: false });
+  }
+
+  return embed;
+}
+async function sendHelpCommand(context) {
+  const embed = commandHelpEmbed(context.member);
+  const payload = { embeds: [embed], ephemeral: true };
+  if (context.isRepliable?.()) return context.reply(payload);
+  const sent = await sendSafeDM(context.author.id, { embeds: [embed] });
+  if (sent) return context.reply("Enviei a lista de comandos no seu privado.").catch(() => null);
+  if (isAdmin(context.member)) return context.reply("Nao consegui mandar DM. Use `/help` para ver os comandos em modo privado.").catch(() => null);
+  return context.reply({ embeds: [embed] }).catch(() => null);
+}
 function buildStoreStatusEmbed(guildId, scopeId = "default") {
   const panel = getPanel(guildId, scopeId);
   const db = readOrders();
@@ -4362,6 +4422,10 @@ client.on("messageCreate", async message => {
   const content = rawContent.toLowerCase();
   const plainContent = content.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
+  if (content === `${config.prefix || "!"}help`) {
+    return sendHelpCommand(message);
+  }
+
   if (content === `${config.prefix || "!"}configds`) {
     await message.delete().catch(() => null);
     return startConfig(message.channel, message.member, message.author);
@@ -4453,6 +4517,7 @@ client.on("messageCreate", async message => {
 client.on("interactionCreate", async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "help") return sendHelpCommand(interaction);
       if (interaction.commandName === "configds") {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para abrir o configurador da loja.")) return;
         await interaction.reply({ content: "Abri o configurador neste canal.", ephemeral: true });

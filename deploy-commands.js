@@ -12,6 +12,9 @@ if (!token || !clientId || !guildId) {
 
 const commands = [
   new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("Mostra todos os comandos disponiveis do bot."),
+  new SlashCommandBuilder()
     .setName("configds")
     .setDescription("Abre o configurador visual da loja."),
   new SlashCommandBuilder()
