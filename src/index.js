@@ -21,6 +21,7 @@ const {
 
 const config = require("../config.json");
 const DEFAULT_CUSTOMER_ROLE_ID = "1515799363149103138";
+const DEFAULT_RESELLER_ROLE_ID = "1515835494204706938";
 const DEFAULT_COMPLETION_CHANNEL_ID = "1515799364155478138";
 const DEFAULT_CANCELLATION_CHANNEL_ID = "1516561891919528037";
 const STAFF_BACKUP_MARKER = "DRAGON_STORE_STAFF_BACKUP_V1";
@@ -45,7 +46,7 @@ const memoryJsonStore = new Map();
 
 ensureDataDir();
 ensureJsonFile(PANELS_FILE, { guilds: {} });
-ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {} });
+ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} });
 ensureJsonFile(STAFF_FILE, { guilds: {} });
 
 const client = new Client({
@@ -144,7 +145,8 @@ function hasUsefulPersistedData(file, data) {
   if (file === ORDERS_FILE) {
     return Object.keys(data.orders || {}).length > 0 ||
       Object.keys(data.tickets || {}).length > 0 ||
-      Object.keys(data.customers || {}).length > 0;
+      Object.keys(data.customers || {}).length > 0 ||
+      Object.keys(data.sellers || {}).length > 0;
   }
   return Object.keys(data).length > 0;
 }
@@ -179,7 +181,7 @@ async function hydratePersistentFiles() {
 
   await Promise.all([
     hydrateJsonFromKv(PANELS_FILE, { guilds: {} }),
-    hydrateJsonFromKv(ORDERS_FILE, { orders: {}, tickets: {}, customers: {} }),
+    hydrateJsonFromKv(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} }),
     hydrateJsonFromKv(STAFF_FILE, { guilds: {} })
   ]);
 }
@@ -192,11 +194,12 @@ function ensureOrdersStore(db) {
   if (!store.orders) store.orders = {};
   if (!store.tickets) store.tickets = {};
   if (!store.customers) store.customers = {};
+  if (!store.sellers) store.sellers = {};
   return store;
 }
 function readPanels() { return readJson(PANELS_FILE, { guilds: {} }); }
 function writePanels(data) { writeJson(PANELS_FILE, data); }
-function readOrders() { return ensureOrdersStore(readJson(ORDERS_FILE, { orders: {}, tickets: {}, customers: {} })); }
+function readOrders() { return ensureOrdersStore(readJson(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} })); }
 function writeOrders(data) { writeJson(ORDERS_FILE, ensureOrdersStore(data)); }
 function readStaff() { return readJson(STAFF_FILE, { guilds: {} }); }
 function writeStaff(data) { writeJson(STAFF_FILE, data); }
@@ -327,10 +330,49 @@ function parsePrice(value) {
 function money(value) {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
+function roundCurrency(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+}
 function plainText(value) {
   return String(value || "")
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
+}
+function resellerRoleId() {
+  return String(process.env.RESELLER_ROLE_ID || config.resellerRoleId || DEFAULT_RESELLER_ROLE_ID || "").trim();
+}
+function resellerDiscountPercent() {
+  const value = Number.parseFloat(String(process.env.RESELLER_DISCOUNT_PERCENT ?? config.resellerDiscountPercent ?? 10).replace(",", "."));
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(90, value);
+}
+function memberHasRole(member, roleId) {
+  return Boolean(roleId && member?.roles?.cache?.has(roleId));
+}
+function discountForMember(member) {
+  const roleId = resellerRoleId();
+  const percent = resellerDiscountPercent();
+  if (!roleId || percent <= 0 || !memberHasRole(member, roleId)) return null;
+  return {
+    type: "role",
+    roleId,
+    percent,
+    label: `Desconto revendedor/premium (${percent}% OFF)`
+  };
+}
+function orderDiscountPercent(order) {
+  const percent = Number.parseFloat(String(order?.discount?.percent ?? 0).replace(",", "."));
+  return Number.isFinite(percent) && percent > 0 ? Math.min(90, percent) : 0;
+}
+function applyOrderDiscount(gross, order) {
+  const percent = orderDiscountPercent(order);
+  if (percent <= 0 || gross <= 0) return { amount: roundCurrency(gross), discountAmount: 0, discountPercent: 0 };
+  const discountAmount = roundCurrency(gross * (percent / 100));
+  return {
+    amount: roundCurrency(Math.max(0, gross - discountAmount)),
+    discountAmount,
+    discountPercent: percent
+  };
 }
 function pixBoxDefaults() {
   const min = Number.parseFloat(String(process.env.PIX_BOX_MIN ?? config.settings?.pixBoxMin ?? 0).replace(",", "."));
@@ -1540,23 +1582,44 @@ function orderItemDetails(item, panel) {
   };
 }
 function orderTotals(order, panel) {
-  return (order.items || []).reduce((summary, item) => {
+  const summary = (order.items || []).reduce((currentSummary, item) => {
     const details = orderItemDetails(item, panel);
     const quantity = Math.max(1, Number(item.quantity) || 1);
     const unit = parsePrice(details.price);
 
-    summary.quantity += quantity;
-    if (unit === null) summary.unknown += quantity;
-    else summary.amount += unit * quantity;
+    currentSummary.quantity += quantity;
+    if (unit === null) currentSummary.unknown += quantity;
+    else currentSummary.grossAmount += unit * quantity;
 
-    return summary;
-  }, { amount: 0, quantity: 0, unknown: 0 });
+    return currentSummary;
+  }, { amount: 0, grossAmount: 0, discountAmount: 0, discountPercent: 0, quantity: 0, unknown: 0 });
+
+  const discounted = applyOrderDiscount(summary.grossAmount, order);
+  summary.grossAmount = roundCurrency(summary.grossAmount);
+  summary.amount = discounted.amount;
+  summary.discountAmount = discounted.discountAmount;
+  summary.discountPercent = discounted.discountPercent;
+  return summary;
 }
-function totalLine(order, panel) {
+function legacyTotalLine(order, panel) {
   const totals = orderTotals(order, panel);
   if (!totals.quantity) return "Carrinho vazio";
   if (totals.unknown) return `${money(totals.amount)} + itens sem preço numérico`;
   return money(totals.amount);
+}
+function totalLine(order, panel) {
+  const totals = orderTotals(order, panel);
+  if (!totals.quantity) return "Carrinho vazio";
+  const base = totals.discountAmount > 0
+    ? `${money(totals.amount)} (${totals.discountPercent}% OFF, de ${money(totals.grossAmount)})`
+    : money(totals.amount);
+  if (totals.unknown) return `${base} + itens sem preco numerico`;
+  return base;
+}
+function discountLine(order) {
+  const percent = orderDiscountPercent(order);
+  if (percent <= 0) return "";
+  return `${order.discount?.label || "Desconto aplicado"}: **${percent}% OFF**`;
 }
 function closedCartDeleteSeconds() {
   const configured = Number(process.env.CLOSED_CART_DELETE_SECONDS ?? config.settings?.deleteClosedCartAfterSeconds ?? 3 * 24 * 60 * 60);
@@ -1816,18 +1879,48 @@ function emptyCustomerStats(userId, username) {
     lastOrderAt: ""
   };
 }
-function recordPeriodSpend(customer, period, key, amount) {
-  if (!customer.periods) customer.periods = { day: {}, week: {}, month: {}, year: {} };
-  if (!customer.periods[period]) customer.periods[period] = {};
-  const bucket = customer.periods[period][key] || { amount: 0, orders: 0 };
-  bucket.amount += amount;
-  bucket.orders += 1;
-  customer.periods[period][key] = bucket;
+function recordPeriodSpend(stats, period, key, amount, ordersDelta = 1) {
+  if (!stats.periods) stats.periods = { day: {}, week: {}, month: {}, year: {} };
+  if (!stats.periods[period]) stats.periods[period] = {};
+  const bucket = stats.periods[period][key] || { amount: 0, orders: 0 };
+  bucket.amount = roundCurrency(Math.max(0, (Number(bucket.amount) || 0) + amount));
+  bucket.orders = Math.max(0, (Number(bucket.orders) || 0) + ordersDelta);
+  stats.periods[period][key] = bucket;
+}
+function emptySellerStats(userId, username) {
+  return {
+    userId,
+    username: username || "vendedor",
+    totalSold: 0,
+    orderCount: 0,
+    totalItems: 0,
+    periods: { day: {}, week: {}, month: {}, year: {} },
+    lastSaleAt: ""
+  };
+}
+function recordSellerSpend(db, order, totals, now, keys) {
+  if (order.sellerRecordedAt || !order.closedByAdminId || totals.amount <= 0) return;
+  const guildId = order.guildId || "default";
+  if (!db.sellers[guildId]) db.sellers[guildId] = {};
+  const seller = db.sellers[guildId][order.closedByAdminId] || emptySellerStats(order.closedByAdminId, order.closedByAdminName);
+
+  seller.username = order.closedByAdminName || seller.username;
+  seller.totalSold = roundCurrency((Number(seller.totalSold) || 0) + totals.amount);
+  seller.orderCount = (Number(seller.orderCount) || 0) + 1;
+  seller.totalItems = (Number(seller.totalItems) || 0) + totals.quantity;
+  seller.lastSaleAt = now.toISOString();
+  for (const [period, key] of Object.entries(keys)) recordPeriodSpend(seller, period, key, totals.amount, 1);
+
+  db.sellers[guildId][order.closedByAdminId] = seller;
+  order.sellerRecordedAt = now.toISOString();
 }
 function recordCustomerSpend(db, order, panel) {
   if (order.spendRecordedAt) return;
   const totals = orderTotals(order, panel);
   order.spentAmount = totals.amount;
+  order.grossAmount = totals.grossAmount;
+  order.discountAmount = totals.discountAmount;
+  order.discountPercent = totals.discountPercent;
   order.totalQuantity = totals.quantity;
   if (!order.userId || totals.amount <= 0) return;
 
@@ -1838,12 +1931,13 @@ function recordCustomerSpend(db, order, panel) {
   const keys = periodKeys(now);
 
   customer.username = order.username || customer.username;
-  customer.totalSpent += totals.amount;
+  customer.totalSpent = roundCurrency((Number(customer.totalSpent) || 0) + totals.amount);
   customer.orderCount += 1;
   customer.lastOrderAt = now.toISOString();
-  for (const [period, key] of Object.entries(keys)) recordPeriodSpend(customer, period, key, totals.amount);
+  for (const [period, key] of Object.entries(keys)) recordPeriodSpend(customer, period, key, totals.amount, 1);
 
   db.customers[guildId][order.userId] = customer;
+  recordSellerSpend(db, order, totals, now, keys);
   order.spendRecordedAt = now.toISOString();
 }
 const RANKING_PERIODS = {
@@ -1937,6 +2031,135 @@ async function sendSpendRankingMessage(message, period = "month", page = 0) {
     embeds: [rankingEmbed(message.guild.id, selectedPeriod, data.page)],
     components: rankingComponents(message.guild.id, selectedPeriod, data.page)
   });
+}
+function publicSpendRankingData(guildId) {
+  const db = readOrders();
+  return Object.values(db.customers?.[guildId] || {})
+    .filter(customer => Number(customer.totalSpent) > 0)
+    .sort((a, b) => Number(b.totalSpent || 0) - Number(a.totalSpent || 0) || String(a.username).localeCompare(String(b.username)))
+    .slice(0, 10);
+}
+function publicSpendRankingEmbed(guildId) {
+  const rows = publicSpendRankingData(guildId);
+  const lines = rows.length
+    ? rows.map((customer, index) => `**${index + 1}.** <@${customer.userId}> - ${money(Number(customer.totalSpent || 0))} (${customer.orderCount || 0} compra(s))`).join("\n")
+    : "Ainda nao tem compras registradas.";
+
+  return new EmbedBuilder()
+    .setTitle("Top gastos do servidor")
+    .setDescription(lines)
+    .setColor(0x28f6a1)
+    .setFooter({ text: "Ranking publico com valores finais pagos, ja considerando descontos." })
+    .setTimestamp();
+}
+async function showPublicSpendRanking(interaction) {
+  return interaction.reply({ embeds: [publicSpendRankingEmbed(interaction.guildId)] });
+}
+function customerStats(guildId, userId) {
+  const db = readOrders();
+  return db.customers?.[guildId]?.[userId] || emptyCustomerStats(userId, "");
+}
+function spendBalanceEmbed(guildId, user) {
+  const stats = customerStats(guildId, user.id);
+  return new EmbedBuilder()
+    .setTitle("Saldo gasto")
+    .setDescription(`<@${user.id}> ja gastou **${money(Number(stats.totalSpent || 0))}** na loja.`)
+    .setColor(0x28f6a1)
+    .addFields(
+      { name: "Compras registradas", value: String(stats.orderCount || 0), inline: true },
+      { name: "Ultima compra", value: stats.lastOrderAt ? `<t:${Math.floor(Date.parse(stats.lastOrderAt) / 1000)}:R>` : "Nenhuma", inline: true }
+    )
+    .setTimestamp();
+}
+async function showSpendBalance(interaction) {
+  const requested = interaction.options.getUser("usuario") || interaction.user;
+  if (requested.id !== interaction.user.id && !isAdmin(interaction.member)) {
+    return interaction.reply({ content: "So ADM pode consultar saldo gasto de outro usuario.", ephemeral: true });
+  }
+  return interaction.reply({ embeds: [spendBalanceEmbed(interaction.guildId, requested)], ephemeral: true });
+}
+function adjustCustomerSpend(db, guildId, user, delta, reason = "ajuste manual") {
+  if (!db.customers[guildId]) db.customers[guildId] = {};
+  const customer = db.customers[guildId][user.id] || emptyCustomerStats(user.id, user.username);
+  const now = new Date();
+  const keys = periodKeys(now);
+
+  customer.username = user.username || customer.username;
+  customer.totalSpent = roundCurrency(Math.max(0, (Number(customer.totalSpent) || 0) + delta));
+  customer.manualAdjustments = [
+    ...(customer.manualAdjustments || []),
+    { amount: roundCurrency(delta), reason: clampText(reason, 200, "ajuste manual"), at: now.toISOString() }
+  ].slice(-25);
+  customer.lastManualAdjustmentAt = now.toISOString();
+  if (delta > 0 && !customer.lastOrderAt) customer.lastOrderAt = now.toISOString();
+  for (const [period, key] of Object.entries(keys)) recordPeriodSpend(customer, period, key, delta, 0);
+
+  if (customer.totalSpent <= 0) delete db.customers[guildId][user.id];
+  else db.customers[guildId][user.id] = customer;
+  return customer;
+}
+async function adjustSpendCommand(interaction, mode) {
+  if (!await requireAdminInteraction(interaction, "So ADM pode ajustar saldo gasto.")) return;
+  const user = interaction.options.getUser("usuario");
+  const value = interaction.options.getNumber("valor");
+  const reason = interaction.options.getString("motivo") || "ajuste manual";
+  if (!user || user.bot) return interaction.reply({ content: "Escolha um membro valido.", ephemeral: true });
+  if (!Number.isFinite(value) || value <= 0) return interaction.reply({ content: "Valor invalido.", ephemeral: true });
+
+  const delta = mode === "remove" ? -value : value;
+  const db = readOrders();
+  const stats = adjustCustomerSpend(db, interaction.guildId, user, delta, reason);
+  writeOrders(db);
+  return interaction.reply({
+    content: `${mode === "remove" ? "Removi" : "Adicionei"} ${money(value)} ${mode === "remove" ? "do" : "ao"} saldo de <@${user.id}>. Saldo atual: **${money(Number(stats?.totalSpent || 0))}**.`,
+    ephemeral: true
+  });
+}
+async function resetSpendCommand(interaction) {
+  if (!await requireAdminInteraction(interaction, "So ADM pode remover alguem do ranking.")) return;
+  const user = interaction.options.getUser("usuario");
+  if (!user) return interaction.reply({ content: "Escolha um usuario.", ephemeral: true });
+
+  const db = readOrders();
+  if (!db.customers[interaction.guildId]) db.customers[interaction.guildId] = {};
+  delete db.customers[interaction.guildId][user.id];
+  writeOrders(db);
+  return interaction.reply({ content: `<@${user.id}> removido do ranking de gastos.`, ephemeral: true });
+}
+function sellerRankingData(guildId) {
+  const db = readOrders();
+  return Object.values(db.sellers?.[guildId] || {})
+    .filter(seller => Number(seller.totalSold) > 0)
+    .sort((a, b) => Number(b.totalSold || 0) - Number(a.totalSold || 0) || String(a.username).localeCompare(String(b.username)));
+}
+function sellerRankingEmbed(guildId) {
+  const rows = sellerRankingData(guildId).slice(0, 25);
+  const total = rows.reduce((sum, seller) => sum + Number(seller.totalSold || 0), 0);
+  const lines = rows.length
+    ? rows.map((seller, index) => `**${index + 1}.** <@${seller.userId}> - ${money(Number(seller.totalSold || 0))} (${seller.orderCount || 0} venda(s), ${seller.totalItems || 0} item(ns))`).join("\n")
+    : "Nenhuma venda registrada por ADM ainda.";
+
+  return new EmbedBuilder()
+    .setTitle("Vendas por ADM")
+    .setDescription(lines)
+    .setColor(0x28f6a1)
+    .addFields({ name: "Total vendido", value: money(total), inline: true })
+    .setFooter({ text: "Conta o ADM que clicou em Finalizar compra." })
+    .setTimestamp();
+}
+async function showSellerSales(interaction) {
+  if (!await requireAdminInteraction(interaction, "So ADM pode ver vendas por atendente.")) return;
+  return interaction.reply({ embeds: [sellerRankingEmbed(interaction.guildId)], ephemeral: true });
+}
+async function resetSellerSales(interaction) {
+  if (!await requireAdminInteraction(interaction, "So ADM pode resetar vendas por atendente.")) return;
+  const user = interaction.options.getUser("vendedor");
+  const db = readOrders();
+  if (!db.sellers[interaction.guildId]) db.sellers[interaction.guildId] = {};
+  if (user) delete db.sellers[interaction.guildId][user.id];
+  else db.sellers[interaction.guildId] = {};
+  writeOrders(db);
+  return interaction.reply({ content: user ? `Vendas de <@${user.id}> resetadas.` : "Ranking de vendas dos ADMs resetado.", ephemeral: true });
 }
 function orderId(type) {
   const db = readOrders();
@@ -3436,6 +3659,7 @@ async function openManualCartCommand(context, targetUser) {
   if (!member) return actionReply(context, { content: "Esse usuario nao esta no servidor.", ephemeral: true });
 
   const panel = panelForManualCart(guild.id, context.channel.id);
+  const discount = discountForMember(member);
   const id = orderId("order");
   const ch = await privateChannel(guild, targetUser, `carrinho-${safeName(targetUser.username)}-aberto-${id}`, config.categories.cartOpen);
   const order = {
@@ -3448,6 +3672,7 @@ async function openManualCartCommand(context, targetUser) {
     username: targetUser.username,
     channelId: ch.id,
     items: [],
+    discount,
     manual: true,
     createdByAdminId: actionUser(context).id,
     assignedAdminId: null,
@@ -3463,7 +3688,10 @@ async function openManualCartCommand(context, targetUser) {
 
   const intro = new EmbedBuilder()
     .setTitle(`Carrinho aberto #${id}`)
-    .setDescription("Carrinho aberto manualmente pela equipe. Selecione um produto no menu ou descreva o pedido neste chat.")
+    .setDescription([
+      "Carrinho aberto manualmente pela equipe. Selecione um produto no menu ou descreva o pedido neste chat.",
+      discount ? discountLine(order) : ""
+    ].filter(Boolean).join("\n\n"))
     .setColor(parseColor(panel.color))
     .addFields(
       { name: "Cliente", value: `<@${targetUser.id}>`, inline: true },
@@ -3494,11 +3722,16 @@ async function openManualCartCommand(context, targetUser) {
 }
 function cartText(order, panel) {
   if (!Array.isArray(order.items) || !order.items.length) return "Carrinho vazio.";
+  const discountPercent = orderDiscountPercent(order);
   const base = order.items.map(item => {
     const p = orderItemDetails(item, panel);
     const quantity = Math.max(1, Number(item.quantity) || 1);
     const unit = parsePrice(p.price);
-    const subtotal = unit === null ? "" : ` = ${money(unit * quantity)}`;
+    const subtotal = unit === null
+      ? ""
+      : discountPercent > 0
+        ? ` = ${money(roundCurrency(unit * quantity * (1 - discountPercent / 100)))} (de ${money(roundCurrency(unit * quantity))})`
+        : ` = ${money(roundCurrency(unit * quantity))}`;
     return `• ${productIcon(p)} **${p.name}** — ${p.price} x${quantity}${subtotal}`;
   }).join("\n");
 
@@ -3530,6 +3763,8 @@ function cartEmbed(order, panel) {
     )
     .setTimestamp();
 
+  const discountText = discountLine(order);
+  if (discountText) embed.addFields({ name: "Desconto", value: discountText, inline: false });
   if (firstImage) embed.setThumbnail(firstImage);
   return embed;
 }
@@ -3596,6 +3831,7 @@ async function openCart(interaction) {
   const p = product(panel, interaction.values[0]);
   if (!p) return interaction.reply({ content: "Produto não encontrado.", ephemeral: true });
   await resetSelectMessage(interaction, saleMessage(panel));
+  const discount = discountForMember(interaction.member);
   const id = orderId("order");
   const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, config.categories.cartOpen);
   const order = {
@@ -3608,6 +3844,7 @@ async function openCart(interaction) {
     username: interaction.user.username,
     channelId: ch.id,
     items: [orderItemFromProduct(p)],
+    discount,
     assignedAdminId: null,
     assignedAdminName: null,
     assignedAt: null,
@@ -3615,7 +3852,7 @@ async function openCart(interaction) {
     closedAt: null
   };
   const db = readOrders(); db.orders[id] = order; writeOrders(db);
-  const intro = new EmbedBuilder().setTitle(`🛒 Carrinho aberto #${id}`).setDescription(config.messages.cartWelcome).setColor(parseColor(panel.color)).addFields({ name: "Cliente", value: `<@${interaction.user.id}>`, inline: true }, { name: "ID da compra", value: id, inline: true });
+  const intro = new EmbedBuilder().setTitle(`🛒 Carrinho aberto #${id}`).setDescription([config.messages.cartWelcome, discount ? discountLine(order) : ""].filter(Boolean).join("\n\n")).setColor(parseColor(panel.color)).addFields({ name: "Cliente", value: `<@${interaction.user.id}>`, inline: true }, { name: "ID da compra", value: id, inline: true });
   await ch.send({ content: `<@${interaction.user.id}>`, embeds: [intro, productInfoEmbed(p, panel, "Produto inicial"), cartEmbed(order, panel)], components: [productSelect(panel, `cartadd:${id}`), cartButtons(id)] });
   await sendStaffChoiceMessage(ch, order, interaction.guildId);
 
@@ -3672,6 +3909,7 @@ async function handleQuickOrderSubmit(interaction) {
   const quick = quickOrderConfig(panel);
   const answer1 = interaction.fields.getTextInputValue("answer1").trim();
   const answer2 = interaction.fields.getTextInputValue("answer2").trim();
+  const discount = discountForMember(interaction.member);
   const id = orderId("order");
   const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, config.categories.cartOpen);
   const order = {
@@ -3693,6 +3931,7 @@ async function handleQuickOrderSubmit(interaction) {
       type: "custom_order",
       imageUrl: panel.imageUrl || ""
     }],
+    discount,
     customAnswers: { answer1, answer2 },
     quickOrder: {
       title: quick.title,
@@ -3712,7 +3951,7 @@ async function handleQuickOrderSubmit(interaction) {
 
   const intro = new EmbedBuilder()
     .setTitle(`🛒 Carrinho aberto #${id}`)
-    .setDescription(config.messages.cartWelcome)
+    .setDescription([config.messages.cartWelcome, discount ? discountLine(order) : ""].filter(Boolean).join("\n\n"))
     .setColor(parseColor(panel.color))
     .addFields(
       { name: "Cliente", value: `<@${interaction.user.id}>`, inline: true },
@@ -3994,6 +4233,7 @@ async function finishCart(interaction, id, options = {}) {
 
 **Resumo da compra:**
 Total estimado: **${totalLine(order, panel)}**
+${discountLine(order) ? `\n${discountLine(order)}` : ""}
 
 ${cartText(order, panel)}`.slice(0, 4096))
         .setColor(parseColor(panel.color))
@@ -4197,6 +4437,17 @@ client.on("messageCreate", async message => {
   if (content === `${config.prefix || "!"}ranking-gastos`) {
     return sendSpendRankingMessage(message);
   }
+  if (content === `${config.prefix || "!"}rankinggastos`) {
+    return message.channel.send({ embeds: [publicSpendRankingEmbed(message.guild.id)] });
+  }
+  if (content === `${config.prefix || "!"}saldogasto`) {
+    return message.reply({ embeds: [spendBalanceEmbed(message.guild.id, message.author)] });
+  }
+  if (content === `${config.prefix || "!"}vendas`) {
+    if (!isAdmin(message.member)) return message.reply("So ADM pode ver vendas por atendente.");
+    await message.delete().catch(() => null);
+    return message.channel.send({ embeds: [sellerRankingEmbed(message.guild.id)] });
+  }
 });
 
 client.on("interactionCreate", async interaction => {
@@ -4243,6 +4494,13 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply({ embeds: [buildStoreStatusEmbed(interaction.guildId, interaction.channelId)], ephemeral: true });
       }
       if (interaction.commandName === "ranking-gastos") return showSpendRanking(interaction);
+      if (interaction.commandName === "rankinggastos") return showPublicSpendRanking(interaction);
+      if (interaction.commandName === "saldogasto") return showSpendBalance(interaction);
+      if (interaction.commandName === "vendas") return showSellerSales(interaction);
+      if (interaction.commandName === "vendasreset") return resetSellerSales(interaction);
+      if (interaction.commandName === "gastos-add") return adjustSpendCommand(interaction, "add");
+      if (interaction.commandName === "gastos-remover") return adjustSpendCommand(interaction, "remove");
+      if (interaction.commandName === "gastos-reset") return resetSpendCommand(interaction);
     }
     if (interaction.isButton()) {
       if (interaction.customId.startsWith("rmconfirm:")) return handleRemoveConfirm(interaction);

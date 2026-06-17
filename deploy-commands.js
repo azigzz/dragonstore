@@ -95,7 +95,86 @@ const commands = [
     .setDescription("Mostra a configuracao atual da loja."),
   new SlashCommandBuilder()
     .setName("ranking-gastos")
-    .setDescription("Mostra o ranking de clientes por valor gasto.")
+    .setDescription("Mostra o ranking de clientes por valor gasto."),
+  new SlashCommandBuilder()
+    .setName("rankinggastos")
+    .setDescription("Mostra o top 10 publico de membros que mais gastaram."),
+  new SlashCommandBuilder()
+    .setName("saldogasto")
+    .setDescription("Mostra seu saldo gasto na loja.")
+    .addUserOption(option =>
+      option
+        .setName("usuario")
+        .setDescription("ADM pode consultar outro usuario.")
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("vendas")
+    .setDescription("Mostra o saldo de vendas por ADM."),
+  new SlashCommandBuilder()
+    .setName("vendasreset")
+    .setDescription("Reseta o saldo de vendas dos ADMs.")
+    .addUserOption(option =>
+      option
+        .setName("vendedor")
+        .setDescription("Opcional: reseta apenas um ADM.")
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("gastos-add")
+    .setDescription("Adiciona saldo gasto manualmente para um cliente.")
+    .addUserOption(option =>
+      option
+        .setName("usuario")
+        .setDescription("Cliente que vai receber saldo.")
+        .setRequired(true)
+    )
+    .addNumberOption(option =>
+      option
+        .setName("valor")
+        .setDescription("Valor em reais.")
+        .setMinValue(0.01)
+        .setRequired(true)
+    )
+    .addStringOption(option =>
+      option
+        .setName("motivo")
+        .setDescription("Motivo do ajuste.")
+        .setMaxLength(200)
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("gastos-remover")
+    .setDescription("Remove saldo gasto manualmente de um cliente.")
+    .addUserOption(option =>
+      option
+        .setName("usuario")
+        .setDescription("Cliente que vai perder saldo.")
+        .setRequired(true)
+    )
+    .addNumberOption(option =>
+      option
+        .setName("valor")
+        .setDescription("Valor em reais.")
+        .setMinValue(0.01)
+        .setRequired(true)
+    )
+    .addStringOption(option =>
+      option
+        .setName("motivo")
+        .setDescription("Motivo do ajuste.")
+        .setMaxLength(200)
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("gastos-reset")
+    .setDescription("Remove um cliente do ranking de gastos.")
+    .addUserOption(option =>
+      option
+        .setName("usuario")
+        .setDescription("Cliente que sera removido do ranking.")
+        .setRequired(true)
+    )
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(token);

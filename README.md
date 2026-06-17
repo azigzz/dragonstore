@@ -80,6 +80,13 @@ No Discord:
 !avaliacao
 /ranking-gastos
 !ranking-gastos
+/rankinggastos
+/saldogasto
+/vendas
+/vendasreset
+/gastos-add
+/gastos-remover
+/gastos-reset
 /status-loja
 !status-loja
 ```
@@ -114,6 +121,13 @@ Comandos operacionais uteis:
 - `/caixapix quantidade:5` ou `!caixapix 5`: sorteia Caixa Pix com o preset padrao, sem mostrar porcentagens ao cliente.
 - `/carrinho cliente:@usuario` ou `!carrinho @usuario`: abre um carrinho privado manual para o cliente.
 - `/lock`, `/unlock`, `!lock` e `!unlock`: trava/libera o chat atual; em carrinho/ticket mexe direto na permissao do cliente.
+- `/rankinggastos`: top 10 publico de quem mais gastou no servidor.
+- `/saldogasto`: consulta privada do saldo gasto; ADM pode informar outro usuario.
+- `/vendas`: ranking privado de vendas por ADM.
+- `/vendasreset`: reseta o saldo de vendas dos ADMs para testes.
+- `/gastos-add`, `/gastos-remover`, `/gastos-reset`: comandos de ADM para ajustar/remover saldo gasto de cliente.
+
+O cargo revendedor/premium `1515835494204706938` recebe 10% de desconto automaticamente quando abre carrinho. O total mostrado no carrinho, Pix, DM, ranking e vendas ja considera esse desconto.
 
 ## Site da Dragon Store
 
