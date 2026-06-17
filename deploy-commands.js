@@ -56,6 +56,41 @@ const commands = [
     .setName("configpix")
     .setDescription("Configura seu nome, chave Pix e QR Code para assumir compras."),
   new SlashCommandBuilder()
+    .setName("salvarpix")
+    .setDescription("Salva/atualiza o backup do Pix e painel de atendimento no Discord."),
+  new SlashCommandBuilder()
+    .setName("caixapix")
+    .setDescription("Sorteia Caixas Pix usando o preset padrao.")
+    .addIntegerOption(option =>
+      option
+        .setName("quantidade")
+        .setDescription("Quantidade de caixas para sortear.")
+        .setMinValue(1)
+        .setMaxValue(100)
+        .setRequired(true)
+    )
+    .addUserOption(option =>
+      option
+        .setName("cliente")
+        .setDescription("Cliente para marcar no resultado, opcional.")
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("carrinho")
+    .setDescription("Abre um carrinho privado para um cliente.")
+    .addUserOption(option =>
+      option
+        .setName("cliente")
+        .setDescription("Cliente que vai receber o carrinho.")
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("lock")
+    .setDescription("Trava o chat atual para o cliente ou para @everyone."),
+  new SlashCommandBuilder()
+    .setName("unlock")
+    .setDescription("Libera o chat atual para o cliente ou para @everyone."),
+  new SlashCommandBuilder()
     .setName("status-loja")
     .setDescription("Mostra a configuracao atual da loja."),
   new SlashCommandBuilder()

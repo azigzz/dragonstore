@@ -23,6 +23,8 @@ const config = require("../config.json");
 const DEFAULT_CUSTOMER_ROLE_ID = "1515799363149103138";
 const DEFAULT_COMPLETION_CHANNEL_ID = "1515799364155478138";
 const DEFAULT_CANCELLATION_CHANNEL_ID = "1516561891919528037";
+const STAFF_BACKUP_MARKER = "DRAGON_STORE_STAFF_BACKUP_V1";
+const STAFF_BACKUP_FILE = "dragon-store-staff-backup.json";
 
 const PORT = process.env.PORT || 3000;
 http.createServer(handleHttpRequest).listen(PORT, () => console.log(`Health server rodando na porta ${PORT}`));
@@ -39,11 +41,12 @@ const KV_FILE_KEYS = {
   [ORDERS_FILE]: `${BOT_KV_PREFIX}:orders`,
   [STAFF_FILE]: `${BOT_KV_PREFIX}:staff`
 };
+const memoryJsonStore = new Map();
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(PANELS_FILE)) fs.writeFileSync(PANELS_FILE, JSON.stringify({ guilds: {} }, null, 2));
-if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, JSON.stringify({ orders: {}, tickets: {}, customers: {} }, null, 2));
-if (!fs.existsSync(STAFF_FILE)) fs.writeFileSync(STAFF_FILE, JSON.stringify({ guilds: {} }, null, 2));
+ensureDataDir();
+ensureJsonFile(PANELS_FILE, { guilds: {} });
+ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {} });
+ensureJsonFile(STAFF_FILE, { guilds: {} });
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -56,17 +59,50 @@ const publicPanelScanCache = new Map();
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
 
+function cloneJson(data) {
+  return JSON.parse(JSON.stringify(data));
+}
+function rememberJson(file, data) {
+  memoryJsonStore.set(file, cloneJson(data));
+}
+function ensureDataDir() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (error) {
+    console.log(`Nao consegui preparar pasta de dados no disco (${error.message}); usando memoria/backup.`);
+  }
+}
+function ensureJsonFile(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(fallback, null, 2));
+  } catch (error) {
+    rememberJson(file, fallback);
+    console.log(`Nao consegui preparar ${path.basename(file)} no disco (${error.message}); usando memoria/backup.`);
+  }
+}
 function readJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
-  catch { return fallback; }
+  if (memoryJsonStore.has(file)) return cloneJson(memoryJsonStore.get(file));
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    rememberJson(file, data);
+    return data;
+  } catch {
+    return cloneJson(fallback);
+  }
 }
 function writeJsonLocal(file, data) {
+  rememberJson(file, data);
   const tmpFile = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
   fs.renameSync(tmpFile, file);
 }
 function writeJson(file, data) {
-  writeJsonLocal(file, data);
+  rememberJson(file, data);
+  try {
+    writeJsonLocal(file, data);
+  } catch (error) {
+    console.log(`Nao consegui gravar ${path.basename(file)} no disco (${error.message}); mantendo em memoria e tentando KV.`);
+  }
   persistJsonToKv(file, data).catch(error => {
     console.log(`Nao consegui salvar ${path.basename(file)} no KV: ${error.message}`);
   });
@@ -120,8 +156,14 @@ async function hydrateJsonFromKv(file, fallback) {
     return null;
   });
   if (!hasUsefulPersistedData(file, remote)) return false;
-  writeJsonLocal(file, remote || fallback);
-  console.log(`${path.basename(file)} carregado do KV.`);
+  const data = remote || fallback;
+  try {
+    writeJsonLocal(file, data);
+    console.log(`${path.basename(file)} carregado do KV.`);
+  } catch (error) {
+    rememberJson(file, data);
+    console.log(`${path.basename(file)} carregado do KV em memoria (${error.message}).`);
+  }
   return true;
 }
 async function persistJsonToKv(file, data) {
@@ -163,6 +205,8 @@ function defaultStaffGuild() {
     users: {},
     panelChannelId: "",
     panelMessageId: "",
+    backupChannelId: "",
+    backupMessageId: "",
     successChannelId: "",
     successMessageEnabled: false,
     customerRoleId: ""
@@ -422,6 +466,169 @@ function pixShortcutRows() {
     )
   ];
 }
+function isStaffPanelMessage(message) {
+  if (!message || message.author?.id !== client.user?.id) return false;
+  const title = message.embeds?.[0]?.title || "";
+  const hasStaffButtons = message.components?.some(row =>
+    row.components?.some(component => String(component.customId || component.data?.custom_id || "").startsWith("staff:"))
+  );
+  return hasStaffButtons || plainText(title).includes("atendimento") && plainText(title).includes("pix");
+}
+function isStaffBackupMessage(message) {
+  return message?.author?.id === client.user?.id && String(message.content || "").includes(STAFF_BACKUP_MARKER);
+}
+async function findBotMessage(channel, predicate, limit = 100) {
+  if (!channel?.isTextBased()) return null;
+  const messages = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!messages) return null;
+  return messages.find(predicate) || null;
+}
+async function findBotMessageInGuild(guild, predicate, preferredChannel = null, limit = 50) {
+  const preferred = await findBotMessage(preferredChannel, predicate, limit);
+  if (preferred) return preferred;
+
+  const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
+  for (const channel of channels.values()) {
+    if (!channel?.isTextBased() || channel.id === preferredChannel?.id) continue;
+    const found = await findBotMessage(channel, predicate, limit);
+    if (found) return found;
+  }
+  return null;
+}
+function staffBackupChannelId(staff, fallbackChannelId = "") {
+  return String(process.env.STAFF_BACKUP_CHANNEL_ID || config.staffBackup?.channelId || staff.backupChannelId || staff.panelChannelId || fallbackChannelId || "").trim();
+}
+async function readStaffBackupMessage(message) {
+  if (!message) return null;
+
+  const attachment = message.attachments?.find(file => file.name === STAFF_BACKUP_FILE) || message.attachments?.first?.();
+  if (attachment?.url) {
+    const response = await fetch(attachment.url).catch(() => null);
+    if (response?.ok) {
+      const json = await response.json().catch(() => null);
+      if (json?.staff) return json.staff;
+    }
+  }
+
+  const encoded = String(message.content || "").split(STAFF_BACKUP_MARKER)[1]?.trim();
+  if (!encoded) return null;
+  try {
+    const json = JSON.parse(Buffer.from(encoded.replace(/^\|\||\|\|$/g, ""), "base64url").toString("utf8"));
+    return json.staff || null;
+  } catch {
+    return null;
+  }
+}
+async function findStaffBackupMessage(guild, staff, fallbackChannel = null) {
+  const candidates = [
+    { channelId: staff.backupChannelId, messageId: staff.backupMessageId },
+    { channelId: staff.panelChannelId, messageId: staff.backupMessageId }
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.channelId || !candidate.messageId) continue;
+    const channel = await guild.channels.fetch(candidate.channelId).catch(() => null);
+    if (!channel?.isTextBased()) continue;
+    const message = await channel.messages.fetch(candidate.messageId).catch(() => null);
+    if (isStaffBackupMessage(message)) return message;
+  }
+
+  const channelId = staffBackupChannelId(staff, fallbackChannel?.id || "");
+  const channel = channelId
+    ? await guild.channels.fetch(channelId).catch(() => null)
+    : fallbackChannel;
+  if (channel?.isTextBased()) {
+    const found = await findBotMessage(channel, isStaffBackupMessage);
+    if (found) return found;
+  }
+  return findBotMessageInGuild(guild, isStaffBackupMessage, fallbackChannel);
+}
+async function recoverStaffBackup(guild, fallbackChannel = null) {
+  const db = readStaff();
+  const current = db.guilds?.[guild.id] ? { ...defaultStaffGuild(), ...db.guilds[guild.id], users: db.guilds[guild.id].users || {} } : defaultStaffGuild();
+  const backupMessage = await findStaffBackupMessage(guild, current, fallbackChannel);
+  const backup = await readStaffBackupMessage(backupMessage);
+  if (!backup) return current;
+
+  const merged = {
+    ...defaultStaffGuild(),
+    ...backup,
+    users: {
+      ...(backup.users || {}),
+      ...(current.users || {})
+    },
+    backupChannelId: backupMessage.channel.id,
+    backupMessageId: backupMessage.id
+  };
+  for (const key of ["panelChannelId", "panelMessageId", "successChannelId", "customerRoleId"]) {
+    if (current[key]) merged[key] = current[key];
+  }
+  if (current.successMessageEnabled) merged.successMessageEnabled = current.successMessageEnabled;
+  db.guilds[guild.id] = merged;
+  writeStaff(db);
+  return merged;
+}
+async function recoverStaffPanelMessage(guild, channel, staff = getStaffGuild(guild.id)) {
+  if (staff.panelChannelId && staff.panelMessageId) {
+    const oldChannel = await guild.channels.fetch(staff.panelChannelId).catch(() => null);
+    const oldMessage = oldChannel?.isTextBased()
+      ? await oldChannel.messages.fetch(staff.panelMessageId).catch(() => null)
+      : null;
+    if (oldMessage) return oldMessage;
+  }
+
+  const found = await findBotMessageInGuild(guild, isStaffPanelMessage, channel);
+  if (!found) return null;
+
+  staff.panelChannelId = found.channel.id;
+  staff.panelMessageId = found.id;
+  saveStaffGuild(guild.id, staff);
+  return found;
+}
+async function ensureStaffState(guild, channel = null) {
+  let staff = await recoverStaffBackup(guild, channel);
+  const panelMessage = await recoverStaffPanelMessage(guild, channel, staff);
+  if (panelMessage) {
+    staff = getStaffGuild(guild.id);
+    staff.panelChannelId = panelMessage.channel.id;
+    staff.panelMessageId = panelMessage.id;
+    saveStaffGuild(guild.id, staff);
+  }
+  return getStaffGuild(guild.id);
+}
+async function saveStaffBackup(guild, fallbackChannel = null) {
+  const staff = getStaffGuild(guild.id);
+  const channelId = staffBackupChannelId(staff, fallbackChannel?.id || "");
+  const channel = channelId
+    ? await guild.channels.fetch(channelId).catch(() => null)
+    : fallbackChannel;
+  if (!channel?.isTextBased()) return false;
+
+  const payload = Buffer.from(JSON.stringify({
+    version: 1,
+    guildId: guild.id,
+    savedAt: new Date().toISOString(),
+    staff
+  }));
+  const file = new AttachmentBuilder(payload, { name: STAFF_BACKUP_FILE });
+  const content = `||${STAFF_BACKUP_MARKER}||\nBackup tecnico do atendimento/Pix. Nao apagar.`;
+  let message = null;
+
+  if (staff.backupMessageId) {
+    message = await channel.messages.fetch(staff.backupMessageId).catch(() => null);
+  }
+  if (!message) message = await findBotMessage(channel, isStaffBackupMessage);
+  if (message) {
+    await message.edit({ content, attachments: [], files: [file] });
+  } else {
+    message = await channel.send({ content, files: [file] });
+  }
+
+  staff.backupChannelId = channel.id;
+  staff.backupMessageId = message.id;
+  saveStaffGuild(guild.id, staff);
+  return true;
+}
 async function refreshStaffPanel(guildId) {
   const staff = getStaffGuild(guildId);
   if (!staff.panelChannelId || !staff.panelMessageId) return false;
@@ -449,16 +656,13 @@ async function setupStaffPanel(interactionOrMessage) {
     return channel.send(text);
   }
 
-  const staff = getStaffGuild(guild.id);
-  let oldMessage = null;
-
-  if (staff.panelChannelId && staff.panelMessageId) {
-    const oldChannel = await guild.channels.fetch(staff.panelChannelId).catch(() => null);
-    if (oldChannel?.isTextBased()) oldMessage = await oldChannel.messages.fetch(staff.panelMessageId).catch(() => null);
-  }
+  let staff = await ensureStaffState(guild, channel);
+  let oldMessage = await recoverStaffPanelMessage(guild, channel, staff);
 
   if (oldMessage) {
     await oldMessage.edit({ embeds: [buildStaffPanelEmbed(guild.id)], components: staffPanelRows() });
+    await saveStaffBackup(guild, oldMessage.channel).catch(error => console.log(`Nao consegui salvar backup do Pix: ${error.message}`));
+    staff = getStaffGuild(guild.id);
     if (interactionOrMessage.isRepliable?.()) {
       return interactionOrMessage.reply({ content: `Painel de atendimento atualizado em <#${staff.panelChannelId}>.`, ephemeral: true });
     }
@@ -469,10 +673,37 @@ async function setupStaffPanel(interactionOrMessage) {
   staff.panelChannelId = channel.id;
   staff.panelMessageId = sent.id;
   saveStaffGuild(guild.id, staff);
+  await saveStaffBackup(guild, channel).catch(error => console.log(`Nao consegui salvar backup do Pix: ${error.message}`));
 
   if (interactionOrMessage.isRepliable?.()) {
     return interactionOrMessage.reply({ content: `Painel de atendimento criado em <#${channel.id}>.`, ephemeral: true });
   }
+}
+async function savePixBackupCommand(interactionOrMessage) {
+  const guild = interactionOrMessage.guild;
+  const channel = interactionOrMessage.channel;
+  const member = interactionOrMessage.member;
+
+  if (!isAdmin(member)) {
+    const text = "So ADM pode salvar backup do Pix.";
+    if (interactionOrMessage.isRepliable?.()) return interactionOrMessage.reply({ content: text, ephemeral: true });
+    return channel.send(text);
+  }
+
+  await ensureStaffState(guild, channel);
+  const saved = await saveStaffBackup(guild, channel).catch(error => {
+    console.log(`Nao consegui salvar backup do Pix: ${error.message}`);
+    return false;
+  });
+  await refreshStaffPanel(guild.id);
+
+  const staff = getStaffGuild(guild.id);
+  const text = saved
+    ? `Backup do Pix salvo. Painel: ${staff.panelChannelId ? `<#${staff.panelChannelId}>` : "nao vinculado"}.`
+    : "Nao consegui salvar backup do Pix. Confira se o bot pode enviar mensagem/anexo neste canal.";
+
+  if (interactionOrMessage.isRepliable?.()) return interactionOrMessage.reply({ content: text, ephemeral: true });
+  return channel.send(text);
 }
 function pixConfigModal(guildId, user) {
   const current = getStaffProfile(guildId, user.id) || {};
@@ -571,7 +802,7 @@ async function sendStaffChoiceMessage(channel, order, guildId) {
   const online = onlineStaffProfiles(guildId);
   const panel = getOrderPanel(order, guildId);
 
-  if (online.length === 1 && !order.assignedAdminId) {
+  if ((order.items || []).length && online.length === 1 && !order.assignedAdminId) {
     const profile = online[0];
     const db = readOrders();
     const saved = db.orders[order.id];
@@ -616,6 +847,7 @@ async function assumeOrder(interaction, id) {
     return interaction.reply({ content: `Essa compra já foi assumida por <@${order.assignedAdminId}>.`, ephemeral: true });
   }
 
+  await ensureStaffState(interaction.guild, interaction.channel);
   const profile = getStaffProfile(interaction.guildId, interaction.user.id);
   if (!profile?.pixKey) {
     return interaction.reply({ content: "Configure seu Pix primeiro com `!configpix`, `/configpix` ou no botão **Configurar meu Pix** do painel de atendimento.", ephemeral: true });
@@ -661,6 +893,7 @@ async function resendPix(interaction, id) {
     return interaction.reply({ content: "Essa compra ainda não foi assumida. Clique em **Assumir compra** primeiro.", ephemeral: true });
   }
 
+  await ensureStaffState(interaction.guild, interaction.channel);
   const profile = getStaffProfile(interaction.guildId, order.assignedAdminId);
   if (!profile?.pixKey) {
     return interaction.reply({ content: "O ADM responsável não tem Pix configurado mais.", ephemeral: true });
@@ -676,6 +909,7 @@ async function handleStaffButton(interaction) {
   if (!isAdmin(interaction.member)) {
     return interaction.reply({ content: "Só ADM pode mexer nesse painel.", ephemeral: true });
   }
+  await ensureStaffState(interaction.guild, interaction.channel);
 
   const [, action] = interaction.customId.split(":");
 
@@ -691,17 +925,20 @@ async function handleStaffButton(interaction) {
 
     saveStaffProfile(interaction.guildId, interaction.user.id, { online: true });
     await refreshStaffPanel(interaction.guildId);
+    await saveStaffBackup(interaction.guild, interaction.channel).catch(error => console.log(`Nao consegui salvar backup do Pix: ${error.message}`));
     return interaction.reply({ content: "Você está ON para receber vendas.", ephemeral: true });
   }
 
   if (action === "off") {
     saveStaffProfile(interaction.guildId, interaction.user.id, { online: false });
     await refreshStaffPanel(interaction.guildId);
+    await saveStaffBackup(interaction.guild, interaction.channel).catch(error => console.log(`Nao consegui salvar backup do Pix: ${error.message}`));
     return interaction.reply({ content: "Você está OFF.", ephemeral: true });
   }
 
   if (action === "refresh") {
     await refreshStaffPanel(interaction.guildId);
+    await saveStaffBackup(interaction.guild, interaction.channel).catch(error => console.log(`Nao consegui salvar backup do Pix: ${error.message}`));
     return interaction.reply({ content: "Painel atualizado.", ephemeral: true });
   }
 }
@@ -709,6 +946,7 @@ async function handlePixModal(interaction) {
   if (!isAdmin(interaction.member)) {
     return interaction.reply({ content: "Só ADM pode configurar Pix.", ephemeral: true });
   }
+  await ensureStaffState(interaction.guild, interaction.channel);
 
   const displayName = interaction.fields.getTextInputValue("displayName").trim();
   const pixKey = interaction.fields.getTextInputValue("pixKey").trim();
@@ -731,6 +969,9 @@ async function handlePixModal(interaction) {
   });
 
   await refreshStaffPanel(interaction.guildId);
+  await saveStaffBackup(interaction.guild, interaction.channel).catch(error => {
+    console.log(`Nao consegui salvar backup do Pix: ${error.message}`);
+  });
 
   return interaction.reply({ content: "Pix salvo. Agora clique em **Ficar ON** no painel quando estiver disponível.", ephemeral: true });
 }
@@ -1413,14 +1654,20 @@ async function grantCustomerRole(guild, userId) {
   const roleIds = configuredCustomerRoleIds(guild.id);
   if (!roleIds.length) return false;
 
+  let granted = false;
   try {
     const member = await guild.members.fetch(userId);
     for (const roleId of roleIds) {
-      await member.roles.add(roleId, "Compra finalizada na Dragon Store");
+      try {
+        await member.roles.add(roleId, "Compra finalizada na Dragon Store");
+        granted = true;
+      } catch (error) {
+        console.log(`Nao consegui adicionar cargo ${roleId} para ${userId}: ${error.message}`);
+      }
     }
-    return true;
+    return granted;
   } catch (error) {
-    console.log(`Nao consegui adicionar cargo cliente para ${userId}: ${error.message}`);
+    console.log(`Nao consegui buscar membro para cargo cliente ${userId}: ${error.message}`);
     return false;
   }
 }
@@ -1514,8 +1761,12 @@ async function setupSuccessFeed(interactionOrMessage, options = {}) {
   staff.successMessageEnabled = options.enabled ?? true;
   if (options.customerRoleId) staff.customerRoleId = options.customerRoleId;
   saveStaffGuild(guild.id, staff);
+  await saveStaffBackup(guild, channel).catch(error => {
+    console.log(`Nao consegui salvar backup do atendimento: ${error.message}`);
+  });
 
-  const roleText = staff.customerRoleId ? `<@&${staff.customerRoleId}>` : "`CUSTOMER_ROLE_ID`/cargo cliente ainda nao definido";
+  const effectiveRoleId = staff.customerRoleId || configuredCustomerRoleId(guild.id);
+  const roleText = effectiveRoleId ? `<@&${effectiveRoleId}>` : "`CUSTOMER_ROLE_ID`/cargo cliente ainda nao definido";
   const statusText = staff.successMessageEnabled ? "ativado" : "desativado";
   const embed = new EmbedBuilder()
     .setTitle("Feed de vendas configurado")
@@ -1886,6 +2137,59 @@ function mysteryResultsEmbed(results, panel) {
     .setColor(parseColor(panel.color))
     .setFooter({ text: "Resultado gerado automaticamente ao finalizar a compra." })
     .setTimestamp();
+}
+function rollPixBoxPreset(quantity = 1) {
+  const amount = Math.min(100, Math.max(1, Number(quantity) || 1));
+  const rewards = pixBoxPresetRewards();
+  const results = [];
+
+  for (let i = 0; i < amount; i++) {
+    const reward = pickWeightedReward(rewards);
+    results.push({
+      boxProductId: "manual_pix_box",
+      boxName: "Caixa Pix",
+      ...resolveRewardResult(reward),
+      rolledAt: new Date().toISOString()
+    });
+  }
+
+  return results;
+}
+function pixBoxCommandEmbeds(results, panel = defaultPanel("manual")) {
+  const embeds = [];
+  const pageSize = 10;
+  for (let i = 0; i < results.length; i += pageSize) {
+    const page = results.slice(i, i + pageSize);
+    embeds.push(
+      new EmbedBuilder()
+        .setTitle(`Caixa Pix sorteada (${i + 1}-${i + page.length}/${results.length})`)
+        .setDescription(mysteryResultsText(page).slice(0, 4096))
+        .setColor(parseColor(panel.color, 0x28f6a1))
+        .setFooter({ text: "Sorteio manual com o preset padrao da Caixa Pix." })
+        .setTimestamp()
+    );
+  }
+  return embeds;
+}
+async function runPixBoxCommand(context, quantity = 1, targetUser = null) {
+  if (!isAdmin(context.member)) {
+    return actionReply(context, { content: "So ADM pode sortear Caixa Pix manualmente.", ephemeral: true });
+  }
+
+  const guildId = actionGuildId(context);
+  const db = readOrders();
+  const order = findOrderInChannel(db, context, false);
+  const panel = order ? getOrderPanel(order, guildId) : getPanel(guildId, context.channel?.id || "default");
+  const results = rollPixBoxPreset(quantity);
+  const targetId = targetUser?.id || order?.userId || "";
+  const payload = {
+    content: targetId ? `<@${targetId}> resultado da Caixa Pix:` : "Resultado da Caixa Pix:",
+    embeds: pixBoxCommandEmbeds(results, panel),
+    allowedMentions: targetId ? { users: [targetId] } : undefined,
+    ephemeral: !targetId
+  };
+
+  return actionReply(context, payload);
 }
 
 function panelEmbed(panel) {
@@ -3104,6 +3408,90 @@ async function privateChannel(guild, user, name, parent) {
     ]
   });
 }
+function panelForManualCart(guildId, channelId) {
+  const store = readPanels();
+  const guildStore = ensurePanelStore(store, guildId);
+  const panels = Object.values(guildStore.panels || {});
+  const current = guildStore.panels?.[channelId];
+  if (current?.products?.length) return current;
+
+  const publishedHere = panels.find(panel => panel.publishedChannelId === channelId && panel.products?.length);
+  if (publishedHere) return publishedHere;
+
+  return panels.find(panel => panel.products?.length) || current || getPanel(guildId, channelId);
+}
+async function openManualCartCommand(context, targetUser) {
+  if (!isAdmin(context.member)) {
+    return actionReply(context, { content: "So ADM pode abrir carrinho manual para cliente.", ephemeral: true });
+  }
+  if (!targetUser) {
+    return actionReply(context, { content: "Marque o cliente. Ex: `/carrinho cliente:@usuario` ou `!carrinho @usuario`.", ephemeral: true });
+  }
+  if (targetUser.bot) {
+    return actionReply(context, { content: "Nao da para abrir carrinho para bot.", ephemeral: true });
+  }
+
+  const guild = context.guild;
+  const member = await guild.members.fetch(targetUser.id).catch(() => null);
+  if (!member) return actionReply(context, { content: "Esse usuario nao esta no servidor.", ephemeral: true });
+
+  const panel = panelForManualCart(guild.id, context.channel.id);
+  const id = orderId("order");
+  const ch = await privateChannel(guild, targetUser, `carrinho-${safeName(targetUser.username)}-aberto-${id}`, config.categories.cartOpen);
+  const order = {
+    id,
+    guildId: guild.id,
+    panelId: panel.id,
+    panelScopeId: panel.scopeId || "default",
+    status: "open",
+    userId: targetUser.id,
+    username: targetUser.username,
+    channelId: ch.id,
+    items: [],
+    manual: true,
+    createdByAdminId: actionUser(context).id,
+    assignedAdminId: null,
+    assignedAdminName: null,
+    assignedAt: null,
+    createdAt: new Date().toISOString(),
+    closedAt: null
+  };
+
+  const db = readOrders();
+  db.orders[id] = order;
+  writeOrders(db);
+
+  const intro = new EmbedBuilder()
+    .setTitle(`Carrinho aberto #${id}`)
+    .setDescription("Carrinho aberto manualmente pela equipe. Selecione um produto no menu ou descreva o pedido neste chat.")
+    .setColor(parseColor(panel.color))
+    .addFields(
+      { name: "Cliente", value: `<@${targetUser.id}>`, inline: true },
+      { name: "ID da compra", value: id, inline: true },
+      { name: "Aberto por", value: `<@${actionUser(context).id}>`, inline: true }
+    )
+    .setTimestamp();
+
+  await ch.send({
+    content: `<@${targetUser.id}>`,
+    embeds: [intro, cartEmbed(order, panel)],
+    components: [productSelect(panel, `cartadd:${id}`), cartButtons(id)],
+    allowedMentions: { users: [targetUser.id] }
+  });
+  await ch.send({ embeds: [staffChoiceEmbed(order, guild.id)], components: staffChoiceRows(id, false) });
+
+  await sendSafeDM(targetUser.id, {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("Carrinho criado")
+        .setDescription(`A equipe abriu um carrinho para voce.\n\nID da compra: \`${id}\`\nAcesse o canal no servidor: ${ch}`)
+        .setColor(parseColor(panel.color))
+        .setTimestamp()
+    ]
+  });
+
+  return actionReply(context, { content: `Carrinho criado para <@${targetUser.id}>: ${ch}`, ephemeral: true });
+}
 function cartText(order, panel) {
   if (!Array.isArray(order.items) || !order.items.length) return "Carrinho vazio.";
   const base = order.items.map(item => {
@@ -3417,6 +3805,56 @@ function openOrderByChannel(guildId, channelId) {
     order.status === "open"
   ) || null;
 }
+function ticketByChannel(db, guildId, channelId, openOnly = true) {
+  return Object.values(db.tickets || {}).find(ticket =>
+    (!ticket.guildId || ticket.guildId === guildId) &&
+    ticket.channelId === channelId &&
+    (!openOnly || ticket.status === "open")
+  ) || null;
+}
+async function setChannelLock(context, locked) {
+  if (!isAdmin(context.member)) {
+    return actionReply(context, { content: "So ADM pode travar ou liberar chat.", ephemeral: true });
+  }
+
+  const guildId = actionGuildId(context);
+  const channel = context.channel;
+  if (!channel?.permissionOverwrites?.edit) {
+    return actionReply(context, { content: "Nao consigo alterar permissoes neste canal.", ephemeral: true });
+  }
+
+  const db = readOrders();
+  const order = findOrderInChannel(db, context, false);
+  const ticket = ticketByChannel(db, guildId, channel.id, false);
+  const record = order || ticket;
+  const targetId = record?.userId || "";
+  const actor = actionUser(context);
+  const now = new Date().toISOString();
+
+  if (targetId) {
+    await channel.permissionOverwrites.edit(targetId, {
+      ViewChannel: true,
+      SendMessages: locked ? false : true,
+      ReadMessageHistory: true,
+      AttachFiles: locked ? false : true
+    }, { reason: `${locked ? "Lock" : "Unlock"} por ${actor.username || actor.id}` });
+
+    record.lockedAt = locked ? now : null;
+    record.lockedById = locked ? actor.id : null;
+    if (order) db.orders[order.id] = record;
+    else db.tickets[record.id] = record;
+    writeOrders(db);
+  } else {
+    await channel.permissionOverwrites.edit(context.guild.id, {
+      SendMessages: locked ? false : null
+    }, { reason: `${locked ? "Lock" : "Unlock"} por ${actor.username || actor.id}` });
+  }
+
+  const text = locked
+    ? targetId ? `Chat travado para <@${targetId}>.` : "Chat travado para @everyone."
+    : targetId ? `Chat liberado para <@${targetId}>.` : "Chat liberado.";
+  return actionReply(context, { content: text, ephemeral: true });
+}
 function normalizeChannelId(value) {
   const raw = String(value || "").trim();
   return raw.match(/\d{15,25}/)?.[0] || "";
@@ -3519,6 +3957,9 @@ async function finishCart(interaction, id, options = {}) {
   const db = readOrders(); const order = orderForAction(db, id, interaction);
   if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   if (config.settings.finalizeCartOnlyAdmins && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Só admin finaliza. Clique em **Chamar ADM**.", ephemeral: true });
+  if (!Array.isArray(order.items) || !order.items.length) {
+    return actionReply(interaction, { content: "Esse carrinho ainda esta vazio. Adicione um produto antes de finalizar.", ephemeral: true });
+  }
   const panel = getOrderPanel(order, guildId);
   const mysteryResults = Array.isArray(order.mysteryResults) && order.mysteryResults.length
     ? order.mysteryResults
@@ -3534,7 +3975,7 @@ async function finishCart(interaction, id, options = {}) {
   await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "fechado") : `carrinho-${safeName(order.username)}-fechado-${order.id}`).catch(() => null);
   if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
-  await grantCustomerRole(interaction.guild, order.userId);
+  const roleGranted = await grantCustomerRole(interaction.guild, order.userId);
   await sendCompletionReceipt(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar recibo da venda ${order.id}: ${error.message}`));
   await sendSuccessFeed(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar feed da venda ${order.id}: ${error.message}`));
   scheduleCartDeletion(order);
@@ -3562,7 +4003,8 @@ ${cartText(order, panel)}`.slice(0, 4096))
   });
 
   const reviewText = reviewResult ? ` ${reviewResult.message}` : "";
-  return actionReply(interaction, { content: mysteryResults.length ? `Compra #${order.id} finalizada e caixa surpresa sorteada.${reviewText}` : `Compra #${order.id} finalizada.${reviewText}`, ephemeral: true });
+  const roleText = roleGranted ? "" : " Nao consegui aplicar o cargo cliente; confira se o cargo do bot esta acima do cargo cliente.";
+  return actionReply(interaction, { content: mysteryResults.length ? `Compra #${order.id} finalizada e caixa surpresa sorteada.${reviewText}${roleText}` : `Compra #${order.id} finalizada.${reviewText}${roleText}`, ephemeral: true });
 }
 
 function ticketPanelEmbed() { return new EmbedBuilder().setTitle(config.ticketPanel.title).setDescription(config.ticketPanel.description).setColor(parseColor(config.ticketPanel.embedColor, 0x2b2d31)); }
@@ -3662,8 +4104,14 @@ async function handlePendingImageUpload(message) {
   return true;
 }
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`Bot online como ${client.user.tag}`);
+  for (const guild of client.guilds.cache.values()) {
+    await ensureStaffState(guild, null).catch(error => {
+      console.log(`Nao consegui recuperar atendimento em ${guild.id}: ${error.message}`);
+    });
+    await refreshStaffPanel(guild.id).catch(() => null);
+  }
   scheduleExistingClosedCarts();
 });
 
@@ -3682,6 +4130,36 @@ client.on("messageCreate", async message => {
   if (content === `${config.prefix || "!"}atendimento`) {
     await message.delete().catch(() => null);
     return setupStaffPanel(message);
+  }
+
+  if (content === `${config.prefix || "!"}salvarpix`) {
+    await message.delete().catch(() => null);
+    return savePixBackupCommand(message);
+  }
+
+  if (content.startsWith(`${config.prefix || "!"}caixapix`)) {
+    const args = rawContent.trim().split(/\s+/).slice(1);
+    const quantity = Number(args.find(arg => /^\d{1,3}$/.test(arg)) || 1);
+    const targetUser = message.mentions.users.first() || null;
+    await message.delete().catch(() => null);
+    return runPixBoxCommand(message, quantity, targetUser);
+  }
+
+  if (content.startsWith(`${config.prefix || "!"}carrinho`)) {
+    const userId = rawContent.match(/\d{15,25}/)?.[0] || "";
+    const targetUser = message.mentions.users.first() || (userId ? await client.users.fetch(userId).catch(() => null) : null);
+    await message.delete().catch(() => null);
+    return openManualCartCommand(message, targetUser);
+  }
+
+  if (content === `${config.prefix || "!"}lock`) {
+    await message.delete().catch(() => null);
+    return setChannelLock(message, true);
+  }
+
+  if (content === `${config.prefix || "!"}unlock`) {
+    await message.delete().catch(() => null);
+    return setChannelLock(message, false);
   }
 
   if (content.startsWith(`${config.prefix || "!"}setupsucess`)) {
@@ -3731,6 +4209,17 @@ client.on("interactionCreate", async interaction => {
       }
       if (interaction.commandName === "setup-ticket") return setupTicket(interaction);
       if (interaction.commandName === "setup-atendimento") return setupStaffPanel(interaction);
+      if (interaction.commandName === "salvarpix") return savePixBackupCommand(interaction);
+      if (interaction.commandName === "caixapix") {
+        return runPixBoxCommand(
+          interaction,
+          interaction.options.getInteger("quantidade") || 1,
+          interaction.options.getUser("cliente")
+        );
+      }
+      if (interaction.commandName === "carrinho") return openManualCartCommand(interaction, interaction.options.getUser("cliente"));
+      if (interaction.commandName === "lock") return setChannelLock(interaction, true);
+      if (interaction.commandName === "unlock") return setChannelLock(interaction, false);
       if (interaction.commandName === "setupsucess") {
         const enabled = interaction.options.getBoolean("ativo") ?? true;
         const role = interaction.options.getRole("cargo-cliente");
@@ -3746,6 +4235,7 @@ client.on("interactionCreate", async interaction => {
       }
       if (interaction.commandName === "configpix") {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para configurar Pix.")) return;
+        await ensureStaffState(interaction.guild, interaction.channel);
         return interaction.showModal(pixConfigModal(interaction.guildId, interaction.user));
       }
       if (interaction.commandName === "status-loja") {

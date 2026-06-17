@@ -108,6 +108,13 @@ Depois de mudar slash commands em `deploy-commands.js`, rode `npm run deploy` ou
 
 Se `/configpix` nao aparecer ou disser que falta permissao, use `!configpix`: o bot manda um botao que abre o mesmo formulario. Rode `npm run deploy` de novo quando quiser corrigir os slash commands. Os comandos slash ficam visiveis no Discord, mas o bot so deixa usar quem tem Administrator ou o cargo ADM configurado em `config.json`.
 
+Comandos operacionais uteis:
+
+- `/salvarpix` ou `!salvarpix`: salva o backup do Pix/painel de atendimento no Discord.
+- `/caixapix quantidade:5` ou `!caixapix 5`: sorteia Caixa Pix com o preset padrao, sem mostrar porcentagens ao cliente.
+- `/carrinho cliente:@usuario` ou `!carrinho @usuario`: abre um carrinho privado manual para o cliente.
+- `/lock`, `/unlock`, `!lock` e `!unlock`: trava/libera o chat atual; em carrinho/ticket mexe direto na permissao do cliente.
+
 ## Site da Dragon Store
 
 O projeto do site fica em `site/`. Ele e separado do bot para publicar facil na Vercel.

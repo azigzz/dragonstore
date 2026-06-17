@@ -35,6 +35,9 @@
     "enabled": true,
     "channelId": "1516561891919528037"
   },
+  "staffBackup": {
+    "channelId": ""
+  },
   "settings": {
     "finalizeCartOnlyAdmins": true,
     "deleteTicketAfterCloseSeconds": 5,
