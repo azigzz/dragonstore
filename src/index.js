@@ -947,6 +947,55 @@ async function resendPix(interaction, id) {
 
   return interaction.reply({ content: "Pix reenviado.", ephemeral: true });
 }
+async function sendPixCommand(message) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode enviar Pix do carrinho.");
+  await message.delete().catch(() => null);
+
+  const db = readOrders();
+  const order = findOrderInChannel(db, message, false);
+  if (!order) return message.channel.send("Nao encontrei carrinho neste chat.");
+  if (order.status !== "open") return message.channel.send(`Esse carrinho esta ${order.status === "closed" ? "fechado" : "indisponivel"}.`);
+
+  await ensureStaffState(message.guild, message.channel);
+  const profile = getStaffProfile(message.guild.id, message.author.id);
+  if (!profile?.pixKey) return message.channel.send("Configure seu Pix primeiro com `!configpix` ou `/configpix`.");
+
+  if (order.assignedAdminId && order.assignedAdminId !== message.author.id) {
+    return message.channel.send(`Essa compra ja foi assumida por <@${order.assignedAdminId}>.`);
+  }
+
+  if (!order.assignedAdminId) {
+    order.assignedAdminId = message.author.id;
+    order.assignedAdminName = profile.displayName || message.member?.displayName || message.author.username;
+    order.assignedAt = new Date().toISOString();
+    db.orders[order.id] = order;
+    writeOrders(db);
+  }
+
+  const panel = getOrderPanel(order, message.guild.id);
+  await message.channel.send({
+    content: `<@${order.userId}> Pix enviado por **${order.assignedAdminName || profile.displayName || "ADM"}** (<@${message.author.id}>).`,
+    embeds: [buildPixEmbed(order, panel, profile)],
+    components: staffChoiceRows(order.id, true),
+    allowedMentions: { users: [order.userId, message.author.id] }
+  });
+  await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
+  return null;
+}
+async function finishCurrentCartCommand(message) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode concluir compra.");
+  const order = findOrderInChannel(readOrders(), message, true);
+  if (!order) return message.reply("Nao encontrei carrinho aberto neste chat.");
+  await message.delete().catch(() => null);
+  return finishCart(message, order.id);
+}
+async function cancelCurrentCartCommand(message) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode cancelar compra por comando.");
+  const order = findOrderInChannel(readOrders(), message, true);
+  if (!order) return message.reply("Nao encontrei carrinho aberto neste chat.");
+  await message.delete().catch(() => null);
+  return cancelCart(message, order.id);
+}
 async function handleStaffButton(interaction) {
   if (!isAdmin(interaction.member)) {
     return interaction.reply({ content: "Só ADM pode mexer nesse painel.", ephemeral: true });
@@ -1528,20 +1577,40 @@ function getOrderPanel(order, guildId) {
   return (order?.panelId && getPanelById(guildId, order.panelId)) ||
     getPanel(guildId, order?.panelScopeId || order?.scopeId || "default");
 }
+function orderCanBeUsed(order, openOnly = true) {
+  return Boolean(order && (!openOnly || order.status === "open"));
+}
+function orderIdHintsFromContext(context) {
+  const values = [
+    context?.channel?.name,
+    context?.channel?.topic,
+    context?.message?.content,
+    ...(context?.message?.embeds || []).flatMap(embed => [embed?.title, embed?.description])
+  ].filter(Boolean).join(" ");
+  return Array.from(new Set(String(values).match(/\b\d{7}\b/g) || []));
+}
 function findOrderInChannel(db, context, openOnly = true) {
   const guildId = actionGuildId(context);
   const channelId = context?.channel?.id || context?.channelId;
   if (!guildId || !channelId) return null;
 
-  return Object.values(db.orders || {}).find(order =>
+  const byChannel = Object.values(db.orders || {}).find(order =>
     order.guildId === guildId &&
     order.channelId === channelId &&
     (!openOnly || order.status === "open")
-  ) || null;
+  );
+  if (byChannel) return byChannel;
+
+  for (const hintId of orderIdHintsFromContext(context)) {
+    const hinted = db.orders?.[hintId];
+    if (hinted?.guildId === guildId && orderCanBeUsed(hinted, openOnly)) return hinted;
+  }
+
+  return null;
 }
 function orderForAction(db, id, context, openOnly = true) {
   const order = db.orders?.[id];
-  if (order && (!openOnly || order.status === "open")) return order;
+  if (orderCanBeUsed(order, openOnly)) return order;
   return findOrderInChannel(db, context, openOnly) || order || null;
 }
 function product(panel, id) { return (panel.products || []).find(p => p.id === id); }
@@ -3785,7 +3854,7 @@ function commandHelpEmbed(member) {
     "`/saldogasto` ou `!saldogasto` - mostra seu saldo gasto em modo privado."
   ];
   const setupCommands = [
-    "`/configds` ou `!configds` - abre o configurador da loja no canal.",
+    "`/configds`, `!configds`, `!painel`, `!loja` ou `!setup` - abre o configurador da loja no canal.",
     "`/setup-atendimento` ou `!atendimento` - cria/atualiza o painel ON/OFF dos ADMs.",
     "`/configpix` ou `!configpix` - configura Pix do ADM.",
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
@@ -3794,6 +3863,9 @@ function commandHelpEmbed(member) {
     "`/status-loja` ou `!status-loja` - mostra resumo da loja."
   ];
   const salesCommands = [
+    "`!pix` ou `!assumir` - assume o carrinho atual e envia o Pix do ADM.",
+    "`!concluircompra` ou `!concluir` - conclui o carrinho atual.",
+    "`!cancelarcompra` ou `!cancelar` - cancela e apaga o carrinho atual.",
     "`/avaliacao` ou `!avaliacao` - finaliza carrinho e pede avaliacao.",
     "`/carrinho cliente:@user` ou `!carrinho @user` - abre carrinho manual.",
     "`/caixapix quantidade:5` ou `!caixapix 5` - sorteia Caixa Pix manual.",
@@ -4426,7 +4498,7 @@ client.on("messageCreate", async message => {
     return sendHelpCommand(message);
   }
 
-  if (content === `${config.prefix || "!"}configds`) {
+  if ([`${config.prefix || "!"}configds`, `${config.prefix || "!"}painel`, `${config.prefix || "!"}loja`, `${config.prefix || "!"}setup`].includes(content)) {
     await message.delete().catch(() => null);
     return startConfig(message.channel, message.member, message.author);
   }
@@ -4439,6 +4511,18 @@ client.on("messageCreate", async message => {
   if (content === `${config.prefix || "!"}salvarpix`) {
     await message.delete().catch(() => null);
     return savePixBackupCommand(message);
+  }
+
+  if ([`${config.prefix || "!"}pix`, `${config.prefix || "!"}assumir`].includes(content)) {
+    return sendPixCommand(message);
+  }
+
+  if ([`${config.prefix || "!"}concluircompra`, `${config.prefix || "!"}concluir`, `${config.prefix || "!"}finalizarcompra`, `${config.prefix || "!"}finalizar`].includes(content)) {
+    return finishCurrentCartCommand(message);
+  }
+
+  if ([`${config.prefix || "!"}cancelarcompra`, `${config.prefix || "!"}cancelar`].includes(content)) {
+    return cancelCurrentCartCommand(message);
   }
 
   if (content.startsWith(`${config.prefix || "!"}caixapix`)) {

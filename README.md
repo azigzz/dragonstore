@@ -70,10 +70,16 @@ No Discord:
 !help
 /configds
 !configds
+!painel
+!loja
+!setup
 /setup-atendimento
 !atendimento
 /configpix
 !configpix
+!pix
+!concluircompra
+!cancelarcompra
 /setup-ticket
 /setupsucess
 !setupsucess
@@ -121,6 +127,8 @@ Comandos operacionais uteis:
 
 - `/help` ou `!help`: mostra a lista de comandos; ADMs veem tambem a area administrativa.
 - `/salvarpix` ou `!salvarpix`: salva o backup do Pix/painel de atendimento no Discord.
+- `!pix`: no carrinho atual, assume a compra e envia o Pix do ADM.
+- `!concluircompra` e `!cancelarcompra`: finalizam ou cancelam o carrinho atual sem depender dos botoes.
 - `/caixapix quantidade:5` ou `!caixapix 5`: sorteia Caixa Pix com o preset padrao, sem mostrar porcentagens ao cliente.
 - `/carrinho cliente:@usuario` ou `!carrinho @usuario`: abre um carrinho privado manual para o cliente.
 - `/lock`, `/unlock`, `!lock` e `!unlock`: trava/libera o chat atual; em carrinho/ticket mexe direto na permissao do cliente.
