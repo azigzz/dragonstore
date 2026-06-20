@@ -54,11 +54,13 @@ const client = new Client({
 });
 
 const sessions = new Map();
+const addCartSessions = new Map();
 const imageUploads = new Map();
 const cartDeleteTimers = new Map();
 const publicPanelScanCache = new Map();
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
+const ADD_CART_SESSION_TTL_MS = 10 * 60 * 1000;
 
 function cloneJson(data) {
   return JSON.parse(JSON.stringify(data));
@@ -3863,6 +3865,7 @@ function commandHelpEmbed(member) {
     "`/status-loja` ou `!status-loja` - mostra resumo da loja."
   ];
   const salesCommands = [
+    "`!addcar [pesquisa]` - lista produtos, permite pesquisar e pergunta a quantidade antes de adicionar.",
     "`!pix` ou `!assumir` - assume o carrinho atual e envia o Pix do ADM.",
     "`!concluircompra` ou `!concluir` - conclui o carrinho atual.",
     "`!cancelarcompra` ou `!cancelar` - cancela e apaga o carrinho atual.",
@@ -4127,6 +4130,270 @@ async function addCart(interaction) {
   if (item) item.quantity += 1; else order.items.push(orderItemFromProduct(p));
   db.orders[order.id] = order; writeOrders(db);
   await interaction.reply({ content: `Adicionado: ${productIcon(p)} **${p.name}** — ${p.price}`, ephemeral: true });
+  return interaction.channel.send({ embeds: [productInfoEmbed(p, panel, "Produto adicionado"), cartEmbed(order, panel)] });
+}
+function canEditOrder(member, userId, order) {
+  return Boolean(order && (userId === order.userId || isAdmin(member)));
+}
+function rememberAddCartSession(session) {
+  session.expiresAt = Date.now() + ADD_CART_SESSION_TTL_MS;
+  addCartSessions.set(session.id, session);
+  setTimeout(() => {
+    const current = addCartSessions.get(session.id);
+    if (current?.expiresAt && current.expiresAt <= Date.now()) addCartSessions.delete(session.id);
+  }, ADD_CART_SESSION_TTL_MS + 1000);
+  return session;
+}
+function getAddCartSession(interaction) {
+  const [, sessionId] = interaction.customId.split(":");
+  const session = addCartSessions.get(sessionId);
+  if (!session || session.expiresAt <= Date.now()) {
+    if (session) addCartSessions.delete(sessionId);
+    return null;
+  }
+  return session;
+}
+function addCartSessionAllowed(context, session, order) {
+  const user = actionUser(context);
+  if (!user || user.id !== session.userId) return false;
+  return canEditOrder(context.member, user.id, order);
+}
+function addCartMatches(panel, query = "") {
+  const words = plainText(query).split(/\s+/).filter(Boolean);
+  const products = Array.isArray(panel?.products) ? panel.products : [];
+  if (!words.length) return products;
+  return products.filter(p => {
+    const haystack = plainText([p.name, p.price, p.description, p.stock].filter(Boolean).join(" "));
+    return words.every(word => haystack.includes(word));
+  });
+}
+function addCartProductLines(panel, query = "") {
+  const matches = addCartMatches(panel, query);
+  if (!matches.length) return "Nenhum produto encontrado com essa pesquisa.";
+  return matches.slice(0, 15).map((p, index) => {
+    return `\`${index + 1}.\` ${productIcon(p)} **${p.name}** - ${p.price} | Estoque: ${p.stock || "infinito"}`;
+  }).join("\n");
+}
+function addCartProductSelect(session, panel) {
+  const matches = addCartMatches(panel, session.query).slice(0, 25);
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`addcarpick:${session.id}:${sid()}`)
+    .setPlaceholder("Selecione o produto para adicionar")
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  if (!matches.length) {
+    menu
+      .setDisabled(true)
+      .addOptions([{ label: "Nenhum produto encontrado", value: "none", description: "Clique em Pesquisar ou Limpar filtro." }]);
+  } else {
+    menu.addOptions(matches.map(p => ({
+      label: `${productIcon(p)} ${String(p.name).slice(0, 96)}`,
+      description: productOptionDescription(p),
+      value: p.id
+    })));
+  }
+
+  return new ActionRowBuilder().addComponents(menu);
+}
+function addCartButtons(session) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`addcar:${session.id}:search`).setLabel("Pesquisar").setEmoji("🔎").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`addcar:${session.id}:clear`).setLabel("Limpar").setEmoji("🧹").setStyle(ButtonStyle.Secondary).setDisabled(!session.query),
+    new ButtonBuilder().setCustomId(`addcar:${session.id}:refresh`).setLabel("Atualizar").setEmoji("♻️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`addcar:${session.id}:close`).setLabel("Fechar").setEmoji("✖️").setStyle(ButtonStyle.Danger)
+  );
+}
+function addCartPanelPayload(session, order, panel) {
+  const matches = addCartMatches(panel, session.query);
+  const embed = new EmbedBuilder()
+    .setTitle(`Adicionar item ao carrinho #${order.id}`)
+    .setDescription([
+      session.query ? `Pesquisa atual: **${session.query}**` : "Mostrando todos os produtos disponiveis neste painel.",
+      "",
+      addCartProductLines(panel, session.query)
+    ].join("\n").slice(0, 4096))
+    .setColor(parseColor(panel.color))
+    .addFields(
+      { name: "Cliente", value: `<@${order.userId}>`, inline: true },
+      { name: "Encontrados", value: `${matches.length}/${panel.products.length}`, inline: true },
+      { name: "Total atual", value: totalLine(order, panel), inline: true }
+    )
+    .setFooter({ text: "Selecione um produto. Depois o bot pede a quantidade." })
+    .setTimestamp();
+
+  return {
+    embeds: [embed],
+    components: [addCartProductSelect(session, panel), addCartButtons(session)]
+  };
+}
+function addCartSearchModal(session) {
+  return new ModalBuilder()
+    .setCustomId(`addcarsearch:${session.id}`)
+    .setTitle("Pesquisar produto")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("query")
+          .setLabel("Nome, preco ou palavra-chave")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(100)
+          .setRequired(false)
+          .setValue(String(session.query || "").slice(0, 100))
+      )
+    );
+}
+function addCartQuantityModal(session, p) {
+  return new ModalBuilder()
+    .setCustomId(`addcarqty:${session.id}:${p.id}`)
+    .setTitle("Quantidade")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("quantity")
+          .setLabel(`Quantidade de ${String(p.name).slice(0, 30)}`)
+          .setStyle(TextInputStyle.Short)
+          .setMinLength(1)
+          .setMaxLength(4)
+          .setPlaceholder("Ex: 1")
+          .setValue("1")
+          .setRequired(true)
+      )
+    );
+}
+function parseCartQuantity(value) {
+  const match = String(value || "").match(/\d{1,4}/);
+  if (!match) return null;
+  const quantity = Number.parseInt(match[0], 10);
+  if (!Number.isFinite(quantity) || quantity <= 0) return null;
+  return Math.min(999, quantity);
+}
+async function refreshAddCartMessage(context, session, order, panel) {
+  const channel = context.channel;
+  if (!channel?.messages?.fetch || !session.messageId) return false;
+  const message = await channel.messages.fetch(session.messageId).catch(() => null);
+  if (!message) return false;
+  await message.edit(addCartPanelPayload(session, order, panel)).catch(() => null);
+  return true;
+}
+async function sendAddCartCommand(message, initialQuery = "") {
+  const db = readOrders();
+  const order = findOrderInChannel(db, message, true);
+  if (!order) return message.reply("Nao encontrei carrinho aberto neste chat. Use dentro do canal do carrinho.").catch(() => null);
+  if (!canEditOrder(message.member, message.author.id, order)) {
+    return message.reply("Voce nao pode alterar esse carrinho.").catch(() => null);
+  }
+
+  const panel = getOrderPanel(order, message.guild.id);
+  if (!panel?.products?.length) return message.reply("Esse painel nao tem produtos cadastrados para adicionar.").catch(() => null);
+
+  await message.delete().catch(() => null);
+
+  const session = rememberAddCartSession({
+    id: sid(),
+    guildId: message.guild.id,
+    channelId: message.channel.id,
+    orderId: order.id,
+    userId: message.author.id,
+    query: clampText(initialQuery, 100)
+  });
+  const sent = await message.channel.send(addCartPanelPayload(session, order, panel));
+  session.messageId = sent.id;
+  addCartSessions.set(session.id, session);
+  return sent;
+}
+async function handleAddCartButton(interaction) {
+  const session = getAddCartSession(interaction);
+  if (!session) return interaction.reply({ content: "Sessao expirada. Use `!addcar` novamente.", ephemeral: true });
+
+  const [, , action] = interaction.customId.split(":");
+  const db = readOrders();
+  const order = db.orders?.[session.orderId];
+  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (!addCartSessionAllowed(interaction, session, order)) return interaction.reply({ content: "Essa lista foi aberta por outro usuario.", ephemeral: true });
+
+  const panel = getOrderPanel(order, interaction.guildId);
+  if (action === "search") return interaction.showModal(addCartSearchModal(session));
+  if (action === "clear") {
+    session.query = "";
+    rememberAddCartSession(session);
+    await interaction.update(addCartPanelPayload(session, order, panel));
+    return;
+  }
+  if (action === "refresh") {
+    rememberAddCartSession(session);
+    await interaction.update(addCartPanelPayload(session, order, panel));
+    return;
+  }
+  if (action === "close") {
+    await interaction.deferUpdate().catch(() => null);
+    addCartSessions.delete(session.id);
+    await interaction.message.delete().catch(() => null);
+  }
+}
+async function handleAddCartSearchSubmit(interaction) {
+  const session = getAddCartSession(interaction);
+  if (!session) return interaction.reply({ content: "Sessao expirada. Use `!addcar` novamente.", ephemeral: true });
+
+  const db = readOrders();
+  const order = db.orders?.[session.orderId];
+  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (!addCartSessionAllowed(interaction, session, order)) return interaction.reply({ content: "Essa lista foi aberta por outro usuario.", ephemeral: true });
+
+  session.query = clampText(interaction.fields.getTextInputValue("query"), 100);
+  rememberAddCartSession(session);
+  await interaction.deferReply({ ephemeral: true });
+  const panel = getOrderPanel(order, interaction.guildId);
+  await refreshAddCartMessage(interaction, session, order, panel);
+  return interaction.editReply({
+    content: session.query ? `Pesquisa aplicada: **${session.query}**.` : "Pesquisa limpa. Mostrando todos os produtos.",
+  });
+}
+async function handleAddCartPick(interaction) {
+  const session = getAddCartSession(interaction);
+  if (!session) return interaction.reply({ content: "Sessao expirada. Use `!addcar` novamente.", ephemeral: true });
+
+  const db = readOrders();
+  const order = db.orders?.[session.orderId];
+  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (!addCartSessionAllowed(interaction, session, order)) return interaction.reply({ content: "Essa lista foi aberta por outro usuario.", ephemeral: true });
+
+  const panel = getOrderPanel(order, interaction.guildId);
+  const p = product(panel, interaction.values[0]);
+  if (!p) return interaction.reply({ content: "Produto nao encontrado.", ephemeral: true });
+  return interaction.showModal(addCartQuantityModal(session, p));
+}
+async function handleAddCartQuantitySubmit(interaction) {
+  const parts = interaction.customId.split(":");
+  const session = getAddCartSession(interaction);
+  if (!session) return interaction.reply({ content: "Sessao expirada. Use `!addcar` novamente.", ephemeral: true });
+
+  const db = readOrders();
+  const order = db.orders?.[session.orderId];
+  if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  if (!addCartSessionAllowed(interaction, session, order)) return interaction.reply({ content: "Essa lista foi aberta por outro usuario.", ephemeral: true });
+
+  const quantity = parseCartQuantity(interaction.fields.getTextInputValue("quantity"));
+  if (!quantity) return interaction.reply({ content: "Quantidade invalida. Use um numero maior que zero.", ephemeral: true });
+
+  const panel = getOrderPanel(order, interaction.guildId);
+  const p = product(panel, parts[2]);
+  if (!p) return interaction.reply({ content: "Produto nao encontrado.", ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+
+  const item = order.items.find(current => current.productId === p.id);
+  if (item) item.quantity = Math.min(9999, (Number(item.quantity) || 1) + quantity);
+  else {
+    const next = orderItemFromProduct(p);
+    next.quantity = quantity;
+    order.items.push(next);
+  }
+
+  db.orders[order.id] = order;
+  writeOrders(db);
+  rememberAddCartSession(session);
+  await refreshAddCartMessage(interaction, session, order, panel);
+  await interaction.editReply({ content: `Adicionado: ${productIcon(p)} **${p.name}** x${quantity}.` });
   return interaction.channel.send({ embeds: [productInfoEmbed(p, panel, "Produto adicionado"), cartEmbed(order, panel)] });
 }
 async function callAdmin(interaction, id, type = "order") {
@@ -4493,6 +4760,7 @@ client.on("messageCreate", async message => {
   const rawContent = message.content.trim();
   const content = rawContent.toLowerCase();
   const plainContent = content.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const prefix = config.prefix || "!";
 
   if (content === `${config.prefix || "!"}help`) {
     return sendHelpCommand(message);
@@ -4523,6 +4791,12 @@ client.on("messageCreate", async message => {
 
   if ([`${config.prefix || "!"}cancelarcompra`, `${config.prefix || "!"}cancelar`].includes(content)) {
     return cancelCurrentCartCommand(message);
+  }
+
+  const addCartCommand = [`${prefix}addcar`, `${prefix}addcart`, `${prefix}adicionar`]
+    .find(command => content === command || content.startsWith(`${command} `));
+  if (addCartCommand) {
+    return sendAddCartCommand(message, rawContent.slice(addCartCommand.length).trim());
   }
 
   if (content.startsWith(`${config.prefix || "!"}caixapix`)) {
@@ -4656,6 +4930,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("rmcancel:")) return handleRemoveCancel(interaction);
       if (interaction.customId.startsWith("cfg:")) return handleConfigButton(interaction);
       if (interaction.customId.startsWith("staff:")) return handleStaffButton(interaction);
+      if (interaction.customId.startsWith("addcar:")) return handleAddCartButton(interaction);
       if (interaction.customId.startsWith("rank:")) {
         const [, period, page] = interaction.customId.split(":");
         return showSpendRanking(interaction, period, Number(page) || 0);
@@ -4676,6 +4951,8 @@ client.on("interactionCreate", async interaction => {
       if (act === "tclose") return closeTicket(interaction, id);
     }
     if (interaction.isModalSubmit() && interaction.customId === "pixmodal") return handlePixModal(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("addcarsearch:")) return handleAddCartSearchSubmit(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("addcarqty:")) return handleAddCartQuantitySubmit(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("quickmodal:")) return handleQuickOrderSubmit(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal:")) return handleModal(interaction);
     if (interaction.isStringSelectMenu()) {
@@ -4687,6 +4964,7 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("reward:")) return handleRewardProduct(interaction);
       if (interaction.customId.startsWith("buy:")) return openCart(interaction);
       if (interaction.customId.startsWith("cartadd:")) return addCart(interaction);
+      if (interaction.customId.startsWith("addcarpick:")) return handleAddCartPick(interaction);
     }
   } catch (err) {
     console.error(err);
