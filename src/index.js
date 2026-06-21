@@ -61,6 +61,12 @@ ensureJsonFile(STAFF_FILE, { guilds: {} });
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
+client.on("error", error => {
+  console.error("Erro do client Discord:", error);
+});
+client.on("shardError", error => {
+  console.error("Erro de shard Discord:", error);
+});
 
 const sessions = new Map();
 const addCartSessions = new Map();
@@ -3796,6 +3802,9 @@ async function openManualCartCommand(context, targetUser) {
   if (targetUser.bot) {
     return actionReply(context, { content: "Nao da para abrir carrinho para bot.", ephemeral: true });
   }
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
+  }
 
   const guild = context.guild;
   const member = await guild.members.fetch(targetUser.id).catch(() => null);
@@ -4079,6 +4088,7 @@ async function sendDiagnosticsCommand(context) {
   return actionReply(context, { embeds: [buildDiagnosticsEmbed(actionGuildId(context))], ephemeral: true });
 }
 async function openCart(interaction) {
+  await interaction.deferReply({ ephemeral: true });
   const [, panelId] = interaction.customId.split(":");
   let panel = getPanelById(interaction.guildId, panelId);
   if (!panel || !product(panel, interaction.values[0])) {
@@ -4088,9 +4098,9 @@ async function openCart(interaction) {
       panel?.scopeId || scopeIdFromPanelId(panelId, interaction.channelId)
     ) || panel;
   }
-  if (!panel) return interaction.reply({ content: "Painel antigo. Use `!configds`, clique em **Vincular painel** e cole o link desta mensagem.", ephemeral: true });
+  if (!panel) return actionReply(interaction, { content: "Painel antigo. Use `!configds`, clique em **Vincular painel** e cole o link desta mensagem.", ephemeral: true });
   const p = product(panel, interaction.values[0]);
-  if (!p) return interaction.reply({ content: "Produto não encontrado.", ephemeral: true });
+  if (!p) return actionReply(interaction, { content: "Produto não encontrado.", ephemeral: true });
   await resetSelectMessage(interaction, saleMessage(panel));
   const discount = discountForMember(interaction.member);
   const id = orderId("order");
@@ -4141,7 +4151,7 @@ async function openCart(interaction) {
     ]
   });
 
-  return interaction.reply({ content: `Carrinho criado: ${ch}`, ephemeral: true });
+  return actionReply(interaction, { content: `Carrinho criado: ${ch}`, ephemeral: true });
 }
 async function handleQuickBuyButton(interaction, panelId) {
   const panel = getPanelById(interaction.guildId, panelId) ||
@@ -4166,6 +4176,7 @@ async function handleQuickOrderSubmit(interaction) {
   const [, panelId] = interaction.customId.split(":");
   const panel = getPanelById(interaction.guildId, panelId);
   if (!panel) return interaction.reply({ content: "Mensagem de compra antiga. Peça para um admin publicar de novo.", ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
 
   const quick = quickOrderConfig(panel);
   const answer1 = interaction.fields.getTextInputValue("answer1").trim();
@@ -4242,7 +4253,7 @@ async function handleQuickOrderSubmit(interaction) {
     ]
   });
 
-  return interaction.reply({ content: `Carrinho criado: ${ch}`, ephemeral: true });
+  return actionReply(interaction, { content: `Carrinho criado: ${ch}`, ephemeral: true });
 }
 async function addCart(interaction) {
   const [, id] = interaction.customId.split(":");
@@ -5021,8 +5032,11 @@ client.on("messageCreate", async message => {
   }
 });
 
-client.on("interactionCreate", async interaction => {
-  try {
+client.on("interactionCreate", interaction => {
+  handleInteraction(interaction).catch(error => handleInteractionError(interaction, error));
+});
+
+async function handleInteraction(interaction) {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "help") return sendHelpCommand(interaction);
       if (interaction.commandName === "configds") {
@@ -5119,12 +5133,13 @@ client.on("interactionCreate", async interaction => {
       if (interaction.customId.startsWith("cartadd:")) return addCart(interaction);
       if (interaction.customId.startsWith("addcarpick:")) return handleAddCartPick(interaction);
     }
-  } catch (err) {
-    console.error(err);
-    const payload = { content: `Erro: \`${err.message}\``, ephemeral: true };
-    await actionReply(interaction, payload).catch(() => null);
-  }
-});
+}
+
+async function handleInteractionError(interaction, err) {
+  console.error(err);
+  const payload = { content: `Erro: \`${err.message}\``, ephemeral: true };
+  await actionReply(interaction, payload).catch(() => null);
+}
 
 const token = process.env.DISCORD_TOKEN?.trim();
 if (!token) {
