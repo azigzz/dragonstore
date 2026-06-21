@@ -123,11 +123,20 @@ Depois de mudar slash commands em `deploy-commands.js`, rode `npm run deploy` ou
 
 Se `/configpix` nao aparecer ou disser que falta permissao, use `!configpix`: o bot manda um botao que abre o mesmo formulario. Rode `npm run deploy` de novo quando quiser corrigir os slash commands. Os comandos slash ficam visiveis no Discord, mas o bot so deixa usar quem tem Administrator ou o cargo ADM configurado em `config.json`.
 
+Antes de subir uma versao nova, rode:
+
+```bash
+npm run check
+```
+
+Depois do deploy, use `/diagnostico` no servidor para conferir KV, paineis, Pix, atendimento e alertas.
+
 Comandos operacionais uteis:
 
 - `/help` ou `!help`: mostra a lista de comandos; ADMs veem tambem a area administrativa.
 - `/salvarpix` ou `!salvarpix`: salva o backup do Pix/painel de atendimento no Discord.
-- `!addcar [pesquisa]`: dentro de um carrinho, abre uma lista de produtos com botao de pesquisa e pergunta a quantidade antes de adicionar. Ex: `!addcar steam`.
+- `/addcar` ou `!addcar [pesquisa]`: dentro de um carrinho, abre uma lista de produtos com botao de pesquisa e pergunta a quantidade antes de adicionar. Ex: `!addcar steam`.
+- `/diagnostico` ou `!diagnostico`: mostra KV, paineis, produtos, Pix, atendimento e alertas de configuracao.
 - `!pix`: no carrinho atual, assume a compra e envia o Pix do ADM.
 - `!concluircompra` e `!cancelarcompra`: finalizam ou cancelam o carrinho atual sem depender dos botoes.
 - `/caixapix quantidade:5` ou `!caixapix 5`: sorteia Caixa Pix com o preset padrao, sem mostrar porcentagens ao cliente.

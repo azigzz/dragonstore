@@ -97,6 +97,19 @@ const commands = [
     .setName("status-loja")
     .setDescription("Mostra a configuracao atual da loja."),
   new SlashCommandBuilder()
+    .setName("diagnostico")
+    .setDescription("Mostra saude do bot, KV, Pix, paineis e carrinhos."),
+  new SlashCommandBuilder()
+    .setName("addcar")
+    .setDescription("Adiciona um produto ao carrinho atual com pesquisa e quantidade.")
+    .addStringOption(option =>
+      option
+        .setName("pesquisa")
+        .setDescription("Filtro opcional para abrir a lista ja pesquisada.")
+        .setMaxLength(100)
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName("ranking-gastos")
     .setDescription("Mostra o ranking de clientes por valor gasto."),
   new SlashCommandBuilder()

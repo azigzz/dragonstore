@@ -1,6 +1,6 @@
 "use client";
 
-import { BarChart3, CheckCircle2, LogIn, LogOut, Plus, RefreshCw, Save, ShieldCheck, TestTube2, Trash2 } from "lucide-react";
+import { BarChart3, CheckCircle2, Copy, LogIn, LogOut, Plus, RefreshCw, Save, ShieldCheck, TestTube2, Trash2 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { AdminConfigPayload, AnalyticsSummary, StoreCategory, StoreProduct } from "@/lib/types";
 
@@ -83,6 +83,15 @@ function productLabel(count: number) {
   return `${count} ${count === 1 ? "produto" : "produtos"}`;
 }
 
+function uniqueId(base: string, existing: Iterable<string>) {
+  const cleanBase = slugify(base);
+  const used = new Set([...existing]);
+  if (!used.has(cleanBase)) return cleanBase;
+  let suffix = 2;
+  while (used.has(`${cleanBase}-${suffix}`)) suffix += 1;
+  return `${cleanBase}-${suffix}`;
+}
+
 export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps) {
   const [isLoggedIn, setIsLoggedIn] = useState(loggedIn);
   const [password, setPassword] = useState("");
@@ -155,7 +164,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
   }
 
   function changeCategoryId(oldId: string, value: string) {
-    const nextId = slugify(value);
+    const nextId = uniqueId(value, categories.filter(category => category.id !== oldId).map(category => category.id));
     if (!nextId) return;
     setCategories(current => current.map(category => category.id === oldId ? { ...category, id: nextId } : category));
     setSelectedCategoryId(nextId);
@@ -172,7 +181,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
   }
 
   function addCategory() {
-    const id = `categoria-${Date.now().toString(36)}`;
+    const id = uniqueId(`categoria-${Date.now().toString(36)}`, categories.map(category => category.id));
     const category: StoreCategory = {
       id,
       title: "Nova categoria",
@@ -182,6 +191,28 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
       products: [newProduct(1)]
     };
     setCategories(current => [...current, category]);
+    setSelectedCategoryId(id);
+  }
+
+  function duplicateCategory(categoryId: string) {
+    const source = categories.find(category => category.id === categoryId);
+    if (!source) return;
+    const id = uniqueId(`${source.id}-copia`, categories.map(category => category.id));
+    const category: StoreCategory = {
+      ...source,
+      id,
+      title: `${source.title} copia`,
+      products: source.products.map((product, index) => ({
+        ...product,
+        id: uniqueId(`${product.id}-copia`, source.products.map(item => item.id).concat(`${product.id}-${index}`))
+      }))
+    };
+    setCategories(current => {
+      const index = current.findIndex(item => item.id === categoryId);
+      const next = [...current];
+      next.splice(index + 1, 0, category);
+      return next;
+    });
     setSelectedCategoryId(id);
   }
 
@@ -197,6 +228,20 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
     setCategories(current => current.map(category => {
       if (category.id !== categoryId) return category;
       return { ...category, products: [...category.products, newProduct(category.products.length + 1)] };
+    }));
+  }
+
+  function duplicateProduct(categoryId: string, productId: string) {
+    setCategories(current => current.map(category => {
+      if (category.id !== categoryId) return category;
+      const source = category.products.find(product => product.id === productId);
+      if (!source) return category;
+      const id = uniqueId(`${source.id}-copia`, category.products.map(product => product.id));
+      const product = { ...source, id, name: `${source.name} copia` };
+      const index = category.products.findIndex(item => item.id === productId);
+      const products = [...category.products];
+      products.splice(index + 1, 0, product);
+      return { ...category, products };
     }));
   }
 
@@ -418,6 +463,10 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
                           <Plus className="h-4 w-4" />
                           Produto
                         </button>
+                        <button onClick={() => duplicateCategory(selectedCategory.id)} className="inline-flex h-10 items-center gap-2 rounded-md border border-white/10 bg-white/[.06] px-3 text-sm font-bold text-white transition hover:bg-white/10">
+                          <Copy className="h-4 w-4" />
+                          Duplicar categoria
+                        </button>
                         <button onClick={() => removeCategory(selectedCategory.id)} className="inline-flex h-10 items-center gap-2 rounded-md border border-red-300/30 bg-red-400/10 px-3 text-sm font-bold text-red-100 transition hover:bg-red-400/20">
                           <Trash2 className="h-4 w-4" />
                           Remover categoria
@@ -438,10 +487,16 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
                             <TextField label="Descricao" value={product.description} onChange={value => updateProduct(selectedCategory.id, product.id, { description: value })} rows={3} />
                           </div>
                           <div className="md:col-span-2">
-                            <button onClick={() => removeProduct(selectedCategory.id, product.id)} className="inline-flex h-10 items-center gap-2 rounded-md border border-red-300/30 bg-red-400/10 px-3 text-sm font-bold text-red-100 transition hover:bg-red-400/20">
-                              <Trash2 className="h-4 w-4" />
-                              Remover produto
-                            </button>
+                            <div className="flex flex-wrap gap-2">
+                              <button onClick={() => duplicateProduct(selectedCategory.id, product.id)} className="inline-flex h-10 items-center gap-2 rounded-md border border-white/10 bg-white/[.06] px-3 text-sm font-bold text-white transition hover:bg-white/10">
+                                <Copy className="h-4 w-4" />
+                                Duplicar produto
+                              </button>
+                              <button onClick={() => removeProduct(selectedCategory.id, product.id)} className="inline-flex h-10 items-center gap-2 rounded-md border border-red-300/30 bg-red-400/10 px-3 text-sm font-bold text-red-100 transition hover:bg-red-400/20">
+                                <Trash2 className="h-4 w-4" />
+                                Remover produto
+                              </button>
+                            </div>
                           </div>
                         </div>
                       ))}

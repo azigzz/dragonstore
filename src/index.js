@@ -43,6 +43,15 @@ const KV_FILE_KEYS = {
   [STAFF_FILE]: `${BOT_KV_PREFIX}:staff`
 };
 const memoryJsonStore = new Map();
+const kvWriteQueues = new Map();
+
+process.on("unhandledRejection", error => {
+  console.error("Erro async nao tratado:", error);
+});
+process.on("uncaughtException", error => {
+  console.error("Erro fatal nao tratado:", error);
+  drainKvWriteQueues().finally(() => process.exit(1));
+});
 
 ensureDataDir();
 ensureJsonFile(PANELS_FILE, { guilds: {} });
@@ -96,6 +105,7 @@ function readJson(file, fallback) {
 function writeJsonLocal(file, data) {
   rememberJson(file, data);
   const tmpFile = `${file}.${process.pid}.tmp`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
   fs.renameSync(tmpFile, file);
 }
@@ -106,7 +116,7 @@ function writeJson(file, data) {
   } catch (error) {
     console.log(`Nao consegui gravar ${path.basename(file)} no disco (${error.message}); mantendo em memoria e tentando KV.`);
   }
-  persistJsonToKv(file, data).catch(error => {
+  enqueuePersistJsonToKv(file, data).catch(error => {
     console.log(`Nao consegui salvar ${path.basename(file)} no KV: ${error.message}`);
   });
 }
@@ -175,6 +185,29 @@ async function persistJsonToKv(file, data) {
   if (!key || !kvEnabled()) return false;
   return writeJsonToKv(key, data);
 }
+function enqueuePersistJsonToKv(file, data) {
+  const key = KV_FILE_KEYS[file];
+  if (!key || !kvEnabled()) return Promise.resolve(false);
+
+  const snapshot = cloneJson(data);
+  const previous = kvWriteQueues.get(file) || Promise.resolve();
+  const next = previous
+    .catch(() => null)
+    .then(() => persistJsonToKv(file, snapshot));
+  const tracked = next.finally(() => {
+    if (kvWriteQueues.get(file) === tracked) kvWriteQueues.delete(file);
+  });
+  kvWriteQueues.set(file, tracked);
+  return tracked;
+}
+async function drainKvWriteQueues(timeoutMs = 5000) {
+  const writes = [...kvWriteQueues.values()];
+  if (!writes.length) return;
+  await Promise.race([
+    Promise.allSettled(writes),
+    new Promise(resolve => setTimeout(resolve, timeoutMs))
+  ]);
+}
 async function hydratePersistentFiles() {
   if (!kvEnabled()) {
     console.log("KV do bot nao configurado; usando JSON local para paineis, pedidos e Pix.");
@@ -189,21 +222,60 @@ async function hydratePersistentFiles() {
 }
 async function flushPersistentFile(file) {
   const data = readJson(file, {});
-  await persistJsonToKv(file, data);
+  await enqueuePersistJsonToKv(file, data);
 }
 function ensureOrdersStore(db) {
   const store = db && typeof db === "object" ? db : {};
-  if (!store.orders) store.orders = {};
-  if (!store.tickets) store.tickets = {};
-  if (!store.customers) store.customers = {};
-  if (!store.sellers) store.sellers = {};
+  if (!store.orders || typeof store.orders !== "object" || Array.isArray(store.orders)) store.orders = {};
+  if (!store.tickets || typeof store.tickets !== "object" || Array.isArray(store.tickets)) store.tickets = {};
+  if (!store.customers || typeof store.customers !== "object" || Array.isArray(store.customers)) store.customers = {};
+  if (!store.sellers || typeof store.sellers !== "object" || Array.isArray(store.sellers)) store.sellers = {};
+
+  for (const [id, order] of Object.entries(store.orders)) {
+    if (!order || typeof order !== "object" || Array.isArray(order)) {
+      delete store.orders[id];
+      continue;
+    }
+    order.id = String(order.id || id);
+    order.status = String(order.status || "open");
+    order.items = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
+    order.createdAt = order.createdAt || new Date().toISOString();
+    order.closedAt = order.closedAt || null;
+  }
+
+  for (const [id, ticket] of Object.entries(store.tickets)) {
+    if (!ticket || typeof ticket !== "object" || Array.isArray(ticket)) {
+      delete store.tickets[id];
+      continue;
+    }
+    ticket.id = String(ticket.id || id);
+    ticket.status = String(ticket.status || "open");
+    ticket.createdAt = ticket.createdAt || new Date().toISOString();
+  }
   return store;
 }
-function readPanels() { return readJson(PANELS_FILE, { guilds: {} }); }
+function ensureGuildStore(data) {
+  const store = data && typeof data === "object" ? data : {};
+  if (!store.guilds || typeof store.guilds !== "object" || Array.isArray(store.guilds)) store.guilds = {};
+  return store;
+}
+function readPanels() {
+  const data = ensureGuildStore(readJson(PANELS_FILE, { guilds: {} }));
+  rememberJson(PANELS_FILE, data);
+  return data;
+}
 function writePanels(data) { writeJson(PANELS_FILE, data); }
-function readOrders() { return ensureOrdersStore(readJson(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} })); }
+function readOrders() {
+  const data = ensureOrdersStore(readJson(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} }));
+  rememberJson(ORDERS_FILE, data);
+  return data;
+}
 function writeOrders(data) { writeJson(ORDERS_FILE, ensureOrdersStore(data)); }
-function readStaff() { return readJson(STAFF_FILE, { guilds: {} }); }
+function readStaff() {
+  const data = ensureGuildStore(readJson(STAFF_FILE, { guilds: {} }));
+  rememberJson(STAFF_FILE, data);
+  return data;
+}
 function writeStaff(data) { writeJson(STAFF_FILE, data); }
 function defaultStaffGuild() {
   return {
@@ -3862,10 +3934,11 @@ function commandHelpEmbed(member) {
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
     "`/setup-ticket` - envia o painel de ticket.",
     "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
-    "`/status-loja` ou `!status-loja` - mostra resumo da loja."
+    "`/status-loja` ou `!status-loja` - mostra resumo da loja.",
+    "`/diagnostico` ou `!diagnostico` - mostra saude do bot, KV, Pix, paineis e carrinhos."
   ];
   const salesCommands = [
-    "`!addcar [pesquisa]` - lista produtos, permite pesquisar e pergunta a quantidade antes de adicionar.",
+    "`/addcar` ou `!addcar [pesquisa]` - lista produtos, permite pesquisar e pergunta a quantidade antes de adicionar.",
     "`!pix` ou `!assumir` - assume o carrinho atual e envia o Pix do ADM.",
     "`!concluircompra` ou `!concluir` - conclui o carrinho atual.",
     "`!cancelarcompra` ou `!cancelar` - cancela e apaga o carrinho atual.",
@@ -3951,6 +4024,59 @@ function buildStoreStatusEmbed(guildId, scopeId = "default") {
     )
     .setFooter({ text: "Valores são estimativas a partir dos preços cadastrados; pagamento continua manual via Pix." })
     .setTimestamp();
+}
+function buildDiagnosticsEmbed(guildId) {
+  const panelStore = readPanels();
+  const guildStore = ensurePanelStore(panelStore, guildId);
+  const panels = allPublicPanels(guildStore);
+  const ordersDb = readOrders();
+  const staff = getStaffGuild(guildId);
+  const staffProfiles = Object.values(staff.users || {});
+  const guildOrders = Object.values(ordersDb.orders || {}).filter(order => !order.guildId || order.guildId === guildId);
+  const openOrders = guildOrders.filter(order => order.status === "open");
+  const closedOrders = guildOrders.filter(order => order.status === "closed");
+  const cancelledOrders = guildOrders.filter(order => ["cancelled", "canceled"].includes(String(order.status)));
+  const productsCount = panels.reduce((sum, panel) => sum + (panel.products || []).length, 0);
+  const publishedCount = panels.filter(panel => panel.publishedChannelId && panel.publishedMessageId).length;
+  const staffWithPix = staffProfiles.filter(profile => profile.pixKey).length;
+  const onlineStaff = staffProfiles.filter(profile => profile.online && profile.pixKey).length;
+  const warnings = [];
+
+  if (!kvEnabled()) warnings.push("KV nao configurado: deploy pode perder JSON local em host read-only.");
+  if (!process.env.PUBLIC_STORE_API_TOKEN?.trim()) warnings.push("PUBLIC_STORE_API_TOKEN ausente: site nao consegue ler API publica do bot.");
+  if (!productsCount) warnings.push("Nenhum produto salvo nos paineis do bot.");
+  if (!publishedCount) warnings.push("Nenhum painel publicado salvo/vinculado.");
+  if (!staffWithPix) warnings.push("Nenhum ADM com Pix configurado.");
+  if (!onlineStaff) warnings.push("Nenhum ADM ON com Pix.");
+  if (!staff.backupMessageId) warnings.push("Backup do Pix/painel ainda nao salvo no Discord.");
+
+  const persistenceLine = kvEnabled()
+    ? `KV ativo (${BOT_KV_PREFIX})`
+    : "JSON local/memoria";
+  const staffPanelLine = staff.panelChannelId && staff.panelMessageId
+    ? `<#${staff.panelChannelId}> / \`${staff.panelMessageId}\``
+    : "Nao vinculado";
+  const warningLine = warnings.length ? warnings.map(item => `- ${item}`).join("\n") : "Nenhum alerta critico detectado.";
+
+  return new EmbedBuilder()
+    .setTitle("Diagnostico Dragon Store")
+    .setColor(warnings.length ? 0xf1c40f : 0x28f6a1)
+    .addFields(
+      { name: "Persistencia", value: persistenceLine, inline: true },
+      { name: "Paineis", value: `${panels.length} painel(is)\n${productsCount} produto(s)\n${publishedCount} publicado(s)`, inline: true },
+      { name: "Carrinhos", value: `${openOrders.length} aberto(s)\n${closedOrders.length} fechado(s)\n${cancelledOrders.length} cancelado(s)`, inline: true },
+      { name: "Atendimento", value: `${staffWithPix} ADM(s) com Pix\n${onlineStaff} ADM(s) ON\nPainel: ${staffPanelLine}`, inline: false },
+      { name: "Site/API", value: `Token publico: ${process.env.PUBLIC_STORE_API_TOKEN?.trim() ? "configurado" : "faltando"}\nScan paineis: ${process.env.PUBLIC_STORE_SCAN_CHANNELS === "false" ? "manual" : "ativo"}\nInvite: ${publicDiscordInviteUrl(process.env.DISCORD_INVITE_URL)}`, inline: false },
+      { name: "Alertas", value: warningLine.slice(0, 1024), inline: false }
+    )
+    .setFooter({ text: "Use !salvarpix depois de configurar Pix/painel e publique/vincule paineis pelo !configds." })
+    .setTimestamp();
+}
+async function sendDiagnosticsCommand(context) {
+  if (!isAdmin(context.member)) {
+    return actionReply(context, { content: "So ADM pode ver diagnostico do bot.", ephemeral: true });
+  }
+  return actionReply(context, { embeds: [buildDiagnosticsEmbed(actionGuildId(context))], ephemeral: true });
 }
 async function openCart(interaction) {
   const [, panelId] = interaction.customId.split(":");
@@ -4276,31 +4402,43 @@ async function refreshAddCartMessage(context, session, order, panel) {
   await message.edit(addCartPanelPayload(session, order, panel)).catch(() => null);
   return true;
 }
-async function sendAddCartCommand(message, initialQuery = "") {
-  const db = readOrders();
-  const order = findOrderInChannel(db, message, true);
-  if (!order) return message.reply("Nao encontrei carrinho aberto neste chat. Use dentro do canal do carrinho.").catch(() => null);
-  if (!canEditOrder(message.member, message.author.id, order)) {
-    return message.reply("Voce nao pode alterar esse carrinho.").catch(() => null);
+async function startAddCartFlow(context, initialQuery = "", options = {}) {
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
   }
 
-  const panel = getOrderPanel(order, message.guild.id);
-  if (!panel?.products?.length) return message.reply("Esse painel nao tem produtos cadastrados para adicionar.").catch(() => null);
+  const db = readOrders();
+  const order = findOrderInChannel(db, context, true);
+  const user = actionUser(context);
+  if (!order) {
+    return actionReply(context, { content: "Nao encontrei carrinho aberto neste chat. Use dentro do canal do carrinho.", ephemeral: true });
+  }
+  if (!canEditOrder(context.member, user.id, order)) {
+    return actionReply(context, { content: "Voce nao pode alterar esse carrinho.", ephemeral: true });
+  }
 
-  await message.delete().catch(() => null);
+  const panel = getOrderPanel(order, actionGuildId(context));
+  if (!panel?.products?.length) {
+    return actionReply(context, { content: "Esse painel nao tem produtos cadastrados para adicionar.", ephemeral: true });
+  }
 
   const session = rememberAddCartSession({
     id: sid(),
-    guildId: message.guild.id,
-    channelId: message.channel.id,
+    guildId: actionGuildId(context),
+    channelId: context.channel.id,
     orderId: order.id,
-    userId: message.author.id,
+    userId: user.id,
     query: clampText(initialQuery, 100)
   });
-  const sent = await message.channel.send(addCartPanelPayload(session, order, panel));
+  const sent = await context.channel.send(addCartPanelPayload(session, order, panel));
   session.messageId = sent.id;
   addCartSessions.set(session.id, session);
-  return sent;
+  if (options.confirm === false) return sent;
+  return actionReply(context, { content: `Lista de produtos aberta para o carrinho #${order.id}.`, ephemeral: true });
+}
+async function sendAddCartCommand(message, initialQuery = "") {
+  await message.delete().catch(() => null);
+  return startAddCartFlow(message, initialQuery, { confirm: false });
 }
 async function handleAddCartButton(interaction) {
   const session = getAddCartSession(interaction);
@@ -4432,7 +4570,14 @@ function stripEphemeral(payload) {
   return rest;
 }
 async function actionReply(context, payload) {
-  if (context.isRepliable?.()) return context.reply(payload);
+  if (context.isRepliable?.()) {
+    if (context.deferred && !context.replied) {
+      const { ephemeral, ...editablePayload } = payload || {};
+      return context.editReply(editablePayload);
+    }
+    if (context.replied) return context.followUp(payload);
+    return context.reply(payload);
+  }
   return context.channel.send(stripEphemeral(payload));
 }
 function openOrderByChannel(guildId, channelId) {
@@ -4856,6 +5001,10 @@ client.on("messageCreate", async message => {
       ? `<@${message.author.id}> enviei o status da loja no seu privado.`
       : `<@${message.author.id}> não consegui mandar DM. Use \`/status-loja\` para ver em modo privado.`);
   }
+  if ([`${config.prefix || "!"}diagnostico`, `${config.prefix || "!"}diagnóstico`, `${config.prefix || "!"}diag`].includes(content)) {
+    await message.delete().catch(() => null);
+    return sendDiagnosticsCommand(message);
+  }
   if (content === `${config.prefix || "!"}ranking-gastos`) {
     return sendSpendRankingMessage(message);
   }
@@ -4916,6 +5065,10 @@ client.on("interactionCreate", async interaction => {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para ver o status da loja.")) return;
         return interaction.reply({ embeds: [buildStoreStatusEmbed(interaction.guildId, interaction.channelId)], ephemeral: true });
       }
+      if (interaction.commandName === "diagnostico") return sendDiagnosticsCommand(interaction);
+      if (interaction.commandName === "addcar") {
+        return startAddCartFlow(interaction, interaction.options.getString("pesquisa") || "");
+      }
       if (interaction.commandName === "ranking-gastos") return showSpendRanking(interaction);
       if (interaction.commandName === "rankinggastos") return showPublicSpendRanking(interaction);
       if (interaction.commandName === "saldogasto") return showSpendBalance(interaction);
@@ -4969,8 +5122,7 @@ client.on("interactionCreate", async interaction => {
   } catch (err) {
     console.error(err);
     const payload = { content: `Erro: \`${err.message}\``, ephemeral: true };
-    if (interaction.replied || interaction.deferred) await interaction.followUp(payload).catch(() => null);
-    else await interaction.reply(payload).catch(() => null);
+    await actionReply(interaction, payload).catch(() => null);
   }
 });
 
@@ -4979,6 +5131,12 @@ if (!token) {
   console.error("DISCORD_TOKEN não configurado.");
   process.exit(1);
 }
+function shutdown(signal) {
+  console.log(`${signal} recebido; salvando persistencia pendente antes de sair.`);
+  drainKvWriteQueues().finally(() => process.exit(0));
+}
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
 async function boot() {
   await hydratePersistentFiles();
   await client.login(token);
