@@ -1727,7 +1727,10 @@ function orderItemDetails(item, panel) {
     stock: item.stock || current?.stock || "infinito",
     type: item.type || current?.type || "product",
     imageUrl: item.imageUrl || current?.imageUrl || "",
-    rewards: Array.isArray(item.rewards) ? item.rewards : current?.rewards
+    rewards: Array.isArray(item.rewards) ? item.rewards : current?.rewards,
+    sourceProductId: item.sourceProductId || current?.id || item.productId,
+    sourcePanelId: item.sourcePanelId || "",
+    sourcePanelTitle: item.sourcePanelTitle || ""
   };
 }
 function orderTotals(order, panel) {
@@ -3884,7 +3887,8 @@ function cartText(order, panel) {
       : discountPercent > 0
         ? ` = ${money(roundCurrency(unit * quantity * (1 - discountPercent / 100)))} (de ${money(roundCurrency(unit * quantity))})`
         : ` = ${money(roundCurrency(unit * quantity))}`;
-    return `• ${productIcon(p)} **${p.name}** — ${p.price} x${quantity}${subtotal}`;
+    const source = p.sourcePanelTitle ? ` | ${p.sourcePanelTitle}` : "";
+    return `• ${productIcon(p)} **${p.name}** — ${p.price} x${quantity}${subtotal}${source}`;
   }).join("\n");
 
   if (Array.isArray(order.mysteryResults) && order.mysteryResults.length) {
@@ -3947,7 +3951,7 @@ function commandHelpEmbed(member) {
     "`/diagnostico` ou `!diagnostico` - mostra saude do bot, KV, Pix, paineis e carrinhos."
   ];
   const salesCommands = [
-    "`/addcar` ou `!addcar [pesquisa]` - lista produtos, permite pesquisar e pergunta a quantidade antes de adicionar.",
+    "`/addcar` ou `!addcar [pesquisa]` - busca produtos de todos os paineis do servidor e pergunta a quantidade antes de adicionar ao carrinho.",
     "`!pix` ou `!assumir` - assume o carrinho atual e envia o Pix do ADM.",
     "`!concluircompra` ou `!concluir` - conclui o carrinho atual.",
     "`!cancelarcompra` ou `!cancelar` - cancela e apaga o carrinho atual.",
@@ -4295,24 +4299,70 @@ function addCartSessionAllowed(context, session, order) {
   if (!user || user.id !== session.userId) return false;
   return canEditOrder(context.member, user.id, order);
 }
-function addCartMatches(panel, query = "") {
+function addCartCatalogForGuild(guildId) {
+  const store = readPanels();
+  const guildStore = ensurePanelStore(store, guildId);
+  const panels = allPublicPanels(guildStore)
+    .filter(panel => Array.isArray(panel.products) && panel.products.length);
+  const entries = [];
+
+  panels.forEach((panel, panelIndex) => {
+    panel.products.forEach((productItem, productIndex) => {
+      entries.push({
+        key: `c${entries.length}`,
+        panelId: String(panel.id || `panel-${panelIndex}`),
+        scopeId: String(panel.scopeId || ""),
+        panelTitle: String(panel.title || `Painel ${panelIndex + 1}`),
+        panelColor: panel.color || "#9b00ff",
+        productId: String(productItem.id || `p${productIndex}`),
+        product: { ...productItem }
+      });
+    });
+  });
+
+  return entries;
+}
+function addCartCatalogEntry(session, key) {
+  return (session.catalog || []).find(entry => entry.key === key) || null;
+}
+function orderItemFromCatalogEntry(entry) {
+  const item = orderItemFromProduct(entry.product);
+  item.productId = entry.key;
+  item.sourceProductId = entry.productId;
+  item.sourcePanelId = entry.panelId;
+  item.sourcePanelTitle = entry.panelTitle;
+  return item;
+}
+function addCartMatches(session, query = "") {
   const words = plainText(query).split(/\s+/).filter(Boolean);
-  const products = Array.isArray(panel?.products) ? panel.products : [];
-  if (!words.length) return products;
-  return products.filter(p => {
-    const haystack = plainText([p.name, p.price, p.description, p.stock].filter(Boolean).join(" "));
+  const entries = Array.isArray(session?.catalog) ? session.catalog : [];
+  if (!words.length) return entries;
+  return entries.filter(entry => {
+    const p = entry.product || {};
+    const haystack = plainText([entry.panelTitle, p.name, p.price, p.description, p.stock].filter(Boolean).join(" "));
     return words.every(word => haystack.includes(word));
   });
 }
-function addCartProductLines(panel, query = "") {
-  const matches = addCartMatches(panel, query);
+function addCartProductLines(session) {
+  const matches = addCartMatches(session, session.query);
   if (!matches.length) return "Nenhum produto encontrado com essa pesquisa.";
-  return matches.slice(0, 15).map((p, index) => {
-    return `\`${index + 1}.\` ${productIcon(p)} **${p.name}** - ${p.price} | Estoque: ${p.stock || "infinito"}`;
-  }).join("\n");
+  const lines = matches.slice(0, 15).map((entry, index) => {
+    const p = entry.product;
+    return `\`${index + 1}.\` ${productIcon(p)} **${p.name || "Produto"}** - ${p.price || "valor a combinar"} | ${entry.panelTitle} | Estoque: ${p.stock || "infinito"}`;
+  });
+  if (matches.length > 15) lines.push(`...mais ${matches.length - 15} produto(s). Use **Pesquisar** para filtrar.`);
+  return lines.join("\n");
 }
-function addCartProductSelect(session, panel) {
-  const matches = addCartMatches(panel, session.query).slice(0, 25);
+function addCartOptionDescription(entry) {
+  const p = entry.product || {};
+  return [
+    String(p.price || "valor a combinar"),
+    String(entry.panelTitle || "Painel"),
+    `Estoque: ${String(p.stock || "infinito")}`
+  ].join(" | ").slice(0, 100);
+}
+function addCartProductSelect(session) {
+  const matches = addCartMatches(session, session.query).slice(0, 25);
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`addcarpick:${session.id}:${sid()}`)
     .setPlaceholder("Selecione o produto para adicionar")
@@ -4324,10 +4374,10 @@ function addCartProductSelect(session, panel) {
       .setDisabled(true)
       .addOptions([{ label: "Nenhum produto encontrado", value: "none", description: "Clique em Pesquisar ou Limpar filtro." }]);
   } else {
-    menu.addOptions(matches.map(p => ({
-      label: `${productIcon(p)} ${String(p.name).slice(0, 96)}`,
-      description: productOptionDescription(p),
-      value: p.id
+    menu.addOptions(matches.map(entry => ({
+      label: `${productIcon(entry.product)} ${String(entry.product.name || "Produto").slice(0, 96)}`,
+      description: addCartOptionDescription(entry),
+      value: entry.key
     })));
   }
 
@@ -4342,18 +4392,19 @@ function addCartButtons(session) {
   );
 }
 function addCartPanelPayload(session, order, panel) {
-  const matches = addCartMatches(panel, session.query);
+  const matches = addCartMatches(session, session.query);
+  const totalProducts = Array.isArray(session.catalog) ? session.catalog.length : 0;
   const embed = new EmbedBuilder()
     .setTitle(`Adicionar item ao carrinho #${order.id}`)
     .setDescription([
-      session.query ? `Pesquisa atual: **${session.query}**` : "Mostrando todos os produtos disponiveis neste painel.",
+      session.query ? `Pesquisa atual: **${session.query}**` : "Mostrando produtos de todos os paineis configurados neste servidor.",
       "",
-      addCartProductLines(panel, session.query)
+      addCartProductLines(session)
     ].join("\n").slice(0, 4096))
     .setColor(parseColor(panel.color))
     .addFields(
       { name: "Cliente", value: `<@${order.userId}>`, inline: true },
-      { name: "Encontrados", value: `${matches.length}/${panel.products.length}`, inline: true },
+      { name: "Encontrados", value: `${matches.length}/${totalProducts}`, inline: true },
       { name: "Total atual", value: totalLine(order, panel), inline: true }
     )
     .setFooter({ text: "Selecione um produto. Depois o bot pede a quantidade." })
@@ -4361,7 +4412,7 @@ function addCartPanelPayload(session, order, panel) {
 
   return {
     embeds: [embed],
-    components: [addCartProductSelect(session, panel), addCartButtons(session)]
+    components: [addCartProductSelect(session), addCartButtons(session)]
   };
 }
 function addCartSearchModal(session) {
@@ -4380,15 +4431,16 @@ function addCartSearchModal(session) {
       )
     );
 }
-function addCartQuantityModal(session, p) {
+function addCartQuantityModal(session, entry) {
+  const p = entry.product || {};
   return new ModalBuilder()
-    .setCustomId(`addcarqty:${session.id}:${p.id}`)
+    .setCustomId(`addcarqty:${session.id}:${entry.key}`)
     .setTitle("Quantidade")
     .addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId("quantity")
-          .setLabel(`Quantidade de ${String(p.name).slice(0, 30)}`)
+          .setLabel(`Quantidade de ${String(p.name || "Produto").slice(0, 30)}`)
           .setStyle(TextInputStyle.Short)
           .setMinLength(1)
           .setMaxLength(4)
@@ -4429,8 +4481,9 @@ async function startAddCartFlow(context, initialQuery = "", options = {}) {
   }
 
   const panel = getOrderPanel(order, actionGuildId(context));
-  if (!panel?.products?.length) {
-    return actionReply(context, { content: "Esse painel nao tem produtos cadastrados para adicionar.", ephemeral: true });
+  const catalog = addCartCatalogForGuild(actionGuildId(context));
+  if (!catalog.length) {
+    return actionReply(context, { content: "Nao encontrei produtos em nenhum painel configurado neste servidor. Use `!configds` para publicar produtos primeiro.", ephemeral: true });
   }
 
   const session = rememberAddCartSession({
@@ -4439,7 +4492,8 @@ async function startAddCartFlow(context, initialQuery = "", options = {}) {
     channelId: context.channel.id,
     orderId: order.id,
     userId: user.id,
-    query: clampText(initialQuery, 100)
+    query: clampText(initialQuery, 100),
+    catalog
   });
   const sent = await context.channel.send(addCartPanelPayload(session, order, panel));
   session.messageId = sent.id;
@@ -4470,6 +4524,7 @@ async function handleAddCartButton(interaction) {
     return;
   }
   if (action === "refresh") {
+    session.catalog = addCartCatalogForGuild(interaction.guildId);
     rememberAddCartSession(session);
     await interaction.update(addCartPanelPayload(session, order, panel));
     return;
@@ -4507,10 +4562,9 @@ async function handleAddCartPick(interaction) {
   if (!order || order.status !== "open") return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
   if (!addCartSessionAllowed(interaction, session, order)) return interaction.reply({ content: "Essa lista foi aberta por outro usuario.", ephemeral: true });
 
-  const panel = getOrderPanel(order, interaction.guildId);
-  const p = product(panel, interaction.values[0]);
-  if (!p) return interaction.reply({ content: "Produto nao encontrado.", ephemeral: true });
-  return interaction.showModal(addCartQuantityModal(session, p));
+  const entry = addCartCatalogEntry(session, interaction.values[0]);
+  if (!entry) return interaction.reply({ content: "Produto nao encontrado nessa lista. Clique em Atualizar e tente de novo.", ephemeral: true });
+  return interaction.showModal(addCartQuantityModal(session, entry));
 }
 async function handleAddCartQuantitySubmit(interaction) {
   const parts = interaction.customId.split(":");
@@ -4526,14 +4580,15 @@ async function handleAddCartQuantitySubmit(interaction) {
   if (!quantity) return interaction.reply({ content: "Quantidade invalida. Use um numero maior que zero.", ephemeral: true });
 
   const panel = getOrderPanel(order, interaction.guildId);
-  const p = product(panel, parts[2]);
-  if (!p) return interaction.reply({ content: "Produto nao encontrado.", ephemeral: true });
+  const entry = addCartCatalogEntry(session, parts[2]);
+  if (!entry) return interaction.reply({ content: "Produto nao encontrado nessa lista. Clique em Atualizar e tente de novo.", ephemeral: true });
+  const p = entry.product || {};
   await interaction.deferReply({ ephemeral: true });
 
-  const item = order.items.find(current => current.productId === p.id);
+  const item = order.items.find(current => current.productId === entry.key);
   if (item) item.quantity = Math.min(9999, (Number(item.quantity) || 1) + quantity);
   else {
-    const next = orderItemFromProduct(p);
+    const next = orderItemFromCatalogEntry(entry);
     next.quantity = quantity;
     order.items.push(next);
   }
@@ -4542,7 +4597,7 @@ async function handleAddCartQuantitySubmit(interaction) {
   writeOrders(db);
   rememberAddCartSession(session);
   await refreshAddCartMessage(interaction, session, order, panel);
-  await interaction.editReply({ content: `Adicionado: ${productIcon(p)} **${p.name}** x${quantity}.` });
+  await interaction.editReply({ content: `Adicionado: ${productIcon(p)} **${p.name || "Produto"}** x${quantity}.\nTotal atualizado: **${totalLine(order, panel)}**` });
   return interaction.channel.send({ embeds: [productInfoEmbed(p, panel, "Produto adicionado"), cartEmbed(order, panel)] });
 }
 async function callAdmin(interaction, id, type = "order") {

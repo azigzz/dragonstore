@@ -135,7 +135,7 @@ Comandos operacionais uteis:
 
 - `/help` ou `!help`: mostra a lista de comandos; ADMs veem tambem a area administrativa.
 - `/salvarpix` ou `!salvarpix`: salva o backup do Pix/painel de atendimento no Discord.
-- `/addcar` ou `!addcar [pesquisa]`: dentro de um carrinho, abre uma lista de produtos com botao de pesquisa e pergunta a quantidade antes de adicionar. Ex: `!addcar steam`.
+- `/addcar` ou `!addcar [pesquisa]`: dentro de um carrinho, busca produtos de todos os paineis do servidor, deixa pesquisar e pergunta a quantidade antes de adicionar. Ex: `!addcar steam`.
 - `/diagnostico` ou `!diagnostico`: mostra KV, paineis, produtos, Pix, atendimento e alertas de configuracao.
 - `!pix`: no carrinho atual, assume a compra e envia o Pix do ADM.
 - `!concluircompra` e `!cancelarcompra`: finalizam ou cancelam o carrinho atual sem depender dos botoes.
