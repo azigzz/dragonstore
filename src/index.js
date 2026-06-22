@@ -5243,8 +5243,8 @@ async function discordPermissionWarnings(guild, panels = [], staff = null) {
       warnings.push(`${label} (${roleId}) nao existe ou o bot nao consegue ver.`);
       continue;
     }
-    if (label === "cargo cliente" && role.comparePositionTo(me.roles.highest) >= 0) {
-      warnings.push(`Cargo do bot precisa ficar acima do cargo cliente (${role.name}) para aplicar automaticamente.`);
+    if ((label === "cargo cliente" || label === "cargo premium/revendedor") && role.comparePositionTo(me.roles.highest) >= 0) {
+      warnings.push(`Cargo do bot precisa ficar acima do ${label} (${role.name}) para aplicar automaticamente.`);
     }
   }
 
