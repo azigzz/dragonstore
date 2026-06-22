@@ -18,6 +18,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - Snapshot do produto dentro do pedido, preservando nome/preco mesmo se o produto for editado depois.
 - Resumo de carrinho com quantidade, subtotal e total estimado.
 - Atendimento ON/OFF por ADM.
+- Presenca em call de status enquanto o bot estiver ligado.
 - Pix, QR Code e mensagem extra por atendente.
 - Assumir compra, reenviar Pix e finalizar compra.
 - DM segura para cliente na abertura do carrinho e na finalizacao.
@@ -45,6 +46,7 @@ CLIENT_ID=id_da_aplicacao
 GUILD_ID=id_do_servidor
 PUBLIC_STORE_API_TOKEN=gere_um_token_grande_e_dificil
 DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
+STATUS_VOICE_CHANNEL_ID=1515799363857809494
 # opcional/preparado para migracao transacional
 DATABASE_URL=postgres://usuario:senha@host/db
 # opcionais para escolher/recuperar painel antigo
@@ -329,6 +331,10 @@ Os IDs ficam em `config.json`:
     "message": "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.",
     "channelPingMessage": "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.",
     "deletePingAfterSeconds": 10
+  },
+  "statusVoice": {
+    "enabled": true,
+    "channelId": "1515799363857809494"
   },
   "settings": {
     "deleteClosedCartAfterSeconds": 259200

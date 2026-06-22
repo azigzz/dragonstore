@@ -6,6 +6,12 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
 const {
+  entersState,
+  getVoiceConnection,
+  joinVoiceChannel,
+  VoiceConnectionStatus
+} = require("@discordjs/voice");
+const {
   ActionRowBuilder,
   AttachmentBuilder,
   ButtonBuilder,
@@ -26,6 +32,7 @@ const DEFAULT_CUSTOMER_ROLE_ID = "1515799363149103138";
 const DEFAULT_RESELLER_ROLE_ID = "1515835494204706938";
 const DEFAULT_COMPLETION_CHANNEL_ID = "1515799364155478138";
 const DEFAULT_CANCELLATION_CHANNEL_ID = "1516561891919528037";
+const DEFAULT_STATUS_VOICE_CHANNEL_ID = "1515799363857809494";
 const STAFF_BACKUP_MARKER = "DRAGON_STORE_STAFF_BACKUP_V1";
 const STAFF_BACKUP_FILE = "dragon-store-staff-backup.json";
 
@@ -71,7 +78,7 @@ ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {
 ensureJsonFile(STAFF_FILE, { guilds: {} });
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates]
 });
 client.on("error", error => {
   console.error("Erro do client Discord:", error);
@@ -87,6 +94,7 @@ const paymentProofUploads = new Map();
 const cartDeleteTimers = new Map();
 const publicPanelScanCache = new Map();
 const orderActionLocks = new Set();
+let statusVoiceReconnectTimer = null;
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
 const PROOF_UPLOAD_TTL_MS = 2 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -6657,8 +6665,93 @@ async function handlePendingImageUpload(message) {
   return true;
 }
 
+function statusVoiceChannelId() {
+  return String(process.env.STATUS_VOICE_CHANNEL_ID || config.statusVoice?.channelId || DEFAULT_STATUS_VOICE_CHANNEL_ID).trim();
+}
+function statusVoiceEnabled() {
+  return config.statusVoice?.enabled !== false && process.env.STATUS_VOICE_ENABLED !== "false";
+}
+function scheduleStatusVoiceReconnect(delayMs = 30000) {
+  if (statusVoiceReconnectTimer || !statusVoiceEnabled()) return;
+  statusVoiceReconnectTimer = setTimeout(() => {
+    statusVoiceReconnectTimer = null;
+    connectStatusVoiceChannel().catch(error => {
+      console.log(`Nao consegui reconectar na call de status: ${error.message}`);
+      scheduleStatusVoiceReconnect();
+    });
+  }, delayMs);
+}
+function watchStatusVoiceConnection(connection) {
+  if (connection.__dragonStoreStatusWatcher) return;
+  connection.__dragonStoreStatusWatcher = true;
+  connection.on("stateChange", (_, state) => {
+    if (state.status === VoiceConnectionStatus.Destroyed || state.status === VoiceConnectionStatus.Disconnected) {
+      scheduleStatusVoiceReconnect(state.status === VoiceConnectionStatus.Disconnected ? 10000 : 30000);
+    }
+  });
+  connection.on("error", error => {
+    console.log(`Erro na call de status: ${error.message}`);
+    scheduleStatusVoiceReconnect(15000);
+  });
+}
+async function connectStatusVoiceChannel() {
+  if (!statusVoiceEnabled()) return null;
+  const channelId = statusVoiceChannelId();
+  if (!channelId) return null;
+
+  const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(() => null);
+  if (!channel || ![ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(channel.type)) {
+    console.log(`Call de status ${channelId} nao encontrada ou nao e canal de voz.`);
+    return null;
+  }
+
+  const botMember = channel.guild.members.me || await channel.guild.members.fetchMe().catch(() => null);
+  const permissions = botMember ? channel.permissionsFor(botMember) : null;
+  if (permissions && !permissions.has(PermissionFlagsBits.Connect)) {
+    console.log(`Sem permissao para entrar na call de status ${channel.name || channel.id}.`);
+    return null;
+  }
+
+  const existing = getVoiceConnection(channel.guild.id);
+  const existingChannelId = existing?.joinConfig?.channelId;
+  const reusableStatuses = new Set([
+    VoiceConnectionStatus.Ready,
+    VoiceConnectionStatus.Signalling,
+    VoiceConnectionStatus.Connecting
+  ]);
+  if (existing && existingChannelId === channel.id && reusableStatuses.has(existing.state.status)) {
+    watchStatusVoiceConnection(existing);
+    return existing;
+  }
+  if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
+    existing.destroy();
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: channel.guild.id,
+    adapterCreator: channel.guild.voiceAdapterCreator,
+    selfDeaf: true
+  });
+  watchStatusVoiceConnection(connection);
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+    console.log(`Bot entrou na call de status: ${channel.name || channel.id}`);
+  } catch (error) {
+    console.log(`Nao consegui confirmar entrada na call de status ${channel.name || channel.id}: ${error.message}`);
+    connection.destroy();
+    scheduleStatusVoiceReconnect(30000);
+  }
+  return connection;
+}
+
 client.once("ready", async () => {
   console.log(`Bot online como ${client.user.tag}`);
+  await connectStatusVoiceChannel().catch(error => {
+    console.log(`Nao consegui entrar na call de status: ${error.message}`);
+    scheduleStatusVoiceReconnect();
+  });
   const recoveredProcessing = recoverStaleProcessingOrders();
   if (recoveredProcessing) console.log(`${recoveredProcessing} carrinho(s) preso(s) em processing foram reabertos automaticamente.`);
   for (const guild of client.guilds.cache.values()) {

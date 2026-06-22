@@ -40,6 +40,10 @@
   "staffBackup": {
     "channelId": ""
   },
+  "statusVoice": {
+    "enabled": true,
+    "channelId": "1515799363857809494"
+  },
   "settings": {
     "finalizeCartOnlyAdmins": true,
     "deleteTicketAfterCloseSeconds": 5,
