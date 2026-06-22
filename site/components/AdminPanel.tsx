@@ -36,12 +36,21 @@ function slugify(value: string) {
     .replace(/^-|-$/g, "")
     .slice(0, 80) || "item";
 }
+function priceCentsFromLabel(value: string) {
+  const raw = String(value || "")
+    .replace(/[^\d,.-]/g, "")
+    .replace(/\.(?=\d{3}(\D|$))/g, "")
+    .replace(",", ".");
+  const amount = Number.parseFloat(raw);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : null;
+}
 
 function newProduct(index: number): StoreProduct {
   return {
     id: `produto-${Date.now().toString(36)}-${index}`,
     name: "Novo produto",
     price: "R$ 0,00",
+    priceCents: 0,
     description: "Produto digital da Dragon Store",
     stock: "sob consulta",
     imageUrl: "/dragon-store-hero.png",
@@ -102,13 +111,24 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
   const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  const [csrfToken, setCsrfToken] = useState(initialConfig?.csrfToken || "");
 
   const tokenLabel = useMemo(() => config.botApiTokenConfigured ? "Token ja configurado" : "Token ainda nao salvo", [config.botApiTokenConfigured]);
   const selectedCategory = categories.find(category => category.id === selectedCategoryId) || categories[0] || null;
 
   useEffect(() => {
-    if (isLoggedIn) loadAnalytics();
+    if (isLoggedIn) {
+      loadConfig();
+      loadAnalytics();
+    }
   }, [isLoggedIn]);
+
+  function adminHeaders(contentType = true) {
+    return {
+      ...(contentType ? { "Content-Type": "application/json" } : {}),
+      ...(csrfToken ? { "x-csrf-token": csrfToken } : {})
+    };
+  }
 
   async function loadConfig() {
     const response = await fetch("/api/admin/config", { cache: "no-store" });
@@ -116,6 +136,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
     const data = await response.json() as AdminConfigPayload;
     const nextCategories = normalizeCategories(data);
     setConfig(data);
+    setCsrfToken(data.csrfToken || "");
     setCategories(nextCategories);
     setSelectedCategoryId(nextCategories[0]?.id || "");
     setTrustText((data.trustBadges || []).join("\n"));
@@ -143,6 +164,8 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
       setStatus(data.error || "Login recusado.");
       return;
     }
+    const data = await response.json().catch(() => ({}));
+    setCsrfToken(String(data.csrfToken || ""));
     setIsLoggedIn(true);
     setPassword("");
     setStatus("Login aprovado.");
@@ -151,8 +174,9 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
   }
 
   async function logout() {
-    await fetch("/api/admin/logout", { method: "POST" });
+    await fetch("/api/admin/logout", { method: "POST", headers: adminHeaders(false) });
     setIsLoggedIn(false);
+    setCsrfToken("");
   }
 
   function update<K extends keyof AdminConfigPayload>(key: K, value: AdminConfigPayload[K]) {
@@ -261,7 +285,8 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
         id: category.id || slugify(category.title || `categoria-${index + 1}`),
         products: category.products.map((product, productIndex) => ({
           ...product,
-          id: product.id || `${slugify(product.name)}-${productIndex + 1}`
+          id: product.id || `${slugify(product.name)}-${productIndex + 1}`,
+          priceCents: priceCentsFromLabel(product.price)
         }))
       }));
       const payload = {
@@ -272,7 +297,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
       };
       const response = await fetch("/api/admin/config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: adminHeaders(),
         body: JSON.stringify(payload)
       });
       const data = await response.json();
@@ -293,7 +318,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
     setStatus("");
     const response = await fetch("/api/admin/test-bot", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: adminHeaders(),
       body: JSON.stringify({ botApiUrl: config.botApiUrl, botApiToken: config.botApiToken })
     });
     const data = await response.json().catch(() => ({}));
@@ -304,7 +329,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
   async function syncProducts() {
     setBusy(true);
     setStatus("");
-    const response = await fetch("/api/admin/sync", { method: "POST" });
+    const response = await fetch("/api/admin/sync", { method: "POST", headers: adminHeaders(false) });
     const data = await response.json().catch(() => ({}));
     setBusy(false);
     if (!response.ok) {

@@ -97,8 +97,17 @@ const commands = [
     .setName("status-loja")
     .setDescription("Mostra a configuracao atual da loja."),
   new SlashCommandBuilder()
+    .setName("pedidos")
+    .setDescription("Lista os pedidos abertos para a equipe."),
+  new SlashCommandBuilder()
     .setName("diagnostico")
     .setDescription("Mostra saude do bot, KV, Pix, paineis e carrinhos."),
+  new SlashCommandBuilder()
+    .setName("pago")
+    .setDescription("Marca o pagamento manual do carrinho atual."),
+  new SlashCommandBuilder()
+    .setName("entregar")
+    .setDescription("Entrega manualmente o produto no carrinho atual."),
   new SlashCommandBuilder()
     .setName("addcar")
     .setDescription("Adiciona um produto ao carrinho atual com pesquisa e quantidade.")

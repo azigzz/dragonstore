@@ -3,6 +3,8 @@ require("dotenv").config();
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
+const { Pool } = require("pg");
 const {
   ActionRowBuilder,
   AttachmentBuilder,
@@ -37,25 +39,35 @@ const STAFF_FILE = path.join(DATA_DIR, "staff.json");
 const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "";
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const BOT_KV_PREFIX = process.env.BOT_KV_PREFIX || "dragon-store:bot";
+const DATABASE_URL = process.env.DATABASE_URL?.trim() || "";
+const BOT_DB_PREFIX = process.env.BOT_DB_PREFIX || BOT_KV_PREFIX;
 const KV_FILE_KEYS = {
   [PANELS_FILE]: `${BOT_KV_PREFIX}:panels`,
   [ORDERS_FILE]: `${BOT_KV_PREFIX}:orders`,
   [STAFF_FILE]: `${BOT_KV_PREFIX}:staff`
 };
+const DB_FILE_KEYS = {
+  [PANELS_FILE]: `${BOT_DB_PREFIX}:panels`,
+  [ORDERS_FILE]: `${BOT_DB_PREFIX}:orders`,
+  [STAFF_FILE]: `${BOT_DB_PREFIX}:staff`
+};
 const memoryJsonStore = new Map();
 const kvWriteQueues = new Map();
+const postgresWriteQueues = new Map();
+let postgresPool = null;
+let postgresStoreReady = false;
 
 process.on("unhandledRejection", error => {
   console.error("Erro async nao tratado:", error);
 });
 process.on("uncaughtException", error => {
   console.error("Erro fatal nao tratado:", error);
-  drainKvWriteQueues().finally(() => process.exit(1));
+  drainPersistentWriteQueues().finally(() => closePostgresPool()).finally(() => process.exit(1));
 });
 
 ensureDataDir();
 ensureJsonFile(PANELS_FILE, { guilds: {} });
-ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} });
+ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {}, auditLogs: [] });
 ensureJsonFile(STAFF_FILE, { guilds: {} });
 
 const client = new Client({
@@ -71,9 +83,12 @@ client.on("shardError", error => {
 const sessions = new Map();
 const addCartSessions = new Map();
 const imageUploads = new Map();
+const paymentProofUploads = new Map();
 const cartDeleteTimers = new Map();
 const publicPanelScanCache = new Map();
+const orderActionLocks = new Set();
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
+const PROOF_UPLOAD_TTL_MS = 2 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
 const ADD_CART_SESSION_TTL_MS = 10 * 60 * 1000;
 
@@ -124,6 +139,9 @@ function writeJson(file, data) {
   }
   enqueuePersistJsonToKv(file, data).catch(error => {
     console.log(`Nao consegui salvar ${path.basename(file)} no KV: ${error.message}`);
+  });
+  enqueuePersistJsonToPostgres(file, data).catch(error => {
+    console.log(`Nao consegui salvar ${path.basename(file)} no Postgres: ${error.message}`);
   });
 }
 function kvEnabled() {
@@ -206,29 +224,676 @@ function enqueuePersistJsonToKv(file, data) {
   kvWriteQueues.set(file, tracked);
   return tracked;
 }
-async function drainKvWriteQueues(timeoutMs = 5000) {
-  const writes = [...kvWriteQueues.values()];
+function postgresEnabled() {
+  return Boolean(DATABASE_URL);
+}
+function postgresSsl() {
+  return process.env.DATABASE_SSL === "false" ? false : { rejectUnauthorized: false };
+}
+function getPostgresPool() {
+  if (!postgresEnabled()) return null;
+  if (!postgresPool) postgresPool = new Pool({ connectionString: DATABASE_URL, ssl: postgresSsl() });
+  return postgresPool;
+}
+async function ensurePostgresStore() {
+  if (!postgresEnabled()) return false;
+  if (postgresStoreReady) return true;
+  const pool = getPostgresPool();
+  const schemaPath = path.join(__dirname, "..", "database", "postgres-schema.sql");
+  if (fs.existsSync(schemaPath)) {
+    await pool.query(fs.readFileSync(schemaPath, "utf8"));
+  } else {
+    await pool.query(`
+      create table if not exists bot_json_store (
+        key text primary key,
+        payload jsonb not null,
+        updated_at timestamptz not null default now()
+      )
+    `);
+  }
+  postgresStoreReady = true;
+  return true;
+}
+async function readJsonFromPostgres(file) {
+  const key = DB_FILE_KEYS[file];
+  if (!key || !await ensurePostgresStore()) return null;
+  const result = await getPostgresPool().query("select payload from bot_json_store where key = $1", [key]);
+  return result.rows[0]?.payload || null;
+}
+async function writeJsonToPostgres(file, data) {
+  const key = DB_FILE_KEYS[file];
+  if (!key || !await ensurePostgresStore()) return false;
+  await getPostgresPool().query(`
+    insert into bot_json_store (key, payload, updated_at)
+    values ($1, $2::jsonb, now())
+    on conflict (key) do update set payload = excluded.payload, updated_at = now()
+  `, [key, JSON.stringify(data)]);
+  return true;
+}
+function enqueuePersistJsonToPostgres(file, data) {
+  const key = DB_FILE_KEYS[file];
+  if (!key || !postgresEnabled()) return Promise.resolve(false);
+
+  const snapshot = cloneJson(data);
+  const previous = postgresWriteQueues.get(file) || Promise.resolve();
+  const next = previous
+    .catch(() => null)
+    .then(() => writeJsonToPostgres(file, snapshot));
+  const tracked = next.finally(() => {
+    if (postgresWriteQueues.get(file) === tracked) postgresWriteQueues.delete(file);
+  });
+  postgresWriteQueues.set(file, tracked);
+  return tracked;
+}
+async function hydrateJsonFromPostgres(file, fallback) {
+  const key = DB_FILE_KEYS[file];
+  if (!key || !postgresEnabled()) return false;
+  const remote = await readJsonFromPostgres(file).catch(error => {
+    console.log(`Nao consegui carregar ${path.basename(file)} do Postgres: ${error.message}`);
+    return null;
+  });
+  if (!hasUsefulPersistedData(file, remote)) return false;
+  const data = remote || fallback;
+  try {
+    writeJsonLocal(file, data);
+    console.log(`${path.basename(file)} carregado do Postgres.`);
+  } catch (error) {
+    rememberJson(file, data);
+    console.log(`${path.basename(file)} carregado do Postgres em memoria (${error.message}).`);
+  }
+  return true;
+}
+async function drainPersistentWriteQueues(timeoutMs = 5000) {
+  const writes = [...kvWriteQueues.values(), ...postgresWriteQueues.values()];
   if (!writes.length) return;
   await Promise.race([
     Promise.allSettled(writes),
     new Promise(resolve => setTimeout(resolve, timeoutMs))
   ]);
 }
+async function closePostgresPool() {
+  if (!postgresPool) return;
+  await postgresPool.end().catch(() => null);
+  postgresPool = null;
+  postgresStoreReady = false;
+}
 async function hydratePersistentFiles() {
-  if (!kvEnabled()) {
-    console.log("KV do bot nao configurado; usando JSON local para paineis, pedidos e Pix.");
-    return;
+  const files = [
+    [PANELS_FILE, { guilds: {} }],
+    [ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {}, auditLogs: [] }],
+    [STAFF_FILE, { guilds: {} }]
+  ];
+  const hydrated = new Set();
+
+  if (postgresEnabled()) {
+    await ensurePostgresStore()
+      .then(() => console.log(`Postgres ativo para persistencia do bot (${BOT_DB_PREFIX}).`))
+      .catch(error => console.log(`Postgres configurado, mas indisponivel agora: ${error.message}`));
+
+    for (const [file, fallback] of files) {
+      if (await hydrateJsonFromPostgres(file, fallback)) hydrated.add(file);
+    }
   }
 
-  await Promise.all([
-    hydrateJsonFromKv(PANELS_FILE, { guilds: {} }),
-    hydrateJsonFromKv(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} }),
-    hydrateJsonFromKv(STAFF_FILE, { guilds: {} })
-  ]);
+  if (kvEnabled()) {
+    for (const [file, fallback] of files) {
+      if (!hydrated.has(file)) await hydrateJsonFromKv(file, fallback);
+    }
+  }
+
+  if (!postgresEnabled() && !kvEnabled()) {
+    console.log("Postgres/KV do bot nao configurados; usando JSON local para paineis, pedidos e Pix.");
+  }
 }
 async function flushPersistentFile(file) {
   const data = readJson(file, {});
-  await enqueuePersistJsonToKv(file, data);
+  const results = await Promise.allSettled([
+    enqueuePersistJsonToKv(file, data),
+    enqueuePersistJsonToPostgres(file, data)
+  ]);
+  const failed = results.find(result => result.status === "rejected");
+  if (failed) throw failed.reason;
+}
+function dbText(value, fallback = "") {
+  return String(value ?? fallback).trim();
+}
+function dbJson(value, fallback = null) {
+  return JSON.stringify(value ?? fallback);
+}
+function dbCents(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : 0;
+}
+function dbStatus(status) {
+  const value = dbText(status, ORDER_STATUS.OPEN).toLowerCase();
+  if (value === ORDER_STATUS.CANCELED) return ORDER_STATUS.CANCELLED;
+  if ([ORDER_STATUS.OPEN, ORDER_STATUS.PROCESSING, ORDER_STATUS.CLOSED, ORDER_STATUS.CANCELLED, "expired"].includes(value)) return value;
+  return ORDER_STATUS.OPEN;
+}
+function dbProductId(panelId, productId) {
+  const cleanPanelId = dbText(panelId);
+  const cleanProductId = dbText(productId);
+  if (!cleanProductId) return null;
+  return cleanPanelId ? `${cleanPanelId}:${cleanProductId}`.slice(0, 240) : cleanProductId.slice(0, 240);
+}
+function stockQuantityFromLabel(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || /inf|ilimit|sob|consulta|demanda/.test(raw)) return null;
+  const match = raw.match(/\d{1,9}/);
+  if (!match) return null;
+  const quantity = Number.parseInt(match[0], 10);
+  return Number.isFinite(quantity) ? Math.max(0, quantity) : null;
+}
+function formatStockLabel(quantity, previous = "") {
+  if (quantity === null || quantity === undefined) return previous || "infinito";
+  return String(Math.max(0, Number(quantity) || 0));
+}
+function productHasStock(productItem, quantity = 1) {
+  const stock = stockQuantityFromLabel(productItem?.stock);
+  return stock === null || stock >= Math.max(1, Number(quantity) || 1);
+}
+function stockUnavailableMessage(productItem, quantity = 1) {
+  const stock = stockQuantityFromLabel(productItem?.stock);
+  if (stock === null) return "";
+  const wanted = Math.max(1, Number(quantity) || 1);
+  return stock <= 0
+    ? `**${productItem?.name || "Produto"}** esta sem estoque.`
+    : `**${productItem?.name || "Produto"}** tem apenas ${stock} em estoque, mas foram pedidos ${wanted}.`;
+}
+async function withPostgresClient(callback) {
+  if (!postgresEnabled()) return null;
+  await ensurePostgresStore();
+  const dbClient = await getPostgresPool().connect();
+  try {
+    return await callback(dbClient);
+  } finally {
+    dbClient.release();
+  }
+}
+async function withPostgresTransaction(callback) {
+  return withPostgresClient(async dbClient => {
+    await dbClient.query("begin");
+    try {
+      const result = await callback(dbClient);
+      await dbClient.query("commit");
+      return result;
+    } catch (error) {
+      await dbClient.query("rollback").catch(() => null);
+      throw error;
+    }
+  });
+}
+async function upsertGuildRelational(dbClient, guildId) {
+  const id = dbText(guildId, "default");
+  await dbClient.query(`
+    insert into guilds (id, name, updated_at)
+    values ($1, $2, now())
+    on conflict (id) do update set updated_at = now()
+  `, [id, id]);
+  return id;
+}
+async function upsertPanelRelational(dbClient, guildId, panel) {
+  const panelId = dbText(panel?.id);
+  if (!panelId) return null;
+  await upsertGuildRelational(dbClient, guildId);
+  await dbClient.query(`
+    insert into panels (
+      id, guild_id, scope_id, title, description, color, image_url, thumbnail_url,
+      channel_id, published_channel_id, published_message_id, quick_order, updated_at
+    )
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,now())
+    on conflict (id) do update set
+      title = excluded.title,
+      description = excluded.description,
+      color = excluded.color,
+      image_url = excluded.image_url,
+      thumbnail_url = excluded.thumbnail_url,
+      channel_id = excluded.channel_id,
+      published_channel_id = excluded.published_channel_id,
+      published_message_id = excluded.published_message_id,
+      quick_order = excluded.quick_order,
+      updated_at = now()
+  `, [
+    panelId,
+    dbText(guildId, "default"),
+    dbText(panel.scopeId, "default"),
+    dbText(panel.title, "Dragon Store"),
+    dbText(panel.description),
+    dbText(panel.color, "#9b00ff"),
+    dbText(panel.imageUrl),
+    dbText(panel.thumbnailUrl),
+    dbText(panel.channelId),
+    dbText(panel.publishedChannelId),
+    dbText(panel.publishedMessageId),
+    dbJson(panel.quickOrder || {}, {})
+  ]);
+
+  for (const productItem of panel.products || []) {
+    await dbClient.query(`
+      insert into products (
+        id, panel_id, guild_id, name, price_label, price_cents, description,
+        stock_label, stock_quantity, type, image_url, rewards, active, updated_at
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,true,now())
+      on conflict (id) do update set
+        name = excluded.name,
+        price_label = excluded.price_label,
+        price_cents = excluded.price_cents,
+        description = excluded.description,
+        stock_label = excluded.stock_label,
+        stock_quantity = excluded.stock_quantity,
+        type = excluded.type,
+        image_url = excluded.image_url,
+        rewards = excluded.rewards,
+        active = true,
+        updated_at = now()
+    `, [
+      dbProductId(panelId, productItem.id),
+      panelId,
+      dbText(guildId, "default"),
+      dbText(productItem.name, "Produto"),
+      dbText(productItem.price, "R$ 0,00"),
+      Number.isFinite(Number(productItem.priceCents)) ? Number(productItem.priceCents) : priceCentsFromValue(productItem.price),
+      dbText(productItem.description),
+      dbText(productItem.stock, "infinito"),
+      stockQuantityFromLabel(productItem.stock),
+      dbText(productItem.type, "product"),
+      dbText(productItem.imageUrl),
+      dbJson(Array.isArray(productItem.rewards) ? productItem.rewards : [], [])
+    ]);
+  }
+
+  return panelId;
+}
+function relationalOrderValues(order, panel, statusOverride = null) {
+  const totals = orderTotals(order, panel);
+  const status = dbStatus(statusOverride || order.status);
+  const grossAmount = Number.isFinite(Number(order.grossAmount)) ? Number(order.grossAmount) : totals.grossAmount;
+  const discountAmount = Number.isFinite(Number(order.discountAmount)) ? Number(order.discountAmount) : totals.discountAmount;
+  const paidAmount = Number.isFinite(Number(order.spentAmount)) ? Number(order.spentAmount) : totals.amount;
+  return {
+    status,
+    version: Number(order.version) || 0,
+    discount: order.discount || null,
+    grossAmountCents: dbCents(grossAmount),
+    discountAmountCents: dbCents(discountAmount),
+    paidAmountCents: dbCents(paidAmount),
+    panelId: dbText(panel?.id || order.panelId) || null,
+    panelScopeId: dbText(order.panelScopeId || order.scopeId || panel?.scopeId, "default"),
+    updatedAt: order.updatedAt || new Date().toISOString()
+  };
+}
+async function insertOrderRelationalIfMissing(dbClient, order, panel) {
+  const guildId = await upsertGuildRelational(dbClient, order.guildId || "default");
+  await upsertPanelRelational(dbClient, guildId, panel);
+  const values = relationalOrderValues(order, panel);
+  await dbClient.query(`
+    insert into orders (
+      id, guild_id, panel_id, panel_scope_id, channel_id, user_id, username, status,
+      version, discount, gross_amount_cents, discount_amount_cents, paid_amount_cents,
+      assigned_admin_id, assigned_admin_name, processing_by_admin_id, processing_by_admin_name,
+      delivered_by_admin_id, delivered_by_admin_name, delivery_message,
+      closed_by_admin_id, closed_by_admin_name, processing_started_at, delivered_at, closed_at, cancelled_at,
+      created_at, updated_at
+    )
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+    on conflict (id) do update set
+      guild_id = excluded.guild_id,
+      panel_id = excluded.panel_id,
+      panel_scope_id = excluded.panel_scope_id,
+      channel_id = excluded.channel_id,
+      user_id = excluded.user_id,
+      username = excluded.username,
+      discount = excluded.discount,
+      gross_amount_cents = excluded.gross_amount_cents,
+      discount_amount_cents = excluded.discount_amount_cents,
+      paid_amount_cents = excluded.paid_amount_cents,
+      assigned_admin_id = excluded.assigned_admin_id,
+      assigned_admin_name = excluded.assigned_admin_name,
+      updated_at = now()
+  `, [
+    dbText(order.id),
+    guildId,
+    values.panelId,
+    values.panelScopeId,
+    dbText(order.channelId),
+    dbText(order.userId),
+    dbText(order.username),
+    values.status,
+    values.version,
+    dbJson(values.discount, null),
+    values.grossAmountCents,
+    values.discountAmountCents,
+    values.paidAmountCents,
+    dbText(order.assignedAdminId) || null,
+    dbText(order.assignedAdminName),
+    dbText(order.processingByAdminId) || null,
+    dbText(order.processingByAdminName),
+    dbText(order.deliveredByAdminId) || null,
+    dbText(order.deliveredByAdminName),
+    dbText(order.deliveryMessage),
+    dbText(order.closedByAdminId) || null,
+    dbText(order.closedByAdminName),
+    order.processingStartedAt || null,
+    order.deliveredAt || null,
+    order.closedAt || null,
+    order.cancelledAt || null,
+    order.createdAt || new Date().toISOString(),
+    values.updatedAt
+  ]);
+}
+async function syncOrderItemsRelational(dbClient, order, panel) {
+  await dbClient.query("delete from order_items where order_id = $1", [dbText(order.id)]);
+  for (const item of order.items || []) {
+    const details = orderItemDetails(item, panel);
+    const sourcePanelId = dbText(details.sourcePanelId || panel?.id || order.panelId);
+    await dbClient.query(`
+      insert into order_items (
+        order_id, product_id, source_panel_id, name, price_label, price_cents,
+        description, stock_label, type, image_url, rewards, quantity
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)
+    `, [
+      dbText(order.id),
+      dbProductId(sourcePanelId, details.sourceProductId || details.productId),
+      sourcePanelId,
+      dbText(details.name, "Produto"),
+      dbText(details.price),
+      Number.isFinite(Number(details.priceCents)) ? Number(details.priceCents) : priceCentsFromValue(details.price),
+      dbText(details.description),
+      dbText(details.stock),
+      dbText(details.type, "product"),
+      dbText(details.imageUrl),
+      dbJson(Array.isArray(details.rewards) ? details.rewards : [], []),
+      Math.max(1, Number(item.quantity) || 1)
+    ]);
+  }
+}
+async function writeOrderRelational(dbClient, order, panel) {
+  await insertOrderRelationalIfMissing(dbClient, order, panel);
+  const values = relationalOrderValues(order, panel);
+  await dbClient.query(`
+    update orders set
+      status = $2,
+      version = $3,
+      discount = $4::jsonb,
+      gross_amount_cents = $5,
+      discount_amount_cents = $6,
+      paid_amount_cents = $7,
+      assigned_admin_id = $8,
+      assigned_admin_name = $9,
+      processing_by_admin_id = $10,
+      processing_by_admin_name = $11,
+      delivered_by_admin_id = $12,
+      delivered_by_admin_name = $13,
+      delivery_message = $14,
+      closed_by_admin_id = $15,
+      closed_by_admin_name = $16,
+      processing_started_at = $17,
+      delivered_at = $18,
+      closed_at = $19,
+      cancelled_at = $20,
+      updated_at = now()
+    where id = $1
+  `, [
+    dbText(order.id),
+    values.status,
+    values.version,
+    dbJson(values.discount, null),
+    values.grossAmountCents,
+    values.discountAmountCents,
+    values.paidAmountCents,
+    dbText(order.assignedAdminId) || null,
+    dbText(order.assignedAdminName),
+    dbText(order.processingByAdminId) || null,
+    dbText(order.processingByAdminName),
+    dbText(order.deliveredByAdminId) || null,
+    dbText(order.deliveredByAdminName),
+    dbText(order.deliveryMessage),
+    dbText(order.closedByAdminId) || null,
+    dbText(order.closedByAdminName),
+    order.processingStartedAt || null,
+    order.deliveredAt || null,
+    order.closedAt || null,
+    order.cancelledAt || null
+  ]);
+  await syncOrderItemsRelational(dbClient, order, panel);
+}
+async function writeStatsRelational(dbClient, db, order) {
+  const guildId = dbText(order.guildId, "default");
+  const customer = db.customers?.[guildId]?.[order.userId];
+  if (customer) {
+    await dbClient.query(`
+      insert into customer_stats (guild_id, user_id, username, total_spent_cents, order_count, periods, last_order_at, updated_at)
+      values ($1,$2,$3,$4,$5,$6::jsonb,$7,now())
+      on conflict (guild_id, user_id) do update set
+        username = excluded.username,
+        total_spent_cents = excluded.total_spent_cents,
+        order_count = excluded.order_count,
+        periods = excluded.periods,
+        last_order_at = excluded.last_order_at,
+        updated_at = now()
+    `, [
+      guildId,
+      dbText(customer.userId || order.userId),
+      dbText(customer.username || order.username),
+      dbCents(customer.totalSpent),
+      Number(customer.orderCount) || 0,
+      dbJson(customer.periods || {}, {}),
+      customer.lastOrderAt || null
+    ]);
+  }
+
+  const seller = order.closedByAdminId ? db.sellers?.[guildId]?.[order.closedByAdminId] : null;
+  if (seller) {
+    await dbClient.query(`
+      insert into admin_sales (guild_id, admin_user_id, username, total_sold_cents, order_count, total_items, periods, last_sale_at, updated_at)
+      values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,now())
+      on conflict (guild_id, admin_user_id) do update set
+        username = excluded.username,
+        total_sold_cents = excluded.total_sold_cents,
+        order_count = excluded.order_count,
+        total_items = excluded.total_items,
+        periods = excluded.periods,
+        last_sale_at = excluded.last_sale_at,
+        updated_at = now()
+    `, [
+      guildId,
+      dbText(seller.userId || order.closedByAdminId),
+      dbText(seller.username || order.closedByAdminName),
+      dbCents(seller.totalSold),
+      Number(seller.orderCount) || 0,
+      Number(seller.totalItems) || 0,
+      dbJson(seller.periods || {}, {}),
+      seller.lastSaleAt || null
+    ]);
+  }
+}
+async function writePaymentRelational(dbClient, order, panel) {
+  const hasProof = Boolean(order.paymentProofLatestUrl || (Array.isArray(order.paymentProofs) && order.paymentProofs.length));
+  if (order.paymentStatus !== "marked_paid" && !order.paidAt && !hasProof) return;
+  const totals = orderTotals(order, panel);
+  const amount = Number.isFinite(Number(order.paidAmount)) ? Number(order.paidAmount) : totals.amount;
+  const status = order.paymentStatus === "marked_paid" || order.paidAt ? "marked_paid" : "proof_received";
+  const markedAt = order.paidAt || order.paymentProofSubmittedAt || order.closedAt || new Date().toISOString();
+  await upsertGuildRelational(dbClient, order.guildId || "default");
+  await dbClient.query(`
+    insert into payments (
+      external_id, order_id, guild_id, status, amount_cents, method,
+      staff_user_id, proof_attachment_url, marked_paid_at, created_at
+    )
+    values ($1,$2,$3,$4,$5,'pix_manual',$6,$7,$8,$8)
+    on conflict (external_id) do update set
+      status = excluded.status,
+      amount_cents = excluded.amount_cents,
+      method = excluded.method,
+      staff_user_id = excluded.staff_user_id,
+      proof_attachment_url = excluded.proof_attachment_url,
+      marked_paid_at = excluded.marked_paid_at
+  `, [
+    `payment_${dbText(order.id)}_manual`,
+    dbText(order.id),
+    dbText(order.guildId, "default"),
+    status,
+    dbCents(amount),
+    dbText(order.paidByAdminId || order.assignedAdminId || order.closedByAdminId) || null,
+    dbText(order.paymentProofLatestUrl) || null,
+    markedAt
+  ]);
+}
+async function writeAuditEntryRelational(dbClient, entry) {
+  const guildId = dbText(entry.guildId, "default");
+  await upsertGuildRelational(dbClient, guildId);
+  await dbClient.query(`
+    insert into audit_logs (external_id, guild_id, actor_id, actor_name, action, order_id, target_user_id, details, created_at)
+    values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)
+    on conflict (external_id) do update set
+      actor_id = excluded.actor_id,
+      actor_name = excluded.actor_name,
+      action = excluded.action,
+      order_id = excluded.order_id,
+      target_user_id = excluded.target_user_id,
+      details = excluded.details
+  `, [
+    dbText(entry.id),
+    guildId,
+    dbText(entry.actorId) || null,
+    dbText(entry.actorName),
+    dbText(entry.action, "unknown"),
+    dbText(entry.orderId) || null,
+    dbText(entry.targetUserId) || null,
+    dbJson(entry.details || {}, {}),
+    entry.createdAt || new Date().toISOString()
+  ]);
+}
+function enqueueAuditLogEntryToPostgres(entry) {
+  if (!postgresEnabled() || !entry?.id) return Promise.resolve(false);
+  return withPostgresClient(dbClient => writeAuditEntryRelational(dbClient, entry))
+    .catch(error => {
+      console.log(`Nao consegui espelhar audit log no Postgres: ${error.message}`);
+      return false;
+    });
+}
+async function writeRecentAuditLogsRelational(dbClient, db, orderId) {
+  const recent = (db.auditLogs || []).filter(entry => !orderId || entry.orderId === orderId).slice(-25);
+  for (const entry of recent) await writeAuditEntryRelational(dbClient, entry);
+}
+async function finalizeOrderWithPostgres(db, order, panel, context, applyFinalState) {
+  if (!postgresEnabled()) return { ok: true, used: false };
+  const actor = actionUser(context);
+  const actorName = context.member?.displayName || actor?.username || actor?.id || "ADM";
+  const processingAt = new Date().toISOString();
+
+  try {
+    return await withPostgresTransaction(async dbClient => {
+      await insertOrderRelationalIfMissing(dbClient, order, panel);
+      await syncOrderItemsRelational(dbClient, order, panel);
+      await dbClient.query(`
+        update orders
+        set status = 'open',
+          processing_started_at = null,
+          processing_by_admin_id = null,
+          processing_by_admin_name = null,
+          version = version + 1,
+          updated_at = now()
+        where id = $1
+          and status = 'processing'
+          and processing_started_at is not null
+          and processing_started_at < now() - interval '10 minutes'
+      `, [dbText(order.id)]);
+      const lock = await dbClient.query(`
+        update orders
+        set status = 'processing',
+          processing_started_at = $2,
+          processing_by_admin_id = $3,
+          processing_by_admin_name = $4,
+          version = version + 1,
+          updated_at = now()
+        where id = $1 and status = 'open'
+        returning status, version
+      `, [dbText(order.id), processingAt, dbText(actor?.id) || null, dbText(actorName)]);
+
+      if (lock.rowCount !== 1) {
+        const current = await dbClient.query("select status from orders where id = $1", [dbText(order.id)]);
+        return { ok: false, used: true, status: current.rows[0]?.status || "missing" };
+      }
+
+      applyFinalState(processingAt);
+      await writeOrderRelational(dbClient, order, panel);
+      await writePaymentRelational(dbClient, order, panel);
+      await writeStatsRelational(dbClient, db, order);
+      await writeRecentAuditLogsRelational(dbClient, db, order.id);
+      return { ok: true, used: true };
+    });
+  } catch (error) {
+    return { ok: false, used: true, error };
+  }
+}
+async function persistOrderRelationalAsync(db, order, panel) {
+  if (!postgresEnabled() || !order?.id) return false;
+  return withPostgresTransaction(async dbClient => {
+    await writeOrderRelational(dbClient, order, panel);
+    await writePaymentRelational(dbClient, order, panel);
+    await writeStatsRelational(dbClient, db, order);
+    await writeRecentAuditLogsRelational(dbClient, db, order.id);
+    return true;
+  }).catch(error => {
+    console.log(`Nao consegui espelhar pedido ${order.id} no Postgres: ${error.message}`);
+    return false;
+  });
+}
+function encryptPixKeyForDb(value) {
+  const pixKey = dbText(value);
+  const secret = process.env.PIX_ENCRYPTION_KEY || "";
+  if (!pixKey || !secret) return null;
+
+  const key = crypto.createHash("sha256").update(secret).digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(pixKey, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `aes-256-gcm:${iv.toString("base64url")}:${tag.toString("base64url")}:${encrypted.toString("base64url")}`;
+}
+async function persistPanelRelationalAsync(guildId, panel) {
+  if (!postgresEnabled() || !panel?.id) return false;
+  return withPostgresTransaction(async dbClient => {
+    await upsertPanelRelational(dbClient, guildId, panel);
+    return true;
+  }).catch(error => {
+    console.log(`Nao consegui espelhar painel ${panel.id} no Postgres: ${error.message}`);
+    return false;
+  });
+}
+async function persistStaffGuildRelationalAsync(guildId, staffGuild) {
+  if (!postgresEnabled() || !staffGuild?.users) return false;
+  return withPostgresTransaction(async dbClient => {
+    await upsertGuildRelational(dbClient, guildId);
+    for (const [userId, profile] of Object.entries(staffGuild.users || {})) {
+      await dbClient.query(`
+        insert into staff (guild_id, user_id, display_name, pix_key_encrypted, qr_code_url, note, online, updated_at)
+        values ($1,$2,$3,$4,$5,$6,$7,now())
+        on conflict (guild_id, user_id) do update set
+          display_name = excluded.display_name,
+          pix_key_encrypted = coalesce(excluded.pix_key_encrypted, staff.pix_key_encrypted),
+          qr_code_url = excluded.qr_code_url,
+          note = excluded.note,
+          online = excluded.online,
+          updated_at = now()
+      `, [
+        dbText(guildId, "default"),
+        dbText(profile.userId || userId),
+        dbText(profile.displayName),
+        encryptPixKeyForDb(profile.pixKey),
+        dbText(profile.qrCodeUrl),
+        dbText(profile.note),
+        Boolean(profile.online)
+      ]);
+    }
+    return true;
+  }).catch(error => {
+    console.log(`Nao consegui espelhar staff ${guildId} no Postgres: ${error.message}`);
+    return false;
+  });
 }
 function ensureOrdersStore(db) {
   const store = db && typeof db === "object" ? db : {};
@@ -236,6 +901,8 @@ function ensureOrdersStore(db) {
   if (!store.tickets || typeof store.tickets !== "object" || Array.isArray(store.tickets)) store.tickets = {};
   if (!store.customers || typeof store.customers !== "object" || Array.isArray(store.customers)) store.customers = {};
   if (!store.sellers || typeof store.sellers !== "object" || Array.isArray(store.sellers)) store.sellers = {};
+  if (!Array.isArray(store.auditLogs)) store.auditLogs = [];
+  if (store.auditLogs.length > 1000) store.auditLogs = store.auditLogs.slice(-1000);
 
   for (const [id, order] of Object.entries(store.orders)) {
     if (!order || typeof order !== "object" || Array.isArray(order)) {
@@ -247,6 +914,7 @@ function ensureOrdersStore(db) {
     order.items = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
     order.createdAt = order.createdAt || new Date().toISOString();
     order.closedAt = order.closedAt || null;
+    order.version = Number.isFinite(Number(order.version)) ? Number(order.version) : 0;
   }
 
   for (const [id, ticket] of Object.entries(store.tickets)) {
@@ -272,7 +940,7 @@ function readPanels() {
 }
 function writePanels(data) { writeJson(PANELS_FILE, data); }
 function readOrders() {
-  const data = ensureOrdersStore(readJson(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {} }));
+  const data = ensureOrdersStore(readJson(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {}, auditLogs: [] }));
   rememberJson(ORDERS_FILE, data);
   return data;
 }
@@ -283,6 +951,154 @@ function readStaff() {
   return data;
 }
 function writeStaff(data) { writeJson(STAFF_FILE, data); }
+const ORDER_STATUS = {
+  OPEN: "open",
+  PROCESSING: "processing",
+  CLOSED: "closed",
+  CANCELLED: "cancelled",
+  CANCELED: "canceled"
+};
+const ORDER_PROCESSING_STALE_MS = 10 * 60 * 1000;
+function touchOrder(order) {
+  order.version = (Number(order.version) || 0) + 1;
+  order.updatedAt = new Date().toISOString();
+  return order;
+}
+function isOrderProcessing(order) {
+  return String(order?.status || "") === ORDER_STATUS.PROCESSING || orderActionLocks.has(String(order?.id || ""));
+}
+function claimOrderActionLock(order) {
+  const id = String(order?.id || "");
+  if (!id || orderActionLocks.has(id)) return false;
+  orderActionLocks.add(id);
+  return true;
+}
+function releaseOrderActionLock(order) {
+  const id = String(order?.id || "");
+  if (id) orderActionLocks.delete(id);
+}
+function isOrderProcessingStale(order) {
+  if (!isOrderProcessing(order) || !order.processingStartedAt) return false;
+  const started = Date.parse(order.processingStartedAt);
+  return Number.isFinite(started) && Date.now() - started > ORDER_PROCESSING_STALE_MS;
+}
+function orderStatusLabel(status) {
+  const value = String(status || ORDER_STATUS.OPEN);
+  if (value === ORDER_STATUS.OPEN) return "Aberto";
+  if (value === ORDER_STATUS.PROCESSING) return "Processando";
+  if (value === ORDER_STATUS.CLOSED) return "Fechado";
+  if (value === ORDER_STATUS.CANCELLED || value === ORDER_STATUS.CANCELED) return "Cancelado";
+  return value;
+}
+function paymentStatusLabel(order) {
+  if (order?.paymentStatus === "marked_paid" || order?.paidAt) {
+    const by = order.paidByAdminId ? ` por <@${order.paidByAdminId}>` : "";
+    return `Pago manualmente${by}`;
+  }
+  if (order?.paymentStatus === "proof_received" || order?.paymentProofSubmittedAt) return "Comprovante recebido";
+  if (order?.assignedAdminId) return "Aguardando pagamento";
+  return "Aguardando ADM";
+}
+function deliveryStatusLabel(order) {
+  if (order?.deliveredAt) {
+    const by = order.deliveredByAdminId ? ` por <@${order.deliveredByAdminId}>` : "";
+    return `Entregue${by}`;
+  }
+  if (order?.paymentStatus === "marked_paid" || order?.paidAt) return "Pago, aguardando entrega";
+  return "Aguardando pagamento";
+}
+function orderChecklist(order) {
+  const done = value => value ? "x" : " ";
+  const paid = order?.paymentStatus === "marked_paid" || order?.paidAt;
+  return [
+    `[x] Carrinho criado`,
+    `[${done(order?.assignedAdminId)}] ADM assumiu`,
+    `[${done(paid)}] Pagamento recebido`,
+    `[${done(order?.deliveredAt)}] Produto entregue`,
+    `[${done(order?.status === ORDER_STATUS.CLOSED)}] Compra finalizada`
+  ].join("\n");
+}
+function canStartOrderProcessing(order) {
+  return Boolean(order && String(order.status || "") === ORDER_STATUS.OPEN);
+}
+function recoverStaleProcessingOrder(db, order, context = null) {
+  if (!db || !order || !isOrderProcessingStale(order)) return false;
+  order.status = ORDER_STATUS.OPEN;
+  order.recoveredFromProcessingAt = new Date().toISOString();
+  order.recoveredProcessingStartedAt = order.processingStartedAt || "";
+  delete order.processingStartedAt;
+  delete order.processingByAdminId;
+  delete order.processingByAdminName;
+  touchOrder(order);
+  appendAuditLog(db, context || {
+    guildId: order.guildId,
+    channelId: order.channelId,
+    user: { id: client.user?.id || "bot", username: client.user?.username || "bot" }
+  }, "order.processing_recovered", { order, recoveredProcessingStartedAt: order.recoveredProcessingStartedAt });
+  db.orders[order.id] = order;
+  return true;
+}
+function recoverStaleProcessingOrders(context = null) {
+  const db = readOrders();
+  let recovered = 0;
+  for (const order of Object.values(db.orders || {})) {
+    if (recoverStaleProcessingOrder(db, order, context)) recovered += 1;
+  }
+  if (recovered) writeOrders(db);
+  return recovered;
+}
+function auditActor(context) {
+  const user = actionUser(context) || {};
+  return {
+    actorId: user.id || "",
+    actorName: context?.member?.displayName || user.username || ""
+  };
+}
+function auditContext(context) {
+  return {
+    guildId: actionGuildId(context),
+    channelId: context?.channel?.id || context?.channelId || ""
+  };
+}
+function compactAuditValue(value, depth = 0) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return clampText(value, 300);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return depth > 1 ? `[${value.length} item(s)]` : value.slice(0, 20).map(item => compactAuditValue(item, depth + 1));
+  if (typeof value === "object") {
+    if (depth > 1) return "[objeto]";
+    return Object.fromEntries(Object.entries(value).slice(0, 30).map(([key, item]) => [key, compactAuditValue(item, depth + 1)]));
+  }
+  return String(value);
+}
+function appendAuditLog(db, context, action, details = {}) {
+  if (!db || typeof db !== "object") return null;
+  if (!Array.isArray(db.auditLogs)) db.auditLogs = [];
+  const actor = auditActor(context);
+  const ctx = auditContext(context);
+  const entry = {
+    id: `audit_${Date.now()}_${sid()}`,
+    action,
+    ...ctx,
+    ...actor,
+    orderId: details.orderId || details.order?.id || "",
+    targetUserId: details.targetUserId || details.order?.userId || "",
+    details: compactAuditValue(details),
+    createdAt: new Date().toISOString()
+  };
+  db.auditLogs.push(entry);
+  if (db.auditLogs.length > 1000) db.auditLogs = db.auditLogs.slice(-1000);
+  enqueueAuditLogEntryToPostgres(entry);
+  return entry;
+}
+function writeAuditLog(context, action, details = {}) {
+  const db = readOrders();
+  appendAuditLog(db, context, action, details);
+  writeOrders(db);
+}
+function changedFieldNames(oldValue = {}, newValue = {}, fields = []) {
+  return fields.filter(field => String(oldValue?.[field] || "") !== String(newValue?.[field] || ""));
+}
 function defaultStaffGuild() {
   return {
     users: {},
@@ -308,6 +1124,7 @@ function saveStaffGuild(guildId, staffGuild) {
   const db = readStaff();
   db.guilds[guildId] = staffGuild;
   writeStaff(db);
+  persistStaffGuildRelationalAsync(guildId, staffGuild);
 }
 function getStaffProfile(guildId, userId) {
   const staff = getStaffGuild(guildId);
@@ -406,6 +1223,17 @@ function parsePrice(value) {
     .replace(",", ".");
   const amount = Number.parseFloat(onlyNumber);
   return Number.isFinite(amount) ? amount : null;
+}
+function priceCentsFromValue(value) {
+  const amount = parsePrice(value);
+  return amount === null ? null : Math.round(amount * 100);
+}
+function amountFromDetails(details) {
+  if (details?.priceCents !== null && details?.priceCents !== undefined && details?.priceCents !== "") {
+    const cents = Number(details.priceCents);
+    if (Number.isFinite(cents)) return cents / 100;
+  }
+  return parsePrice(details?.price);
 }
 function money(value) {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -932,8 +1760,11 @@ async function sendStaffChoiceMessage(channel, order, guildId) {
       saved.assignedAdminId = profile.userId;
       saved.assignedAdminName = profile.displayName || "ADM";
       saved.assignedAt = new Date().toISOString();
+      touchOrder(saved);
+      appendAuditLog(db, { guildId, channelId: channel.id, user: { id: profile.userId, username: profile.displayName || "ADM" } }, "order.auto_assigned", { order: saved, reason: "single_staff_online" });
       db.orders[order.id] = saved;
       writeOrders(db);
+      persistOrderRelationalAsync(db, saved, panel);
       order = saved;
     }
 
@@ -954,41 +1785,51 @@ async function sendStaffChoiceMessage(channel, order, guildId) {
   await channel.send({ embeds: [staffChoiceEmbed(order, guildId)], components: staffChoiceRows(order.id, Boolean(order.assignedAdminId)) });
 }
 async function assumeOrder(interaction, id) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true }).catch(() => null);
   const db = readOrders();
   const order = orderForAction(db, id, interaction);
 
   if (!order || order.status !== "open") {
-    return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+    return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   }
 
   if (!isAdmin(interaction.member)) {
-    return interaction.reply({ content: "Só ADM pode assumir compra.", ephemeral: true });
+    return actionReply(interaction, { content: "Só ADM pode assumir compra.", ephemeral: true });
   }
 
   if (order.assignedAdminId) {
-    return interaction.reply({ content: `Essa compra já foi assumida por <@${order.assignedAdminId}>.`, ephemeral: true });
+    return actionReply(interaction, { content: `Essa compra já foi assumida por <@${order.assignedAdminId}>.`, ephemeral: true });
   }
 
   await ensureStaffState(interaction.guild, interaction.channel);
   const profile = getStaffProfile(interaction.guildId, interaction.user.id);
   if (!profile?.pixKey) {
-    return interaction.reply({ content: "Configure seu Pix primeiro com `!configpix`, `/configpix` ou no botão **Configurar meu Pix** do painel de atendimento.", ephemeral: true });
+    return actionReply(interaction, { content: "Configure seu Pix primeiro com `!configpix`, `/configpix` ou no botão **Configurar meu Pix** do painel de atendimento.", ephemeral: true });
   }
 
   const online = onlineStaffProfiles(interaction.guildId);
   if (online.length > 0 && !profile.online) {
-    return interaction.reply({ content: "Você está OFF. Clique em **Ficar ON** no painel de atendimento antes de assumir.", ephemeral: true });
+    return actionReply(interaction, { content: "Você está OFF. Clique em **Ficar ON** no painel de atendimento antes de assumir.", ephemeral: true });
   }
 
   order.assignedAdminId = interaction.user.id;
   order.assignedAdminName = profile.displayName || interaction.user.username;
   order.assignedAt = new Date().toISOString();
+  touchOrder(order);
+  appendAuditLog(db, interaction, "order.assigned", { order, staffUserId: interaction.user.id });
   db.orders[order.id] = order;
   writeOrders(db);
 
   const panel = getOrderPanel(order, actionGuildId(interaction));
+  persistOrderRelationalAsync(db, order, panel);
+  const targetChannel = order.channelId === interaction.channel?.id
+    ? interaction.channel
+    : await interaction.guild.channels.fetch(order.channelId).catch(() => null);
+  if (!targetChannel?.isTextBased?.()) {
+    return actionReply(interaction, { content: "Compra assumida, mas nao consegui achar o canal do carrinho para enviar o Pix.", ephemeral: true });
+  }
 
-  await interaction.channel.send({
+  await targetChannel.send({
     content: `<@${order.userId}> ✅ Compra #${order.id} assumida por **${order.assignedAdminName}** (<@${interaction.user.id}>).`,
     embeds: [buildPixEmbed(order, panel, profile)],
     components: staffChoiceRows(order.id, true),
@@ -997,35 +1838,38 @@ async function assumeOrder(interaction, id) {
 
   await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
 
-  return interaction.reply({ content: "Compra assumida e Pix enviado.", ephemeral: true });
+  return actionReply(interaction, { content: "Compra assumida e Pix enviado.", ephemeral: true });
 }
 async function resendPix(interaction, id) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true }).catch(() => null);
   const db = readOrders();
   const order = orderForAction(db, id, interaction);
 
   if (!order || order.status !== "open") {
-    return interaction.reply({ content: "Carrinho fechado ou inexistente.", ephemeral: true });
+    return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   }
 
   if (!isAdmin(interaction.member)) {
-    return interaction.reply({ content: "Só ADM pode reenviar Pix.", ephemeral: true });
+    return actionReply(interaction, { content: "Só ADM pode reenviar Pix.", ephemeral: true });
   }
 
   if (!order.assignedAdminId) {
-    return interaction.reply({ content: "Essa compra ainda não foi assumida. Clique em **Assumir compra** primeiro.", ephemeral: true });
+    return actionReply(interaction, { content: "Essa compra ainda não foi assumida. Clique em **Assumir compra** primeiro.", ephemeral: true });
   }
 
   await ensureStaffState(interaction.guild, interaction.channel);
   const profile = getStaffProfile(interaction.guildId, order.assignedAdminId);
   if (!profile?.pixKey) {
-    return interaction.reply({ content: "O ADM responsável não tem Pix configurado mais.", ephemeral: true });
+    return actionReply(interaction, { content: "O ADM responsável não tem Pix configurado mais.", ephemeral: true });
   }
 
   const panel = getOrderPanel(order, actionGuildId(interaction));
+  appendAuditLog(db, interaction, "order.pix_resent", { order, staffUserId: order.assignedAdminId });
+  writeOrders(db);
   await interaction.channel.send({ embeds: [buildPixEmbed(order, panel, profile)] });
   await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
 
-  return interaction.reply({ content: "Pix reenviado.", ephemeral: true });
+  return actionReply(interaction, { content: "Pix reenviado.", ephemeral: true });
 }
 async function sendPixCommand(message) {
   if (!isAdmin(message.member)) return message.reply("So ADM pode enviar Pix do carrinho.");
@@ -1048,11 +1892,16 @@ async function sendPixCommand(message) {
     order.assignedAdminId = message.author.id;
     order.assignedAdminName = profile.displayName || message.member?.displayName || message.author.username;
     order.assignedAt = new Date().toISOString();
+    touchOrder(order);
+    appendAuditLog(db, message, "order.assigned", { order, staffUserId: message.author.id, via: "pix_command" });
     db.orders[order.id] = order;
     writeOrders(db);
   }
+  appendAuditLog(db, message, "order.pix_sent", { order, staffUserId: message.author.id, via: "pix_command" });
+  writeOrders(db);
 
   const panel = getOrderPanel(order, message.guild.id);
+  persistOrderRelationalAsync(db, order, panel);
   await message.channel.send({
     content: `<@${order.userId}> Pix enviado por **${order.assignedAdminName || profile.displayName || "ADM"}** (<@${message.author.id}>).`,
     embeds: [buildPixEmbed(order, panel, profile)],
@@ -1068,6 +1917,23 @@ async function finishCurrentCartCommand(message) {
   if (!order) return message.reply("Nao encontrei carrinho aberto neste chat.");
   await message.delete().catch(() => null);
   return finishCart(message, order.id);
+}
+async function markPaidCurrentCartCommand(message) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode marcar pagamento.");
+  const order = findOrderInChannel(readOrders(), message, false);
+  if (!order) return message.reply("Nao encontrei carrinho neste chat.");
+  await message.delete().catch(() => null);
+  return markOrderPaid(message, order.id);
+}
+async function deliverCurrentCartCommand(message, rawContent) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode entregar produto.");
+  const order = findOrderInChannel(readOrders(), message, false);
+  if (!order) return message.reply("Nao encontrei carrinho neste chat.");
+  const prefix = config.prefix || "!";
+  const deliveryText = String(rawContent || "").replace(new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}entregar\\s*`, "i"), "").trim();
+  if (!deliveryText) return message.reply("Use `!entregar key/link/mensagem` ou clique em **Entregar produto** no carrinho.");
+  await message.delete().catch(() => null);
+  return deliverOrder(message, order.id, deliveryText);
 }
 async function cancelCurrentCartCommand(message) {
   if (!isAdmin(message.member)) return message.reply("So ADM pode cancelar compra por comando.");
@@ -1095,6 +1961,7 @@ async function handleStaffButton(interaction) {
     }
 
     saveStaffProfile(interaction.guildId, interaction.user.id, { online: true });
+    writeAuditLog(interaction, "staff.online_changed", { staffUserId: interaction.user.id, online: true });
     await refreshStaffPanel(interaction.guildId);
     await saveStaffBackup(interaction.guild, interaction.channel).catch(error => console.log(`Nao consegui salvar backup do Pix: ${error.message}`));
     return interaction.reply({ content: "Você está ON para receber vendas.", ephemeral: true });
@@ -1102,6 +1969,7 @@ async function handleStaffButton(interaction) {
 
   if (action === "off") {
     saveStaffProfile(interaction.guildId, interaction.user.id, { online: false });
+    writeAuditLog(interaction, "staff.online_changed", { staffUserId: interaction.user.id, online: false });
     await refreshStaffPanel(interaction.guildId);
     await saveStaffBackup(interaction.guild, interaction.channel).catch(error => console.log(`Nao consegui salvar backup do Pix: ${error.message}`));
     return interaction.reply({ content: "Você está OFF.", ephemeral: true });
@@ -1128,6 +1996,7 @@ async function handlePixModal(interaction) {
     return interaction.reply({ content: "Link de QR Code inválido. Use http/https ou deixe vazio.", ephemeral: true });
   }
 
+  const oldProfile = getStaffProfile(interaction.guildId, interaction.user.id) || {};
   saveStaffProfile(interaction.guildId, interaction.user.id, {
     displayName,
     pixKey,
@@ -1135,6 +2004,8 @@ async function handlePixModal(interaction) {
     note,
     online: false
   });
+  const changedFields = changedFieldNames(oldProfile, { displayName, pixKey, qrCodeUrl, note }, ["displayName", "pixKey", "qrCodeUrl", "note"]);
+  writeAuditLog(interaction, "staff.pix_changed", { staffUserId: interaction.user.id, changedFields });
   await flushPersistentFile(STAFF_FILE).catch(error => {
     console.log(`Nao consegui confirmar Pix no KV agora: ${error.message}`);
   });
@@ -1323,6 +2194,7 @@ function productsFromPreset(preset) {
         id: "p" + random7(),
         name,
         price,
+        priceCents: priceCentsFromValue(price),
         description: preset.productDescription,
         stock: "infinito",
         imageUrl: ""
@@ -1333,6 +2205,7 @@ function productsFromPreset(preset) {
       id: "p" + random7(),
       name: item.name || "Produto",
       price: item.price || "R$ 0,00",
+      priceCents: priceCentsFromValue(item.price || "R$ 0,00"),
       description: item.description || preset.productDescription || "Produto da loja",
       stock: item.stock || "infinito",
       imageUrl: item.imageUrl || "",
@@ -1400,6 +2273,84 @@ function savePanel(guildId, panel, scopeId = null) {
   guildStore.panels[key] = panel;
   if (key === "default") guildStore.panel = panel;
   writePanels(store);
+  persistPanelRelationalAsync(guildId, panel);
+}
+function findProductForStock(store, guildId, panelId, scopeId, productId) {
+  const guildStore = ensurePanelStore(store, guildId);
+  const panels = Object.values(guildStore.panels || {});
+  const panel = panels.find(item => item.id === panelId) ||
+    guildStore.panels?.[scopeId] ||
+    guildStore.panel;
+  const productItem = panel?.products?.find(item => item.id === productId);
+  return productItem && panel ? { panel, product: productItem } : null;
+}
+function orderStockIssues(guildId, order, fallbackPanel) {
+  const store = readPanels();
+  const requested = new Map();
+  for (const item of order.items || []) {
+    const details = orderItemDetails(item, fallbackPanel);
+    const productId = details.sourceProductId || item.productId;
+    const panelId = details.sourcePanelId || item.sourcePanelId || order.panelId || fallbackPanel?.id || "";
+    const key = `${panelId}:${productId}`;
+    const current = requested.get(key) || { panelId, productId, quantity: 0, details };
+    current.quantity += Math.max(1, Number(item.quantity) || 1);
+    requested.set(key, current);
+  }
+
+  const issues = [];
+  for (const request of requested.values()) {
+    const found = findProductForStock(store, guildId, request.panelId, order.panelScopeId || fallbackPanel?.scopeId || "default", request.productId);
+    if (!found) continue;
+    const stock = stockQuantityFromLabel(found.product.stock);
+    if (stock !== null && stock < request.quantity) {
+      issues.push({
+        productName: found.product.name || request.details.name || "Produto",
+        stock,
+        requested: request.quantity
+      });
+    }
+  }
+  return issues;
+}
+function consumeOrderStock(guildId, order, fallbackPanel) {
+  if (order.stockAdjustedAt) return [];
+  const store = readPanels();
+  const changes = [];
+
+  for (const item of order.items || []) {
+    const quantity = Math.max(1, Number(item.quantity) || 1);
+    const details = orderItemDetails(item, fallbackPanel);
+    const productId = details.sourceProductId || item.productId;
+    const panelId = details.sourcePanelId || item.sourcePanelId || order.panelId || fallbackPanel?.id || "";
+    const found = findProductForStock(store, guildId, panelId, order.panelScopeId || fallbackPanel?.scopeId || "default", productId);
+    if (!found) continue;
+
+    const current = stockQuantityFromLabel(found.product.stock);
+    if (current === null) continue;
+    const next = Math.max(0, current - quantity);
+    found.product.stock = formatStockLabel(next, found.product.stock);
+    found.product.updatedAt = new Date().toISOString();
+    changes.push({
+      panelId: found.panel.id,
+      panelTitle: found.panel.title,
+      productId: found.product.id,
+      productName: found.product.name,
+      before: current,
+      sold: quantity,
+      after: next
+    });
+  }
+
+  if (changes.length) {
+    writePanels(store);
+    for (const panel of new Set(changes.map(change => findProductForStock(store, guildId, change.panelId, "", change.productId)?.panel).filter(Boolean))) {
+      persistPanelRelationalAsync(guildId, panel);
+    }
+  }
+
+  order.stockAdjustedAt = new Date().toISOString();
+  order.stockAdjustments = changes;
+  return changes;
 }
 function getPanelById(guildId, panelId) {
   const store = readPanels();
@@ -1441,6 +2392,7 @@ function publicStoreProduct(p, panel, idPrefix = "") {
     id: idPrefix ? `${idPrefix}_${rawId}` : rawId,
     name: String(p.name || "Produto"),
     price: String(p.price || "A combinar"),
+    priceCents: Number.isFinite(Number(p.priceCents)) ? Number(p.priceCents) : priceCentsFromValue(p.price),
     description: String(p.description || "Produto digital da Dragon Store"),
     stock: String(p.stock || "infinito"),
     imageUrl: p.imageUrl || panel.imageUrl || "",
@@ -1482,7 +2434,7 @@ function publicCategoryId(panel, index = 0) {
 function publicCategoryMinPrice(products) {
   let min = null;
   for (const product of products || []) {
-    const value = parsePrice(product.price);
+    const value = amountFromDetails(product);
     if (value === null) continue;
     min = min === null ? value : Math.min(min, value);
   }
@@ -1696,9 +2648,11 @@ function orderForAction(db, id, context, openOnly = true) {
 function product(panel, id) { return (panel.products || []).find(p => p.id === id); }
 function normalizeProductInput({ name, price, description, stock, imageUrl }) {
   const cleanImage = clampText(imageUrl, 500);
+  const cleanPrice = clampText(price, 50, "R$ 0,00");
   return {
     name: clampText(name, 100, "Produto"),
-    price: clampText(price, 50, "R$ 0,00"),
+    price: cleanPrice,
+    priceCents: priceCentsFromValue(cleanPrice),
     description: clampText(description, 200, "Produto da loja"),
     stock: clampText(stock, 50, "infinito") || "infinito",
     imageUrl: cleanImage
@@ -1710,6 +2664,7 @@ function orderItemFromProduct(p) {
     quantity: 1,
     name: p.name,
     price: p.price,
+    priceCents: Number.isFinite(Number(p.priceCents)) ? Number(p.priceCents) : priceCentsFromValue(p.price),
     description: p.description || "",
     stock: p.stock || "infinito",
     type: p.type || "product",
@@ -1723,6 +2678,11 @@ function orderItemDetails(item, panel) {
     productId: item.productId,
     name: item.name || current?.name || "Produto removido",
     price: item.price || current?.price || "valor indisponível",
+    priceCents: Number.isFinite(Number(item.priceCents))
+      ? Number(item.priceCents)
+      : Number.isFinite(Number(current?.priceCents))
+        ? Number(current.priceCents)
+        : priceCentsFromValue(item.price || current?.price),
     description: item.description || current?.description || "",
     stock: item.stock || current?.stock || "infinito",
     type: item.type || current?.type || "product",
@@ -1737,7 +2697,7 @@ function orderTotals(order, panel) {
   const summary = (order.items || []).reduce((currentSummary, item) => {
     const details = orderItemDetails(item, panel);
     const quantity = Math.max(1, Number(item.quantity) || 1);
-    const unit = parsePrice(details.price);
+    const unit = amountFromDetails(details);
 
     currentSummary.quantity += quantity;
     if (unit === null) currentSummary.unknown += quantity;
@@ -1831,6 +2791,77 @@ function successOrderLine(order, panel) {
   });
   return lines.join(", ") || "Pedido personalizado 1x";
 }
+function cleanTranscriptText(value) {
+  return String(value || "")
+    .replace(/\r/g, "")
+    .replace(/\u0000/g, "")
+    .slice(0, 1800);
+}
+function transcriptFileName(order, status) {
+  return `transcript-${status}-${String(order.id || "pedido").replace(/[^\w-]/g, "")}.txt`;
+}
+function orderTranscriptHeader(order, panel, status) {
+  const totals = orderTotals(order, panel);
+  const lines = [
+    "DRAGON STORE - TRANSCRIPT DE PEDIDO",
+    `Pedido: #${order.id}`,
+    `Status: ${status}`,
+    `Cliente: ${order.username || "cliente"} (${order.userId || "sem-id"})`,
+    `Atendente: ${order.assignedAdminName || order.closedByAdminName || "nao assumido"} (${order.assignedAdminId || order.closedByAdminId || "sem-id"})`,
+    `Pagamento: ${paymentStatusLabel(order)}`,
+    `Total: ${totalLine(order, panel)}`,
+    `Total numerico: ${money(totals.amount)}`,
+    `Criado em: ${order.createdAt || ""}`,
+    `Pago em: ${order.paidAt || ""}`,
+    `Comprovante em: ${order.paymentProofSubmittedAt || ""}`,
+    `Comprovante URL: ${order.paymentProofLatestUrl || ""}`,
+    `Entregue em: ${order.deliveredAt || ""}`,
+    `Entregue por: ${order.deliveredByAdminName || ""} (${order.deliveredByAdminId || ""})`,
+    `Fechado em: ${order.closedAt || ""}`,
+    `Cancelado em: ${order.cancelledAt || ""}`,
+    `Canal: ${order.channelId || ""}`,
+    "",
+    "ITENS:",
+    ...(order.items || []).map(item => {
+      const details = orderItemDetails(item, panel);
+      const quantity = Math.max(1, Number(item.quantity) || 1);
+      return `- ${details.name} | ${details.price} | qtd ${quantity} | tipo ${details.type || "product"}`;
+    }),
+    ""
+  ];
+  if (Array.isArray(order.mysteryResults) && order.mysteryResults.length) {
+    lines.push("CAIXAS PIX / SORTEIOS:");
+    lines.push(mysteryResultsText(order.mysteryResults));
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+async function collectChannelTranscript(channel, limit = 80) {
+  if (!channel?.messages?.fetch) return "Mensagens indisponiveis.";
+  const messages = await channel.messages.fetch({ limit }).catch(() => null);
+  if (!messages) return "Nao foi possivel buscar mensagens do canal.";
+  return [...messages.values()]
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+    .map(message => {
+      const author = `${message.author?.tag || message.author?.username || "desconhecido"} (${message.author?.id || "sem-id"})`;
+      const content = cleanTranscriptText(message.content);
+      const embeds = (message.embeds || []).map(embed => [
+        embed.title ? `[embed: ${cleanTranscriptText(embed.title)}]` : "",
+        embed.description ? cleanTranscriptText(embed.description) : ""
+      ].filter(Boolean).join(" ")).filter(Boolean).join(" ");
+      const attachments = message.attachments?.size
+        ? [...message.attachments.values()].map(file => file.url).join(", ")
+        : "";
+      return `[${new Date(message.createdTimestamp).toISOString()}] ${author}: ${[content, embeds, attachments ? `Anexos: ${attachments}` : ""].filter(Boolean).join(" | ") || "(sem texto)"}`;
+    })
+    .join("\n");
+}
+async function buildOrderTranscriptAttachment(channel, order, panel, status) {
+  const header = orderTranscriptHeader(order, panel, status);
+  const messages = await collectChannelTranscript(channel);
+  const text = `${header}\nMENSAGENS RECENTES DO CARRINHO:\n${messages}\n`;
+  return new AttachmentBuilder(Buffer.from(text, "utf8"), { name: transcriptFileName(order, status) });
+}
 function completionChannelId() {
   return String(process.env.COMPLETION_CHANNEL_ID || config.completion?.channelId || DEFAULT_COMPLETION_CHANNEL_ID).trim();
 }
@@ -1903,7 +2934,7 @@ async function sendSuccessFeed(guild, order, panel) {
   await channel.send({ embeds: [embed] });
   return true;
 }
-async function sendCompletionReceipt(guild, order, panel) {
+async function sendCompletionReceipt(guild, order, panel, sourceChannel = null) {
   if (!completionFeedEnabled()) return false;
 
   const channelId = completionChannelId();
@@ -1924,14 +2955,22 @@ async function sendCompletionReceipt(guild, order, panel) {
     )
     .setTimestamp(new Date(order.closedAt || Date.now()));
 
+  const transcript = sourceChannel
+    ? await buildOrderTranscriptAttachment(sourceChannel, order, panel, "finalizado").catch(error => {
+        console.log(`Nao consegui gerar transcript da compra ${order.id}: ${error.message}`);
+        return null;
+      })
+    : null;
+
   await channel.send({
     content: `Compra finalizada! <@${order.userId}> - ${products}`,
     embeds: [embed],
+    files: transcript ? [transcript] : [],
     allowedMentions: { users: [order.userId] }
   });
   return true;
 }
-async function sendCancellationNotice(guild, order, panel, actor) {
+async function sendCancellationNotice(guild, order, panel, actor, sourceChannel = null) {
   if (!cancellationFeedEnabled()) return false;
   if (actor?.id && actor.id !== order.userId && config.cancellation?.notifyAdminCancels !== true) return false;
 
@@ -1953,9 +2992,17 @@ async function sendCancellationNotice(guild, order, panel, actor) {
     )
     .setTimestamp(new Date(order.cancelledAt || Date.now()));
 
+  const transcript = sourceChannel
+    ? await buildOrderTranscriptAttachment(sourceChannel, order, panel, "cancelado").catch(error => {
+        console.log(`Nao consegui gerar transcript do cancelamento ${order.id}: ${error.message}`);
+        return null;
+      })
+    : null;
+
   await channel.send({
     content: `<@${order.userId}> compra cancelada.`,
     embeds: [embed],
+    files: transcript ? [transcript] : [],
     allowedMentions: { users: [order.userId] }
   });
   return true;
@@ -3539,6 +4586,7 @@ async function handleConfigButton(interaction) {
     resetPanel.configMessageChannelId = s.channelId;
     resetPanel.configMessageId = s.messageId;
     savePanel(s.guildId, resetPanel, s.scopeId);
+    writeAuditLog(interaction, "panel.reset", { scopeId: s.scopeId, panelId: resetPanel.id });
     await refreshConfig(sessionId);
     return interaction.reply({ content: "Painel resetado para vazio.", ephemeral: true });
   }
@@ -3552,6 +4600,8 @@ async function handleModal(interaction) {
   const s = await sessionOrReply(interaction, sessionId);
   if (!s) return;
   const panel = getPanel(s.guildId, s.scopeId);
+  let auditAction = "panel.updated";
+  let auditDetails = { scopeId: s.scopeId, panelId: panel.id, field };
   if (field === "title") panel.title = interaction.fields.getTextInputValue("title").trim();
   if (field === "desc") panel.description = interaction.fields.getTextInputValue("desc").trim();
   if (field === "image") {
@@ -3593,6 +4643,7 @@ async function handleModal(interaction) {
     recovered.configMessageChannelId = s.channelId;
     recovered.configMessageId = s.messageId;
     savePanel(s.guildId, recovered, s.scopeId);
+    writeAuditLog(interaction, "panel.linked", { scopeId: s.scopeId, panelId: recovered.id, productCount: recovered.products.length, sourceChannelId: ch.id, sourceMessageId: msg.id });
     await refreshConfig(sessionId);
     return interaction.reply({ content: `Painel vinculado e recuperado de <#${ch.id}> com **${recovered.products.length}** produtos.`, ephemeral: true });
   }
@@ -3621,6 +4672,9 @@ async function handleModal(interaction) {
         imageUrl
       })
     });
+    const newProduct = panel.products[panel.products.length - 1];
+    auditAction = "product.created";
+    auditDetails = { ...auditDetails, productId: newProduct.id, productName: newProduct.name };
   }
   if (field === "mystery") {
     if (panel.products.length >= 25) return interaction.reply({ content: "Limite de 25 produtos atingido.", ephemeral: true });
@@ -3633,11 +4687,15 @@ async function handleModal(interaction) {
       stock: interaction.fields.getTextInputValue("stock").trim() || "infinito",
       rewards: parseRewardLines(interaction.fields.getTextInputValue("rewards"))
     });
+    const newProduct = panel.products[panel.products.length - 1];
+    auditAction = "product.created";
+    auditDetails = { ...auditDetails, productId: newProduct.id, productName: newProduct.name, type: "mystery_box", rewardCount: newProduct.rewards.length };
   }
   if (field === "edit") {
     const target = product(panel, productId);
     if (!target) return interaction.reply({ content: "Produto não encontrado. Reabra o configurador e tente de novo.", ephemeral: true });
     const wasMysteryBox = isMysteryBox(target);
+    const before = { ...target };
 
     const patch = normalizeProductInput({
       name: interaction.fields.getTextInputValue("name"),
@@ -3660,6 +4718,13 @@ async function handleModal(interaction) {
       if (imageUrl && !validUrl(imageUrl)) return interaction.reply({ content: "URL da foto inválida. Use link http/https ou deixe vazio.", ephemeral: true });
       target.imageUrl = imageUrl;
     }
+    auditAction = "product.updated";
+    auditDetails = {
+      ...auditDetails,
+      productId: target.id,
+      productName: target.name,
+      changedFields: changedFieldNames(before, target, ["name", "price", "description", "stock", "imageUrl", "type", "rewards"])
+    };
   }
   if (field === "rewards") {
     const target = product(panel, productId);
@@ -3667,8 +4732,11 @@ async function handleModal(interaction) {
 
     target.type = "mystery_box";
     target.rewards = parseRewardLines(interaction.fields.getTextInputValue("rewards"));
+    auditAction = "product.rewards_updated";
+    auditDetails = { ...auditDetails, productId: target.id, productName: target.name, rewardCount: target.rewards.length };
   }
   savePanel(s.guildId, panel, s.scopeId);
+  writeAuditLog(interaction, auditAction, auditDetails);
   await refreshConfig(sessionId);
   return interaction.reply({ content: "Atualizado.", ephemeral: true });
 }
@@ -3697,10 +4765,14 @@ async function handleRemoveConfirm(interaction) {
   const panel = getPanel(s.guildId, s.scopeId);
   const before = panel.products.length;
   const removeSet = new Set(ids);
+  const removedProducts = panel.products
+    .filter(p => removeSet.has(p.id))
+    .map(p => ({ id: p.id, name: p.name, price: p.price }));
   panel.products = panel.products.filter(p => !removeSet.has(p.id));
   const removed = before - panel.products.length;
 
   savePanel(s.guildId, panel, s.scopeId);
+  writeAuditLog(interaction, "product.removed", { scopeId: s.scopeId, panelId: panel.id, removed, products: removedProducts });
   s.removeIds = [];
   await refreshConfig(sessionId);
   return interaction.update({ content: `${removed} produto(s) removido(s).`, components: [] });
@@ -3763,6 +4835,7 @@ async function handlePresetSelect(interaction) {
   if (!ok) return interaction.reply({ content: "Preset não encontrado.", ephemeral: true });
 
   savePanel(s.guildId, panel, s.scopeId);
+  writeAuditLog(interaction, "panel.preset_applied", { scopeId: s.scopeId, panelId: panel.id, preset: presetKey, productCount: panel.products.length });
   await refreshConfig(sessionId);
 
   const preset = PRODUCT_PRESETS[presetKey];
@@ -3840,6 +4913,7 @@ async function openManualCartCommand(context, targetUser) {
   const db = readOrders();
   db.orders[id] = order;
   writeOrders(db);
+  persistOrderRelationalAsync(db, order, panel);
 
   const intro = new EmbedBuilder()
     .setTitle(`Carrinho aberto #${id}`)
@@ -3858,7 +4932,7 @@ async function openManualCartCommand(context, targetUser) {
   await ch.send({
     content: `<@${targetUser.id}>`,
     embeds: [intro, cartEmbed(order, panel)],
-    components: [productSelect(panel, `cartadd:${id}`), cartButtons(id)],
+    components: [productSelect(panel, `cartadd:${id}`), ...cartActionRows(id)],
     allowedMentions: { users: [targetUser.id] }
   });
   await ch.send({ embeds: [staffChoiceEmbed(order, guild.id)], components: staffChoiceRows(id, false) });
@@ -3881,7 +4955,7 @@ function cartText(order, panel) {
   const base = order.items.map(item => {
     const p = orderItemDetails(item, panel);
     const quantity = Math.max(1, Number(item.quantity) || 1);
-    const unit = parsePrice(p.price);
+    const unit = amountFromDetails(p);
     const subtotal = unit === null
       ? ""
       : discountPercent > 0
@@ -3902,7 +4976,7 @@ ${mysteryResultsText(order.mysteryResults)}`;
 }
 function cartEmbed(order, panel) {
   const totals = orderTotals(order, panel);
-  const statusLabel = order.status === "open" ? "Aberto" : order.status === "cancelled" ? "Cancelado" : "Fechado";
+  const statusLabel = orderStatusLabel(order.status);
   const firstImage = (order.items || [])
     .map(item => orderItemDetails(item, panel).imageUrl)
     .find(url => url && validUrl(url));
@@ -3913,6 +4987,8 @@ function cartEmbed(order, panel) {
     .addFields(
       { name: "Cliente", value: `<@${order.userId}>`, inline: true },
       { name: "Status", value: statusLabel, inline: true },
+      { name: "Pagamento", value: paymentStatusLabel(order), inline: true },
+      { name: "Entrega", value: deliveryStatusLabel(order), inline: true },
       { name: "Atendente", value: order.assignedAdminId ? `<@${order.assignedAdminId}>` : "Ainda não assumido", inline: true },
       { name: "Itens", value: String(totals.quantity), inline: true },
       { name: "Total estimado", value: totalLine(order, panel), inline: true }
@@ -3921,6 +4997,14 @@ function cartEmbed(order, panel) {
 
   const discountText = discountLine(order);
   if (discountText) embed.addFields({ name: "Desconto", value: discountText, inline: false });
+  embed.addFields({ name: "Checklist", value: `\`\`\`\n${orderChecklist(order)}\n\`\`\``, inline: false });
+  if (order.paymentProofSubmittedAt) {
+    embed.addFields({
+      name: "Comprovante",
+      value: proofSubmittedAtText(order),
+      inline: true
+    });
+  }
   if (firstImage) embed.setThumbnail(firstImage);
   return embed;
 }
@@ -3928,9 +5012,19 @@ function cartButtons(orderId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`call:${orderId}`).setLabel("Chamar ADM").setEmoji("📣").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`view:${orderId}`).setLabel("Ver carrinho").setEmoji("🧾").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`paid:${orderId}`).setLabel("Marcar pago").setEmoji("💵").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar compra").setEmoji("✅").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`cancel:${orderId}`).setLabel("Cancelar compra").setEmoji("✖️").setStyle(ButtonStyle.Danger)
   );
+}
+function proofButtonRow(orderId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`proof:${orderId}`).setLabel("Enviar comprovante").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`deliver:${orderId}`).setLabel("Entregar produto").setStyle(ButtonStyle.Primary)
+  );
+}
+function cartActionRows(orderId) {
+  return [cartButtons(orderId), proofButtonRow(orderId)];
 }
 function commandHelpEmbed(member) {
   const prefix = config.prefix || "!";
@@ -3948,11 +5042,14 @@ function commandHelpEmbed(member) {
     "`/setup-ticket` - envia o painel de ticket.",
     "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
     "`/status-loja` ou `!status-loja` - mostra resumo da loja.",
+    "`/pedidos` ou `!pedidos` - lista pedidos abertos e permite assumir o proximo.",
     "`/diagnostico` ou `!diagnostico` - mostra saude do bot, KV, Pix, paineis e carrinhos."
   ];
   const salesCommands = [
     "`/addcar` ou `!addcar [pesquisa]` - busca produtos de todos os paineis do servidor e pergunta a quantidade antes de adicionar ao carrinho.",
     "`!pix` ou `!assumir` - assume o carrinho atual e envia o Pix do ADM.",
+    "`/pago`, `!pago` ou `!marcarpago` - marca o pagamento manual do carrinho atual.",
+    "`/entregar` ou `!entregar key/link/mensagem` - salva a entrega manual e envia para o cliente.",
     "`!concluircompra` ou `!concluir` - conclui o carrinho atual.",
     "`!cancelarcompra` ou `!cancelar` - cancela e apaga o carrinho atual.",
     "`/avaliacao` ou `!avaliacao` - finaliza carrinho e pede avaliacao.",
@@ -3997,6 +5094,64 @@ async function sendHelpCommand(context) {
   if (isAdmin(context.member)) return context.reply("Nao consegui mandar DM. Use `/help` para ver os comandos em modo privado.").catch(() => null);
   return context.reply({ embeds: [embed] }).catch(() => null);
 }
+function guildOpenOrders(guildId) {
+  return Object.values(readOrders().orders || {})
+    .filter(order => (!order.guildId || order.guildId === guildId) && order.status === ORDER_STATUS.OPEN)
+    .sort((a, b) => Date.parse(a.createdAt || "") - Date.parse(b.createdAt || ""));
+}
+function orderQueueLine(order, index) {
+  const panel = getOrderPanel(order, order.guildId);
+  const assigned = order.assignedAdminId ? `<@${order.assignedAdminId}>` : "sem ADM";
+  const createdAt = Date.parse(order.createdAt || "");
+  const created = Number.isFinite(createdAt) ? `<t:${Math.floor(createdAt / 1000)}:R>` : "sem data";
+  return [
+    `**${index + 1}. #${order.id}** - <@${order.userId}> - ${totalLine(order, panel)}`,
+    `Canal: <#${order.channelId}> | ${paymentStatusLabel(order)} | ${deliveryStatusLabel(order)} | ${assigned} | ${created}`
+  ].join("\n");
+}
+function openOrdersEmbed(guildId) {
+  const orders = guildOpenOrders(guildId);
+  const unassigned = orders.filter(order => !order.assignedAdminId).length;
+  const lines = orders.slice(0, 10).map(orderQueueLine);
+  return new EmbedBuilder()
+    .setTitle("Pedidos abertos")
+    .setDescription(lines.length ? lines.join("\n\n") : "Nenhum pedido aberto agora.")
+    .setColor(0x28f6a1)
+    .addFields(
+      { name: "Fila", value: `${orders.length} aberto(s), ${unassigned} sem ADM`, inline: true },
+      { name: "Ordem", value: "Mais antigos primeiro", inline: true }
+    )
+    .setFooter({ text: "Use o canal mencionado para abrir o carrinho. O botao assume o pedido mais antigo sem ADM." })
+    .setTimestamp();
+}
+function openOrdersRows() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("orders:next").setLabel("Assumir proximo").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("orders:refresh").setLabel("Atualizar").setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+async function showOpenOrders(context) {
+  if (!isAdmin(context.member)) return actionReply(context, { content: "So ADM pode ver pedidos abertos.", ephemeral: true });
+  return actionReply(context, {
+    embeds: [openOrdersEmbed(actionGuildId(context))],
+    components: openOrdersRows(),
+    ephemeral: true
+  });
+}
+async function handleOpenOrdersButton(interaction) {
+  if (!await requireAdminInteraction(interaction, "So ADM pode mexer na fila de pedidos.")) return;
+  const [, action] = interaction.customId.split(":");
+  if (action === "refresh") {
+    return interaction.update({ embeds: [openOrdersEmbed(interaction.guildId)], components: openOrdersRows() });
+  }
+  const next = guildOpenOrders(interaction.guildId).find(order => !order.assignedAdminId);
+  if (!next) {
+    return interaction.reply({ content: "Nao tem pedido aberto sem ADM agora.", ephemeral: true });
+  }
+  return assumeOrder(interaction, next.id);
+}
 function buildStoreStatusEmbed(guildId, scopeId = "default") {
   const panel = getPanel(guildId, scopeId);
   const db = readOrders();
@@ -4038,7 +5193,101 @@ function buildStoreStatusEmbed(guildId, scopeId = "default") {
     .setFooter({ text: "Valores são estimativas a partir dos preços cadastrados; pagamento continua manual via Pix." })
     .setTimestamp();
 }
-function buildDiagnosticsEmbed(guildId) {
+const PERMISSION_LABELS = new Map(Object.entries(PermissionFlagsBits).map(([name, value]) => [value, name]));
+function permissionName(permission) {
+  return String(PERMISSION_LABELS.get(permission) || permission)
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/_/g, " ");
+}
+function channelPermissionNames(channel, label = "") {
+  if (String(label).startsWith("categoria")) return [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.ManageChannels
+  ];
+  if (channel?.isTextBased?.()) return [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.EmbedLinks,
+    PermissionFlagsBits.AttachFiles,
+    PermissionFlagsBits.ReadMessageHistory
+  ];
+  return [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels];
+}
+async function discordPermissionWarnings(guild, panels = [], staff = null) {
+  const warnings = [];
+  if (!guild) return ["Servidor Discord indisponivel no contexto do comando."];
+  const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+  if (!me) return ["Nao consegui carregar o membro do bot para validar permissoes."];
+
+  const basePermissions = [
+    PermissionFlagsBits.ManageChannels,
+    PermissionFlagsBits.ManageRoles,
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.EmbedLinks,
+    PermissionFlagsBits.AttachFiles,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.ManageMessages
+  ];
+  const missingBase = basePermissions.filter(permission => !me.permissions.has(permission));
+  if (missingBase.length) warnings.push(`Bot sem permissao global: ${missingBase.map(permissionName).join(", ")}.`);
+
+  const roleIds = [
+    ["cargo ADM", config.adminRoleId],
+    ["cargo cliente", configuredCustomerRoleId(guild.id)],
+    ["cargo premium/revendedor", resellerRoleId()]
+  ].filter(([, roleId]) => roleId);
+  for (const [label, roleId] of roleIds) {
+    const role = await guild.roles.fetch(roleId).catch(() => null);
+    if (!role) {
+      warnings.push(`${label} (${roleId}) nao existe ou o bot nao consegue ver.`);
+      continue;
+    }
+    if (label === "cargo cliente" && role.comparePositionTo(me.roles.highest) >= 0) {
+      warnings.push(`Cargo do bot precisa ficar acima do cargo cliente (${role.name}) para aplicar automaticamente.`);
+    }
+  }
+
+  const channelTargets = [
+    ["categoria de carrinhos", config.categories?.cartOpen],
+    ["categoria de fechados", config.categories?.closed],
+    ["categoria de tickets", config.categories?.ticketOpen],
+    ["canal do painel de ticket", config.ticketPanel?.channelId],
+    ["canal de vendas concluidas", completionChannelId()],
+    ["canal de cancelamentos", cancellationChannelId()],
+    ["canal de avaliacoes", reviewConfig().channelId],
+    ["painel de atendimento", staff?.panelChannelId],
+    ...panels.flatMap(panel => [
+      [`painel publicado ${panel.title || panel.id}`, panel.publishedChannelId],
+      [`canal alvo ${panel.title || panel.id}`, panel.channelId]
+    ])
+  ];
+
+  const checked = new Set();
+  for (const [label, channelId] of channelTargets) {
+    if (!channelId || checked.has(channelId)) continue;
+    checked.add(channelId);
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      warnings.push(`${label} (${channelId}) nao existe ou o bot nao consegue ver.`);
+      continue;
+    }
+    if (String(label).startsWith("categoria") && channel.type !== ChannelType.GuildCategory) {
+      warnings.push(`${label} (<#${channelId}>) nao e uma categoria; criacao/movimento de carrinhos pode falhar.`);
+    }
+    const perms = channel.permissionsFor(me);
+    if (!perms) {
+      warnings.push(`Nao consegui ler permissoes do bot em ${label} (<#${channelId}>).`);
+      continue;
+    }
+    const missing = channelPermissionNames(channel, label).filter(permission => !perms.has(permission));
+    if (missing.length) warnings.push(`Bot sem ${missing.map(permissionName).join(", ")} em ${label} (<#${channelId}>).`);
+  }
+
+  return warnings;
+}
+async function buildDiagnosticsEmbed(guild) {
+  const guildId = guild?.id || String(guild || "");
   const panelStore = readPanels();
   const guildStore = ensurePanelStore(panelStore, guildId);
   const panels = allPublicPanels(guildStore);
@@ -4047,25 +5296,33 @@ function buildDiagnosticsEmbed(guildId) {
   const staffProfiles = Object.values(staff.users || {});
   const guildOrders = Object.values(ordersDb.orders || {}).filter(order => !order.guildId || order.guildId === guildId);
   const openOrders = guildOrders.filter(order => order.status === "open");
+  const processingOrders = guildOrders.filter(order => isOrderProcessing(order));
   const closedOrders = guildOrders.filter(order => order.status === "closed");
   const cancelledOrders = guildOrders.filter(order => ["cancelled", "canceled"].includes(String(order.status)));
   const productsCount = panels.reduce((sum, panel) => sum + (panel.products || []).length, 0);
   const publishedCount = panels.filter(panel => panel.publishedChannelId && panel.publishedMessageId).length;
   const staffWithPix = staffProfiles.filter(profile => profile.pixKey).length;
   const onlineStaff = staffProfiles.filter(profile => profile.online && profile.pixKey).length;
+  const auditCount = (ordersDb.auditLogs || []).filter(entry => !entry.guildId || entry.guildId === guildId).length;
   const warnings = [];
 
-  if (!kvEnabled()) warnings.push("KV nao configurado: deploy pode perder JSON local em host read-only.");
+  if (!postgresEnabled()) warnings.push("DATABASE_URL ausente: finalizacao transacional, auditoria relacional e ranking em banco ficam limitados ao JSON/KV.");
+  if (!kvEnabled() && !postgresEnabled()) warnings.push("KV/Postgres nao configurados: deploy pode perder JSON local em host read-only.");
   if (!process.env.PUBLIC_STORE_API_TOKEN?.trim()) warnings.push("PUBLIC_STORE_API_TOKEN ausente: site nao consegue ler API publica do bot.");
   if (!productsCount) warnings.push("Nenhum produto salvo nos paineis do bot.");
   if (!publishedCount) warnings.push("Nenhum painel publicado salvo/vinculado.");
   if (!staffWithPix) warnings.push("Nenhum ADM com Pix configurado.");
   if (!onlineStaff) warnings.push("Nenhum ADM ON com Pix.");
   if (!staff.backupMessageId) warnings.push("Backup do Pix/painel ainda nao salvo no Discord.");
+  const staleProcessingOrders = processingOrders.filter(isOrderProcessingStale);
+  if (staleProcessingOrders.length) warnings.push(`${staleProcessingOrders.length} carrinho(s) preso(s) em processing ha mais de 10 minutos.`);
+  warnings.push(...await discordPermissionWarnings(guild, panels, staff));
 
-  const persistenceLine = kvEnabled()
-    ? `KV ativo (${BOT_KV_PREFIX})`
-    : "JSON local/memoria";
+  const persistenceParts = [
+    postgresEnabled() ? `Postgres ativo (${BOT_DB_PREFIX})` : "",
+    kvEnabled() ? `KV ativo (${BOT_KV_PREFIX})` : ""
+  ].filter(Boolean);
+  const persistenceLine = persistenceParts.length ? persistenceParts.join("\n") : "JSON local/memoria";
   const staffPanelLine = staff.panelChannelId && staff.panelMessageId
     ? `<#${staff.panelChannelId}> / \`${staff.panelMessageId}\``
     : "Nao vinculado";
@@ -4077,8 +5334,9 @@ function buildDiagnosticsEmbed(guildId) {
     .addFields(
       { name: "Persistencia", value: persistenceLine, inline: true },
       { name: "Paineis", value: `${panels.length} painel(is)\n${productsCount} produto(s)\n${publishedCount} publicado(s)`, inline: true },
-      { name: "Carrinhos", value: `${openOrders.length} aberto(s)\n${closedOrders.length} fechado(s)\n${cancelledOrders.length} cancelado(s)`, inline: true },
+      { name: "Carrinhos", value: `${openOrders.length} aberto(s)\n${processingOrders.length} processando\n${closedOrders.length} fechado(s)\n${cancelledOrders.length} cancelado(s)`, inline: true },
       { name: "Atendimento", value: `${staffWithPix} ADM(s) com Pix\n${onlineStaff} ADM(s) ON\nPainel: ${staffPanelLine}`, inline: false },
+      { name: "Auditoria", value: `${auditCount} evento(s) recentes salvos`, inline: true },
       { name: "Site/API", value: `Token publico: ${process.env.PUBLIC_STORE_API_TOKEN?.trim() ? "configurado" : "faltando"}\nScan paineis: ${process.env.PUBLIC_STORE_SCAN_CHANNELS === "false" ? "manual" : "ativo"}\nInvite: ${publicDiscordInviteUrl(process.env.DISCORD_INVITE_URL)}`, inline: false },
       { name: "Alertas", value: warningLine.slice(0, 1024), inline: false }
     )
@@ -4089,7 +5347,7 @@ async function sendDiagnosticsCommand(context) {
   if (!isAdmin(context.member)) {
     return actionReply(context, { content: "So ADM pode ver diagnostico do bot.", ephemeral: true });
   }
-  return actionReply(context, { embeds: [buildDiagnosticsEmbed(actionGuildId(context))], ephemeral: true });
+  return actionReply(context, { embeds: [await buildDiagnosticsEmbed(context.guild)], ephemeral: true });
 }
 async function openCart(interaction) {
   await interaction.deferReply({ ephemeral: true });
@@ -4105,6 +5363,7 @@ async function openCart(interaction) {
   if (!panel) return actionReply(interaction, { content: "Painel antigo. Use `!configds`, clique em **Vincular painel** e cole o link desta mensagem.", ephemeral: true });
   const p = product(panel, interaction.values[0]);
   if (!p) return actionReply(interaction, { content: "Produto não encontrado.", ephemeral: true });
+  if (!productHasStock(p, 1)) return actionReply(interaction, { content: stockUnavailableMessage(p, 1), ephemeral: true });
   await resetSelectMessage(interaction, saleMessage(panel));
   const discount = discountForMember(interaction.member);
   const id = orderId("order");
@@ -4127,8 +5386,9 @@ async function openCart(interaction) {
     closedAt: null
   };
   const db = readOrders(); db.orders[id] = order; writeOrders(db);
+  persistOrderRelationalAsync(db, order, panel);
   const intro = new EmbedBuilder().setTitle(`🛒 Carrinho aberto #${id}`).setDescription([config.messages.cartWelcome, discount ? discountLine(order) : ""].filter(Boolean).join("\n\n")).setColor(parseColor(panel.color)).addFields({ name: "Cliente", value: `<@${interaction.user.id}>`, inline: true }, { name: "ID da compra", value: id, inline: true });
-  await ch.send({ content: `<@${interaction.user.id}>`, embeds: [intro, productInfoEmbed(p, panel, "Produto inicial"), cartEmbed(order, panel)], components: [productSelect(panel, `cartadd:${id}`), cartButtons(id)] });
+  await ch.send({ content: `<@${interaction.user.id}>`, embeds: [intro, productInfoEmbed(p, panel, "Produto inicial"), cartEmbed(order, panel)], components: [productSelect(panel, `cartadd:${id}`), ...cartActionRows(id)] });
   await sendStaffChoiceMessage(ch, order, interaction.guildId);
 
   await sendSafeDM(interaction.user.id, {
@@ -4224,6 +5484,7 @@ async function handleQuickOrderSubmit(interaction) {
   const db = readOrders();
   db.orders[id] = order;
   writeOrders(db);
+  persistOrderRelationalAsync(db, order, panel);
 
   const intro = new EmbedBuilder()
     .setTitle(`🛒 Carrinho aberto #${id}`)
@@ -4237,7 +5498,7 @@ async function handleQuickOrderSubmit(interaction) {
   await ch.send({
     content: `<@${interaction.user.id}>`,
     embeds: [intro, quickOrderAnswersEmbed(order, panel), cartEmbed(order, panel)],
-    components: [productSelect(panel, `cartadd:${id}`), cartButtons(id)]
+    components: [productSelect(panel, `cartadd:${id}`), ...cartActionRows(id)]
   });
   await sendStaffChoiceMessage(ch, order, interaction.guildId);
 
@@ -4260,17 +5521,32 @@ async function handleQuickOrderSubmit(interaction) {
   return actionReply(interaction, { content: `Carrinho criado: ${ch}`, ephemeral: true });
 }
 async function addCart(interaction) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true }).catch(() => null);
   const [, id] = interaction.customId.split(":");
-  const db = readOrders(); const order = orderForAction(db, id, interaction);
-  if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
-  if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return interaction.reply({ content: "Você não pode alterar esse carrinho.", ephemeral: true });
+  const db = readOrders(); const order = orderForAction(db, id, interaction, false);
+  if (!order) return actionReply(interaction, { content: "Carrinho inexistente.", ephemeral: true });
+  if (isOrderProcessing(order)) {
+    return actionReply(interaction, { content: "Essa compra ja esta sendo finalizada. Aguarde alguns segundos.", ephemeral: true });
+  }
+  if (order.status === ORDER_STATUS.CLOSED) {
+    return actionReply(interaction, { content: `Compra #${order.id} ja foi finalizada.`, ephemeral: true });
+  }
+  if (order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) {
+    return actionReply(interaction, { content: `Compra #${order.id} ja foi cancelada.`, ephemeral: true });
+  }
+  if (!canStartOrderProcessing(order)) return actionReply(interaction, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
+  if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Você não pode alterar esse carrinho.", ephemeral: true });
   const panel = getOrderPanel(order, actionGuildId(interaction)); const p = product(panel, interaction.values[0]);
-  if (!p) return interaction.reply({ content: "Produto não encontrado.", ephemeral: true });
-  await resetSelectMessage(interaction, { components: [productSelect(panel, `cartadd:${order.id}`), cartButtons(order.id)] });
+  if (!p) return actionReply(interaction, { content: "Produto não encontrado.", ephemeral: true });
+  if (!productHasStock(p, 1)) return actionReply(interaction, { content: stockUnavailableMessage(p, 1), ephemeral: true });
+  await resetSelectMessage(interaction, { components: [productSelect(panel, `cartadd:${order.id}`), ...cartActionRows(order.id)] });
   const item = order.items.find(i => i.productId === p.id);
   if (item) item.quantity += 1; else order.items.push(orderItemFromProduct(p));
+  touchOrder(order);
+  appendAuditLog(db, interaction, "order.item_added", { order, productId: p.id, productName: p.name, quantity: 1, source: "cart_select" });
   db.orders[order.id] = order; writeOrders(db);
-  await interaction.reply({ content: `Adicionado: ${productIcon(p)} **${p.name}** — ${p.price}`, ephemeral: true });
+  persistOrderRelationalAsync(db, order, panel);
+  await actionReply(interaction, { content: `Adicionado: ${productIcon(p)} **${p.name}** — ${p.price}`, ephemeral: true });
   return interaction.channel.send({ embeds: [productInfoEmbed(p, panel, "Produto adicionado"), cartEmbed(order, panel)] });
 }
 function canEditOrder(member, userId, order) {
@@ -4583,6 +5859,7 @@ async function handleAddCartQuantitySubmit(interaction) {
   const entry = addCartCatalogEntry(session, parts[2]);
   if (!entry) return interaction.reply({ content: "Produto nao encontrado nessa lista. Clique em Atualizar e tente de novo.", ephemeral: true });
   const p = entry.product || {};
+  if (!productHasStock(p, quantity)) return interaction.reply({ content: stockUnavailableMessage(p, quantity), ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
 
   const item = order.items.find(current => current.productId === entry.key);
@@ -4593,8 +5870,19 @@ async function handleAddCartQuantitySubmit(interaction) {
     order.items.push(next);
   }
 
+  touchOrder(order);
+  appendAuditLog(db, interaction, "order.item_added", {
+    order,
+    productId: entry.sourceProductId || entry.productId,
+    productName: p.name,
+    sourcePanelId: entry.panelId,
+    sourcePanelTitle: entry.panelTitle,
+    quantity,
+    source: "addcar"
+  });
   db.orders[order.id] = order;
   writeOrders(db);
+  persistOrderRelationalAsync(db, order, panel);
   rememberAddCartSession(session);
   await refreshAddCartMessage(interaction, session, order, panel);
   await interaction.editReply({ content: `Adicionado: ${productIcon(p)} **${p.name || "Produto"}** x${quantity}.\nTotal atualizado: **${totalLine(order, panel)}**` });
@@ -4764,24 +6052,241 @@ async function finishCurrentCartWithReview(context, options = {}) {
   }
   return finishCart(context, order.id, { ...options, requestReview: true });
 }
+async function markOrderPaid(context, id) {
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
+  }
+  if (!isAdmin(context.member)) {
+    return actionReply(context, { content: "So ADM pode marcar pagamento.", ephemeral: true });
+  }
+
+  const guildId = actionGuildId(context);
+  const db = readOrders();
+  const order = orderForAction(db, id, context, false);
+  if (!order) return actionReply(context, { content: "Carrinho inexistente.", ephemeral: true });
+  if (isOrderProcessing(order)) return actionReply(context, { content: "Essa compra esta sendo finalizada agora.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CLOSED) return actionReply(context, { content: "Essa compra ja foi finalizada.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) {
+    return actionReply(context, { content: "Essa compra ja foi cancelada.", ephemeral: true });
+  }
+  if (order.status !== ORDER_STATUS.OPEN) {
+    return actionReply(context, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
+  }
+  if (order.paymentStatus === "marked_paid" || order.paidAt) {
+    return actionReply(context, { content: `Pagamento ja marcado por ${order.paidByAdminId ? `<@${order.paidByAdminId}>` : "um ADM"}.`, ephemeral: true });
+  }
+
+  const actor = actionUser(context);
+  const panel = getOrderPanel(order, guildId);
+  const totals = orderTotals(order, panel);
+  const now = new Date().toISOString();
+  order.paymentStatus = "marked_paid";
+  order.paidAt = now;
+  order.paidByAdminId = actor.id;
+  order.paidByAdminName = context.member?.displayName || actor.username;
+  order.paidAmount = totals.amount;
+  order.paidGrossAmount = totals.grossAmount;
+  order.paidDiscountAmount = totals.discountAmount;
+  touchOrder(order);
+  appendAuditLog(db, context, "order.payment_marked_paid", {
+    order,
+    paidAmount: order.paidAmount,
+    grossAmount: order.paidGrossAmount,
+    discountAmount: order.paidDiscountAmount
+  });
+  db.orders[order.id] = order;
+  writeOrders(db);
+  await persistOrderRelationalAsync(db, order, panel);
+
+  await context.channel.send({
+    content: `<@${order.userId}> Pagamento do pedido #${order.id} marcado como recebido por **${order.paidByAdminName || "ADM"}**.`,
+    embeds: [cartEmbed(order, panel)],
+    allowedMentions: { users: [order.userId] }
+  }).catch(() => null);
+
+  return actionReply(context, { content: `Pagamento do carrinho #${order.id} marcado como recebido (${money(totals.amount)}).`, ephemeral: true });
+}
+function proofSubmittedAtText(order) {
+  const timestamp = new Date(order.paymentProofSubmittedAt || "").getTime();
+  if (!Number.isFinite(timestamp)) return "recebido";
+  return `recebido <t:${Math.floor(timestamp / 1000)}:R>`;
+}
+function deliveryModal(order) {
+  return new ModalBuilder()
+    .setCustomId(`deliverymodal:${order.id}`)
+    .setTitle(`Entrega #${order.id}`)
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("delivery")
+          .setLabel("Mensagem de entrega")
+          .setPlaceholder("Cole key, link, conta ou instrucoes de entrega.")
+          .setStyle(TextInputStyle.Paragraph)
+          .setMinLength(2)
+          .setMaxLength(1800)
+          .setRequired(true)
+      )
+    );
+}
+async function requestDelivery(interaction, id) {
+  const db = readOrders();
+  const order = orderForAction(db, id, interaction, false);
+  if (!order) return interaction.reply({ content: "Carrinho inexistente.", ephemeral: true });
+  if (!isAdmin(interaction.member)) return interaction.reply({ content: "So ADM pode entregar produto.", ephemeral: true });
+  if (isOrderProcessing(order)) return interaction.reply({ content: "Essa compra esta sendo finalizada agora.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CLOSED) return interaction.reply({ content: "Essa compra ja foi finalizada.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) return interaction.reply({ content: "Essa compra ja foi cancelada.", ephemeral: true });
+  if (order.status !== ORDER_STATUS.OPEN) return interaction.reply({ content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
+  if (order.deliveredAt) return interaction.reply({ content: "Esse pedido ja foi marcado como entregue.", ephemeral: true });
+  if (order.paymentStatus !== "marked_paid" && !order.paidAt) {
+    return interaction.reply({ content: "Marque o pagamento como recebido antes de entregar.", ephemeral: true });
+  }
+  return interaction.showModal(deliveryModal(order));
+}
+async function deliverOrder(context, id, deliveryText) {
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
+  }
+  if (!isAdmin(context.member)) {
+    return actionReply(context, { content: "So ADM pode entregar produto.", ephemeral: true });
+  }
+
+  const guildId = actionGuildId(context);
+  const db = readOrders();
+  const order = orderForAction(db, id, context, false);
+  if (!order) return actionReply(context, { content: "Carrinho inexistente.", ephemeral: true });
+  if (isOrderProcessing(order)) return actionReply(context, { content: "Essa compra esta sendo finalizada agora.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CLOSED) return actionReply(context, { content: "Essa compra ja foi finalizada.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) {
+    return actionReply(context, { content: "Essa compra ja foi cancelada.", ephemeral: true });
+  }
+  if (order.status !== ORDER_STATUS.OPEN) {
+    return actionReply(context, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
+  }
+  if (order.deliveredAt) {
+    return actionReply(context, { content: `Pedido ja entregue por ${order.deliveredByAdminId ? `<@${order.deliveredByAdminId}>` : "um ADM"}.`, ephemeral: true });
+  }
+  if (order.paymentStatus !== "marked_paid" && !order.paidAt) {
+    return actionReply(context, { content: "Marque o pagamento como recebido antes de entregar.", ephemeral: true });
+  }
+
+  const actor = actionUser(context);
+  const deliveryMessage = clampText(deliveryText, 1800, "Produto entregue.");
+  const panel = getOrderPanel(order, guildId);
+  const now = new Date().toISOString();
+  order.deliveredAt = now;
+  order.deliveredByAdminId = actor.id;
+  order.deliveredByAdminName = context.member?.displayName || actor.username;
+  order.deliveryMessage = deliveryMessage;
+  touchOrder(order);
+  appendAuditLog(db, context, "order.delivered", {
+    order,
+    deliveredBy: actor.id,
+    deliveryPreview: deliveryMessage.slice(0, 120)
+  });
+  db.orders[order.id] = order;
+  writeOrders(db);
+  await persistOrderRelationalAsync(db, order, panel);
+
+  const publicDelivery = clampText(deliveryMessage, 1500, "Produto entregue.");
+  await context.channel.send({
+    content: `<@${order.userId}> Produto entregue no pedido #${order.id} por **${order.deliveredByAdminName || "ADM"}**.\n\n||${publicDelivery}||`,
+    embeds: [cartEmbed(order, panel)],
+    allowedMentions: { users: [order.userId] }
+  }).catch(() => null);
+
+  const dmSent = await sendSafeDM(order.userId, {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("Produto entregue")
+        .setDescription(`Pedido #${order.id}\n\n${deliveryMessage}`.slice(0, 4096))
+        .setColor(parseColor(panel.color))
+        .setTimestamp()
+    ]
+  });
+
+  const dmText = dmSent ? "Tambem enviei no privado do cliente." : "Nao consegui enviar DM; a entrega ficou registrada no carrinho.";
+  return actionReply(context, { content: `Entrega salva no pedido #${order.id}. ${dmText}`, ephemeral: true });
+}
+async function requestPaymentProof(interaction, id) {
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ ephemeral: true }).catch(() => null);
+  }
+
+  const db = readOrders();
+  const order = orderForAction(db, id, interaction, false);
+  if (!order) return actionReply(interaction, { content: "Carrinho inexistente.", ephemeral: true });
+  if (isOrderProcessing(order)) return actionReply(interaction, { content: "Essa compra esta sendo finalizada agora.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CLOSED) return actionReply(interaction, { content: "Essa compra ja foi finalizada.", ephemeral: true });
+  if (order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) {
+    return actionReply(interaction, { content: "Essa compra ja foi cancelada.", ephemeral: true });
+  }
+  if (order.status !== ORDER_STATUS.OPEN) {
+    return actionReply(interaction, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
+  }
+  if (interaction.user.id !== order.userId && !isAdmin(interaction.member)) {
+    return actionReply(interaction, { content: "Sem permissao para solicitar comprovante neste carrinho.", ephemeral: true });
+  }
+
+  const targetUserId = order.userId;
+  const key = imageUploadKey(actionGuildId(interaction), interaction.channel.id, targetUserId);
+  paymentProofUploads.set(key, {
+    orderId: order.id,
+    guildId: actionGuildId(interaction),
+    channelId: interaction.channel.id,
+    userId: targetUserId,
+    requestedById: interaction.user.id,
+    expiresAt: Date.now() + PROOF_UPLOAD_TTL_MS
+  });
+
+  if (interaction.user.id === targetUserId) {
+    return actionReply(interaction, {
+      content: "Envie o print do comprovante aqui neste carrinho nos proximos 2 minutos.",
+      ephemeral: true
+    });
+  }
+
+  await interaction.channel.send({
+    content: `<@${targetUserId}> envie o print do comprovante aqui neste carrinho nos proximos 2 minutos.`,
+    allowedMentions: { users: [targetUserId] }
+  }).catch(() => null);
+
+  return actionReply(interaction, { content: `Solicitei o comprovante para <@${targetUserId}>.`, ephemeral: true });
+}
 async function cancelCart(interaction, id) {
+  if (interaction.isRepliable?.() && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ ephemeral: true }).catch(() => null);
+  }
   const actor = actionUser(interaction);
   const guildId = actionGuildId(interaction);
-  const db = readOrders(); const order = orderForAction(db, id, interaction);
-  if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  const db = readOrders(); const order = orderForAction(db, id, interaction, false);
+  if (!order) return actionReply(interaction, { content: "Carrinho inexistente.", ephemeral: true });
+  if (recoverStaleProcessingOrder(db, order, interaction)) writeOrders(db);
+  if (order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) {
+    return actionReply(interaction, { content: "Esse carrinho ja foi cancelado.", ephemeral: true });
+  }
+  if (order.status === ORDER_STATUS.CLOSED) {
+    return actionReply(interaction, { content: "Esse carrinho ja foi finalizado.", ephemeral: true });
+  }
+  if (isOrderProcessing(order)) {
+    return actionReply(interaction, { content: "Esse carrinho esta sendo processado agora. Aguarde alguns segundos.", ephemeral: true });
+  }
+  if (order.status !== ORDER_STATUS.OPEN) return actionReply(interaction, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
   if (actor.id !== order.userId && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Sem permissao para cancelar esse carrinho.", ephemeral: true });
 
   const panel = getOrderPanel(order, guildId);
   const now = new Date().toISOString();
-  order.status = "cancelled";
+  order.status = ORDER_STATUS.CANCELLED;
   order.cancelledAt = now;
   order.closedAt = now;
   order.cancelledById = actor.id;
   order.cancelledByName = interaction.member?.displayName || actor.username;
-  order.channelDeletedAt = now;
+  touchOrder(order);
+  appendAuditLog(db, interaction, "order.cancelled", { order, reason: "manual_cancel" });
   db.orders[order.id] = order;
   writeOrders(db);
-  await sendCancellationNotice(interaction.guild, order, panel, actor).catch(error => {
+  await persistOrderRelationalAsync(db, order, panel);
+  await sendCancellationNotice(interaction.guild, order, panel, actor, interaction.channel).catch(error => {
     console.log(`Nao consegui enviar aviso de cancelamento ${order.id}: ${error.message}`);
   });
 
@@ -4795,37 +6300,131 @@ async function cancelCart(interaction, id) {
     ]
   });
 
-  await actionReply(interaction, { content: `Carrinho #${order.id} cancelado. Apagando este chat agora.`, ephemeral: true });
-  setTimeout(() => interaction.channel.delete(`Carrinho ${order.id} cancelado`).catch(error => {
-    console.log(`Nao consegui apagar carrinho cancelado ${order.id}: ${error.message}`);
-  }), 1500);
+  await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "cancelado") : `carrinho-${safeName(order.username)}-cancelado-${order.id}`).catch(() => null);
+  if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
+  await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
+  scheduleCartDeletion(order);
+  await interaction.channel.send({ content: `<@${order.userId}> Compra #${order.id} cancelada. Este canal sera apagado automaticamente em 3 dias.`, embeds: [cartEmbed(order, panel)] }).catch(() => null);
+  await actionReply(interaction, { content: `Carrinho #${order.id} cancelado e movido para fechados.`, ephemeral: true });
 }
 async function finishCart(interaction, id, options = {}) {
+  if (interaction.isRepliable?.() && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ ephemeral: true }).catch(() => null);
+  }
   const actor = actionUser(interaction);
   const guildId = actionGuildId(interaction);
-  const db = readOrders(); const order = orderForAction(db, id, interaction);
-  if (!order || order.status !== "open") return actionReply(interaction, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  const db = readOrders(); const order = orderForAction(db, id, interaction, false);
+  if (!order) return actionReply(interaction, { content: "Carrinho inexistente.", ephemeral: true });
+  if (recoverStaleProcessingOrder(db, order, interaction)) writeOrders(db);
+  if (isOrderProcessing(order)) {
+    return actionReply(interaction, { content: "Essa compra ja esta sendo finalizada. Aguarde alguns segundos.", ephemeral: true });
+  }
+  if (order.status === ORDER_STATUS.CLOSED) {
+    return actionReply(interaction, { content: `Compra #${order.id} ja foi finalizada.`, ephemeral: true });
+  }
+  if (order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) {
+    return actionReply(interaction, { content: `Compra #${order.id} ja foi cancelada.`, ephemeral: true });
+  }
+  if (!canStartOrderProcessing(order)) return actionReply(interaction, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
   if (config.settings.finalizeCartOnlyAdmins && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Só admin finaliza. Clique em **Chamar ADM**.", ephemeral: true });
   if (!Array.isArray(order.items) || !order.items.length) {
     return actionReply(interaction, { content: "Esse carrinho ainda esta vazio. Adicione um produto antes de finalizar.", ephemeral: true });
   }
   const panel = getOrderPanel(order, guildId);
-  const mysteryResults = Array.isArray(order.mysteryResults) && order.mysteryResults.length
-    ? order.mysteryResults
-    : rollMysteryBoxes(order, panel);
-  if (mysteryResults.length) order.mysteryResults = mysteryResults;
-  order.status = "closed";
-  order.closedAt = new Date().toISOString();
-  order.closedByAdminId = actor.id;
-  order.closedByAdminName = interaction.member?.displayName || actor.username;
-  recordCustomerSpend(db, order, panel);
-  db.orders[order.id] = order;
+  const stockIssues = orderStockIssues(guildId, order, panel);
+  if (stockIssues.length) {
+    return actionReply(interaction, {
+      content: `Nao da para finalizar por falta de estoque:\n${stockIssues.map(issue => `- ${issue.productName}: ${issue.stock} disponivel, ${issue.requested} solicitado`).join("\n")}`,
+      ephemeral: true
+    });
+  }
+  let mysteryResults = [];
+  const applyFinalState = processingAt => {
+    order.status = ORDER_STATUS.PROCESSING;
+    order.processingStartedAt = processingAt;
+    order.processingByAdminId = actor.id;
+    order.processingByAdminName = interaction.member?.displayName || actor.username;
+    touchOrder(order);
+    appendAuditLog(db, interaction, "order.finalize_started", { order, itemCount: order.items.length, requestReview: Boolean(options.requestReview) });
+
+    mysteryResults = Array.isArray(order.mysteryResults) && order.mysteryResults.length
+      ? order.mysteryResults
+      : rollMysteryBoxes(order, panel);
+    if (mysteryResults.length) order.mysteryResults = mysteryResults;
+    if (order.paymentStatus !== "marked_paid" && !order.paidAt) {
+      const paidTotals = orderTotals(order, panel);
+      order.paymentStatus = "marked_paid";
+      order.paidAt = processingAt;
+      order.paidByAdminId = actor.id;
+      order.paidByAdminName = interaction.member?.displayName || actor.username;
+      order.paidAmount = paidTotals.amount;
+      order.paidGrossAmount = paidTotals.grossAmount;
+      order.paidDiscountAmount = paidTotals.discountAmount;
+      appendAuditLog(db, interaction, "order.payment_auto_marked_paid", {
+        order,
+        paidAmount: order.paidAmount,
+        reason: "finalize_without_manual_paid_step"
+      });
+    }
+    const stockAdjustments = consumeOrderStock(guildId, order, panel);
+    if (stockAdjustments.length) {
+      appendAuditLog(db, interaction, "order.stock_consumed", { order, stockAdjustments });
+    }
+    if (!order.deliveredAt) {
+      order.deliveredAt = processingAt;
+      order.deliveredByAdminId = actor.id;
+      order.deliveredByAdminName = interaction.member?.displayName || actor.username;
+      order.deliveryMessage = order.deliveryMessage || "Entrega confirmada na finalizacao manual.";
+      appendAuditLog(db, interaction, "order.delivery_auto_marked", {
+        order,
+        reason: "finalize_without_manual_delivery_step"
+      });
+    }
+    order.status = ORDER_STATUS.CLOSED;
+    order.closedAt = new Date().toISOString();
+    order.closedByAdminId = actor.id;
+    order.closedByAdminName = interaction.member?.displayName || actor.username;
+    order.finalizedFromProcessingAt = processingAt;
+    delete order.processingStartedAt;
+    delete order.processingByAdminId;
+    delete order.processingByAdminName;
+    touchOrder(order);
+    recordCustomerSpend(db, order, panel);
+    appendAuditLog(db, interaction, "order.finalized", {
+      order,
+      totalAmount: order.spentAmount,
+      grossAmount: order.grossAmount,
+      discountAmount: order.discountAmount,
+      mysteryRolls: mysteryResults.length
+    });
+    db.orders[order.id] = order;
+  };
+
+  if (!claimOrderActionLock(order)) {
+    return actionReply(interaction, { content: "Essa compra ja esta sendo finalizada. Aguarde alguns segundos.", ephemeral: true });
+  }
+
+  try {
+  const postgresFinalize = await finalizeOrderWithPostgres(db, order, panel, interaction, applyFinalState);
+  if (!postgresFinalize.ok) {
+    if (postgresFinalize.error) {
+      return actionReply(interaction, {
+        content: `Nao consegui travar essa compra no banco transacional: ${postgresFinalize.error.message}. Tente de novo em alguns segundos.`,
+        ephemeral: true
+      });
+    }
+    return actionReply(interaction, {
+      content: `Essa compra ja esta em estado ${orderStatusLabel(postgresFinalize.status)} no banco transacional.`,
+      ephemeral: true
+    });
+  }
+  if (!postgresFinalize.used) applyFinalState(new Date().toISOString());
   writeOrders(db);
   await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "fechado") : `carrinho-${safeName(order.username)}-fechado-${order.id}`).catch(() => null);
   if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
   const roleGranted = await grantCustomerRole(interaction.guild, order.userId);
-  await sendCompletionReceipt(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar recibo da venda ${order.id}: ${error.message}`));
+  await sendCompletionReceipt(interaction.guild, order, panel, interaction.channel).catch(error => console.log(`Nao consegui enviar recibo da venda ${order.id}: ${error.message}`));
   await sendSuccessFeed(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar feed da venda ${order.id}: ${error.message}`));
   scheduleCartDeletion(order);
   const thanks = config.messages.purchaseThanks.replaceAll("{id}", order.id);
@@ -4855,6 +6454,9 @@ ${cartText(order, panel)}`.slice(0, 4096))
   const reviewText = reviewResult ? ` ${reviewResult.message}` : "";
   const roleText = roleGranted ? "" : " Nao consegui aplicar o cargo cliente; confira se o cargo do bot esta acima do cargo cliente.";
   return actionReply(interaction, { content: mysteryResults.length ? `Compra #${order.id} finalizada e caixa surpresa sorteada.${reviewText}${roleText}` : `Compra #${order.id} finalizada.${reviewText}${roleText}`, ephemeral: true });
+  } finally {
+    releaseOrderActionLock(order);
+  }
 }
 
 function ticketPanelEmbed() { return new EmbedBuilder().setTitle(config.ticketPanel.title).setDescription(config.ticketPanel.description).setColor(parseColor(config.ticketPanel.embedColor, 0x2b2d31)); }
@@ -4883,6 +6485,87 @@ async function closeTicket(interaction, id) {
   const seconds = Number(config.settings.deleteTicketAfterCloseSeconds ?? 5);
   await interaction.reply({ content: `Ticket fechado. Apagando em ${seconds}s.` });
   setTimeout(() => interaction.channel.delete(`Ticket ${id} fechado`).catch(() => null), Math.max(1, seconds) * 1000);
+}
+async function handlePaymentProofUpload(message) {
+  const key = imageUploadKey(message.guild.id, message.channel.id, message.author.id);
+  const pending = paymentProofUploads.get(key);
+  if (!pending) return false;
+
+  if (Date.now() > pending.expiresAt) {
+    paymentProofUploads.delete(key);
+    await message.reply("O tempo para enviar o comprovante expirou. Clique em **Enviar comprovante** de novo.").catch(() => null);
+    return false;
+  }
+
+  const attachment = message.attachments.find(isImageAttachment);
+  if (!attachment) {
+    if (message.attachments.size) {
+      await message.reply("Recebi um anexo, mas ele nao parece ser imagem. Envie PNG, JPG, WEBP ou GIF.").catch(() => null);
+      return true;
+    }
+    return false;
+  }
+
+  const db = readOrders();
+  const order = db.orders?.[pending.orderId];
+  if (!order || order.guildId !== message.guild.id || order.channelId !== message.channel.id || order.userId !== message.author.id) {
+    paymentProofUploads.delete(key);
+    await message.reply("Nao consegui vincular esse comprovante ao carrinho. Clique em **Enviar comprovante** novamente.").catch(() => null);
+    return true;
+  }
+  if (isOrderProcessing(order)) {
+    paymentProofUploads.delete(key);
+    await message.reply("Essa compra esta sendo finalizada agora. Aguarde alguns segundos.").catch(() => null);
+    return true;
+  }
+  if (order.status === ORDER_STATUS.CLOSED || order.status === ORDER_STATUS.CANCELLED || order.status === ORDER_STATUS.CANCELED) {
+    paymentProofUploads.delete(key);
+    await message.reply("Esse carrinho ja foi fechado. O comprovante nao foi alterado.").catch(() => null);
+    return true;
+  }
+  if (order.status !== ORDER_STATUS.OPEN) {
+    await message.reply(`Carrinho em estado ${orderStatusLabel(order.status)}. O comprovante nao foi salvo.`).catch(() => null);
+    return true;
+  }
+
+  const panel = getOrderPanel(order, message.guild.id);
+  const now = new Date().toISOString();
+  const proof = {
+    url: attachment.url,
+    proxyUrl: attachment.proxyURL || attachment.proxyUrl || "",
+    name: attachment.name || "comprovante",
+    contentType: attachment.contentType || "",
+    size: attachment.size || 0,
+    messageId: message.id,
+    submittedAt: now,
+    submittedById: message.author.id,
+    requestedById: pending.requestedById || ""
+  };
+  if (!Array.isArray(order.paymentProofs)) order.paymentProofs = [];
+  order.paymentProofs.push(proof);
+  order.paymentProofSubmittedAt = now;
+  order.paymentProofLatestUrl = attachment.url;
+  if (!order.paymentStatus || order.paymentStatus === "pending") order.paymentStatus = "proof_received";
+  touchOrder(order);
+  appendAuditLog(db, message, "order.payment_proof_uploaded", {
+    order,
+    attachmentUrl: attachment.url,
+    attachmentName: attachment.name,
+    messageId: message.id
+  });
+  db.orders[order.id] = order;
+  writeOrders(db);
+  await persistOrderRelationalAsync(db, order, panel);
+  paymentProofUploads.delete(key);
+
+  await message.reply("Comprovante recebido e salvo no pedido. A equipe vai conferir o pagamento.").catch(() => null);
+  await message.channel.send({
+    content: `<@&${config.adminRoleId}> comprovante enviado no pedido #${order.id} por <@${order.userId}>.`,
+    embeds: [cartEmbed(order, panel)],
+    components: [cartButtons(order.id)],
+    allowedMentions: { roles: [config.adminRoleId], users: [order.userId] }
+  }).catch(() => null);
+  return true;
 }
 async function handlePendingImageUpload(message) {
   const key = imageUploadKey(message.guild.id, message.channel.id, message.author.id);
@@ -4936,6 +6619,14 @@ async function handlePendingImageUpload(message) {
   }
 
   savePanel(s.guildId, panel, s.scopeId);
+  writeAuditLog(message, pending.target === "product" ? "product.image_updated" : "panel.image_updated", {
+    scopeId: s.scopeId,
+    panelId: panel.id,
+    target: pending.target,
+    productId: pending.productId || "",
+    imageMessageId: savedImage.messageId || "",
+    imageUrl: savedImage.url
+  });
   imageUploads.delete(key);
   await refreshConfig(pending.sessionId);
 
@@ -4956,17 +6647,26 @@ async function handlePendingImageUpload(message) {
 
 client.once("ready", async () => {
   console.log(`Bot online como ${client.user.tag}`);
+  const recoveredProcessing = recoverStaleProcessingOrders();
+  if (recoveredProcessing) console.log(`${recoveredProcessing} carrinho(s) preso(s) em processing foram reabertos automaticamente.`);
   for (const guild of client.guilds.cache.values()) {
     await ensureStaffState(guild, null).catch(error => {
       console.log(`Nao consegui recuperar atendimento em ${guild.id}: ${error.message}`);
     });
     await refreshStaffPanel(guild.id).catch(() => null);
+    const panelStore = readPanels();
+    const guildStore = ensurePanelStore(panelStore, guild.id);
+    const permissionWarnings = await discordPermissionWarnings(guild, allPublicPanels(guildStore), getStaffGuild(guild.id)).catch(error => [`Falha ao validar permissoes: ${error.message}`]);
+    if (permissionWarnings.length) {
+      console.log(`Alertas de permissao em ${guild.name || guild.id}:\n- ${permissionWarnings.join("\n- ")}`);
+    }
   }
   scheduleExistingClosedCarts();
 });
 
 client.on("messageCreate", async message => {
   if (message.author.bot || !message.guild) return;
+  if (await handlePaymentProofUpload(message)) return;
   if (await handlePendingImageUpload(message)) return;
   const rawContent = message.content.trim();
   const content = rawContent.toLowerCase();
@@ -4998,6 +6698,14 @@ client.on("messageCreate", async message => {
 
   if ([`${config.prefix || "!"}concluircompra`, `${config.prefix || "!"}concluir`, `${config.prefix || "!"}finalizarcompra`, `${config.prefix || "!"}finalizar`].includes(content)) {
     return finishCurrentCartCommand(message);
+  }
+
+  if ([`${config.prefix || "!"}pago`, `${config.prefix || "!"}marcarpago`, `${config.prefix || "!"}pagamento`].includes(content)) {
+    return markPaidCurrentCartCommand(message);
+  }
+
+  if (content.startsWith(`${config.prefix || "!"}entregar`)) {
+    return deliverCurrentCartCommand(message, rawContent);
   }
 
   if ([`${config.prefix || "!"}cancelarcompra`, `${config.prefix || "!"}cancelar`].includes(content)) {
@@ -5071,6 +6779,10 @@ client.on("messageCreate", async message => {
     await message.delete().catch(() => null);
     return sendDiagnosticsCommand(message);
   }
+  if (content === `${config.prefix || "!"}pedidos`) {
+    await message.delete().catch(() => null);
+    return showOpenOrders(message);
+  }
   if (content === `${config.prefix || "!"}ranking-gastos`) {
     return sendSpendRankingMessage(message);
   }
@@ -5134,7 +6846,18 @@ async function handleInteraction(interaction) {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para ver o status da loja.")) return;
         return interaction.reply({ embeds: [buildStoreStatusEmbed(interaction.guildId, interaction.channelId)], ephemeral: true });
       }
+      if (interaction.commandName === "pedidos") return showOpenOrders(interaction);
       if (interaction.commandName === "diagnostico") return sendDiagnosticsCommand(interaction);
+      if (interaction.commandName === "pago") {
+        const order = findOrderInChannel(readOrders(), interaction, false);
+        if (!order) return actionReply(interaction, { content: "Nao encontrei carrinho neste canal.", ephemeral: true });
+        return markOrderPaid(interaction, order.id);
+      }
+      if (interaction.commandName === "entregar") {
+        const order = findOrderInChannel(readOrders(), interaction, false);
+        if (!order) return actionReply(interaction, { content: "Nao encontrei carrinho neste canal.", ephemeral: true });
+        return requestDelivery(interaction, order.id);
+      }
       if (interaction.commandName === "addcar") {
         return startAddCartFlow(interaction, interaction.options.getString("pesquisa") || "");
       }
@@ -5157,6 +6880,7 @@ async function handleInteraction(interaction) {
         const [, period, page] = interaction.customId.split(":");
         return showSpendRanking(interaction, period, Number(page) || 0);
       }
+      if (interaction.customId.startsWith("orders:")) return handleOpenOrdersButton(interaction);
       if (interaction.customId.startsWith("quickbuy:")) {
         const [, panelId] = interaction.customId.split(":");
         return handleQuickBuyButton(interaction, panelId);
@@ -5165,6 +6889,9 @@ async function handleInteraction(interaction) {
       const [act, id] = interaction.customId.split(":");
       if (act === "call") return callAdmin(interaction, id, "order");
       if (act === "view") return viewCart(interaction, id);
+      if (act === "paid") return markOrderPaid(interaction, id);
+      if (act === "proof") return requestPaymentProof(interaction, id);
+      if (act === "deliver") return requestDelivery(interaction, id);
       if (act === "finish") return finishCart(interaction, id);
       if (act === "cancel") return cancelCart(interaction, id);
       if (act === "assume") return assumeOrder(interaction, id);
@@ -5176,6 +6903,10 @@ async function handleInteraction(interaction) {
     if (interaction.isModalSubmit() && interaction.customId.startsWith("addcarsearch:")) return handleAddCartSearchSubmit(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("addcarqty:")) return handleAddCartQuantitySubmit(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("quickmodal:")) return handleQuickOrderSubmit(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("deliverymodal:")) {
+      const [, id] = interaction.customId.split(":");
+      return deliverOrder(interaction, id, interaction.fields.getTextInputValue("delivery"));
+    }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal:")) return handleModal(interaction);
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId.startsWith("preset:")) return handlePresetSelect(interaction);
@@ -5203,7 +6934,9 @@ if (!token) {
 }
 function shutdown(signal) {
   console.log(`${signal} recebido; salvando persistencia pendente antes de sair.`);
-  drainKvWriteQueues().finally(() => process.exit(0));
+  drainPersistentWriteQueues()
+    .finally(() => closePostgresPool())
+    .finally(() => process.exit(0));
 }
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));

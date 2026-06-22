@@ -6,11 +6,17 @@
   "scripts": {
     "check": "node --check src/index.js && node --check deploy-commands.js",
     "deploy": "node deploy-commands.js",
+    "db:init": "node scripts/init-postgres.js",
+    "db:migrate-json": "node scripts/migrate-json-to-postgres.js",
     "start": "node src/index.js"
   },
   "dependencies": {
     "discord.js": "^14.23.1",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.1"
+  },
+  "overrides": {
+    "undici": "6.27.0"
   },
   "engines": {
     "node": "20.x"

@@ -27,7 +27,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - `/setupsucess` para definir o canal publico de vendas entregues, com nome do cliente mascarado.
 - `/avaliacao` e `!avaliação` para finalizar carrinho pedindo avaliacao ao cliente.
 - `/ranking-gastos` com ranking paginado de gastos por dia, semana, mes e ano.
-- Cancelamento de compra pelo cliente ou ADM apagando o chat do carrinho na hora.
+- Cancelamento de compra pelo cliente ou ADM bloqueando/movendo o carrinho para historico e apagando automaticamente depois.
 
 ## Instalar
 
@@ -45,6 +45,8 @@ CLIENT_ID=id_da_aplicacao
 GUILD_ID=id_do_servidor
 PUBLIC_STORE_API_TOKEN=gere_um_token_grande_e_dificil
 DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
+# opcional/preparado para migracao transacional
+DATABASE_URL=postgres://usuario:senha@host/db
 # opcionais para escolher/recuperar painel antigo
 PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
 PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado
@@ -150,6 +152,43 @@ Comandos operacionais uteis:
 
 O cargo revendedor/premium `1515835494204706938` recebe 10% de desconto automaticamente quando abre carrinho. O total mostrado no carrinho, Pix, DM, ranking e vendas ja considera esse desconto.
 
+## Banco transacional
+
+O bot continua compativel com JSON local + KV/Upstash, mas quando `DATABASE_URL` estiver configurado ele tambem salva e recupera `panels`, `orders` e `staff` no PostgreSQL. Isso evita perder Pix, paineis e carrinhos em deploy com filesystem read-only.
+
+A base profissional para PostgreSQL/Neon/Supabase esta em `database/postgres-schema.sql`. O schema cobre `bot_json_store`, `guilds`, `panels`, `products`, `orders`, `order_items`, `staff`, `payments`, `stock_items`, `audit_logs`, `customer_stats` e `admin_sales`, com status de pedido `open -> processing -> closed/cancelled` para finalizacao idempotente.
+
+Em runtime, quando o Postgres esta ativo, o bot:
+
+- aplica o schema automaticamente no boot;
+- grava snapshot dos JSONs em `bot_json_store`;
+- espelha paineis, produtos, carrinhos, itens, staff, gastos, vendas e audit logs nas tabelas relacionais;
+- usa trava local e banco como trava na finalizacao: apenas uma chamada consegue fazer `open -> processing`; se outro ADM clicar de novo, o bot nao sorteia caixa, nao soma gasto e nao duplica venda.
+- registra pagamento manual em `payments` quando o ADM usa **Marcar pago** ou `/pago`; o botao **Enviar comprovante** salva o anexo no pedido e no Postgres como `proof_received` ate um ADM validar o pagamento.
+- separa entrega de finalizacao: **Entregar produto**, `/entregar` ou `!entregar` salva a entrega no pedido, manda para o cliente e registra `delivered_at` no Postgres; finalizar direto ainda marca entrega automaticamente para manter o fluxo antigo funcionando.
+- gera transcript TXT com resumo do pedido e mensagens recentes do carrinho ao finalizar/cancelar, anexando nos canais de conclusao/cancelamento quando configurados.
+- controla estoque simples quando o campo `Estoque` e numerico: bloqueia compra sem quantidade suficiente e baixa estoque uma unica vez na finalizacao. Valores como `infinito`, `sob consulta` e `sob demanda` nao sao decrementados.
+
+Se o bot cair depois de marcar uma compra como `processing` e antes de fechar, pedidos presos por mais de 10 minutos no JSON sao reabertos no boot ou na proxima tentativa de finalizar/cancelar. No Postgres, a trava relacional tambem reabre o pedido preso antes de uma nova tentativa de finalizacao.
+
+Para preparar o banco real, configure `DATABASE_URL` e rode:
+
+```bash
+npm run db:init
+```
+
+Use `DATABASE_SSL=false` apenas se seu Postgres local nao usar SSL. Neon/Supabase normalmente funcionam com SSL ligado.
+
+Para migrar os dados que ja existem em `data/panels.json`, `data/orders.json` e `data/staff.json`, rode depois:
+
+```bash
+npm run db:migrate-json
+```
+
+Se `PIX_ENCRYPTION_KEY` estiver configurado, as chaves Pix tambem sao migradas e espelhadas criptografadas na tabela `staff`. Sem essa variavel, o bot continua salvando Pix no snapshot privado usado pela operacao atual, mas nao grava Pix puro nas tabelas relacionais por seguranca.
+
+O painel admin do site tambem registra eventos de seguranca como login aprovado/falho, bloqueio por tentativas, salvar configuracao, sincronizar produtos, testar bot e logout. Se houver Upstash/KV configurado, os eventos ficam em `SITE_ADMIN_AUDIT_KV_KEY`; sem KV, ficam em `/tmp/dragon-store-admin-audit.json` durante a vida da instancia.
+
 ## Site da Dragon Store
 
 O projeto do site fica em `site/`. Ele e separado do bot para publicar facil na Vercel.
@@ -232,7 +271,7 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 4. Use `/ranking-gastos` para ver o ranking por dia, semana, mes ou ano, com 10 clientes por pagina.
 5. Se o slash command ainda nao aparecer, use `!setupsucess` e `!ranking-gastos`.
 
-Carrinhos finalizados ficam visiveis para historico por 3 dias e depois sao apagados automaticamente. Carrinhos cancelados apagam o chat na hora. Para mudar o tempo dos finalizados, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
+Carrinhos finalizados ou cancelados ficam visiveis para historico por 3 dias e depois sao apagados automaticamente. Para mudar o tempo, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
 
 ## Pedido de avaliacao
 
@@ -321,5 +360,7 @@ A recuperacao pelo Discord preserva titulo, descricao, cor, banner, thumbnail, n
 6. Use **Remover produto**, selecione mais de um item e confirme a remocao.
 7. Use `/setup-atendimento`, configure Pix com `/configpix` e fique ON.
 8. Abra outro carrinho e confirme se o Pix vai automaticamente quando houver um unico ADM ON.
+9. Clique em **Enviar comprovante**, envie uma imagem como cliente e confirme que o carrinho mostra `Comprovante recebido` antes do ADM marcar pago.
+10. Use **Marcar pago** e depois **Entregar produto** ou `/entregar`; confira se o checklist muda para pagamento recebido e produto entregue antes da finalizacao.
 9. Adicione uma caixa surpresa, compre e finalize como ADM para verificar o sorteio.
 10. Use `/status-loja` no canal desejado para conferir o resumo daquele painel.

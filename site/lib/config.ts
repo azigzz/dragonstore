@@ -22,6 +22,7 @@ function asProducts(value: unknown): StoreProduct[] {
         id: String(product.id || `fallback-${index + 1}`),
         name: String(product.name || "Produto"),
         price: String(product.price || "A combinar"),
+        priceCents: typeof product.priceCents === "number" ? product.priceCents : null,
         description: String(product.description || "Produto digital da Dragon Store"),
         stock: String(product.stock || "sob consulta"),
         imageUrl: product.imageUrl ? String(product.imageUrl) : "/dragon-store-hero.png",

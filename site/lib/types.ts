@@ -2,6 +2,7 @@ export type StoreProduct = {
   id: string;
   name: string;
   price: string;
+  priceCents?: number | null;
   description: string;
   stock: string;
   imageUrl?: string;
@@ -57,6 +58,7 @@ export type SiteConfig = {
 export type AdminConfigPayload = Omit<SiteConfig, "botApiToken"> & {
   botApiToken?: string;
   botApiTokenConfigured?: boolean;
+  csrfToken?: string;
 };
 
 export type AnalyticsProductSummary = {
