@@ -325,7 +325,7 @@ Os IDs ficam em `config.json`:
     "channelId": "1515799364574904531"
   },
   "review": {
-    "channelId": "1515799364155478138",
+    "channelId": "1516531282975391846",
     "message": "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.",
     "channelPingMessage": "Obrigado pela compra! Deixe sua avaliacao aqui quando puder.",
     "deletePingAfterSeconds": 10

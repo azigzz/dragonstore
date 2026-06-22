@@ -999,6 +999,15 @@ function paymentStatusLabel(order) {
   if (order?.assignedAdminId) return "Aguardando pagamento";
   return "Aguardando ADM";
 }
+function paymentTranscriptLabel(order) {
+  if (order?.paymentStatus === "marked_paid" || order?.paidAt) return "Pago manualmente";
+  if (order?.paymentStatus === "proof_received" || order?.paymentProofSubmittedAt) return "Comprovante recebido";
+  if (order?.assignedAdminId) return "Aguardando pagamento";
+  return "Aguardando ADM";
+}
+function uniqueMentionUsers(...values) {
+  return [...new Set(values.map(value => String(value || "").trim()).filter(Boolean))];
+}
 function deliveryStatusLabel(order) {
   if (order?.deliveredAt) {
     const by = order.deliveredByAdminId ? ` por <@${order.deliveredByAdminId}>` : "";
@@ -1833,7 +1842,7 @@ async function assumeOrder(interaction, id) {
     content: `<@${order.userId}> ✅ Compra #${order.id} assumida por **${order.assignedAdminName}** (<@${interaction.user.id}>).`,
     embeds: [buildPixEmbed(order, panel, profile)],
     components: staffChoiceRows(order.id, true),
-    allowedMentions: { users: [order.userId, interaction.user.id] }
+    allowedMentions: { users: uniqueMentionUsers(order.userId, interaction.user.id) }
   });
 
   await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
@@ -1906,7 +1915,7 @@ async function sendPixCommand(message) {
     content: `<@${order.userId}> Pix enviado por **${order.assignedAdminName || profile.displayName || "ADM"}** (<@${message.author.id}>).`,
     embeds: [buildPixEmbed(order, panel, profile)],
     components: staffChoiceRows(order.id, true),
-    allowedMentions: { users: [order.userId, message.author.id] }
+    allowedMentions: { users: uniqueMentionUsers(order.userId, message.author.id) }
   });
   await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
   return null;
@@ -2808,7 +2817,7 @@ function orderTranscriptHeader(order, panel, status) {
     `Status: ${status}`,
     `Cliente: ${order.username || "cliente"} (${order.userId || "sem-id"})`,
     `Atendente: ${order.assignedAdminName || order.closedByAdminName || "nao assumido"} (${order.assignedAdminId || order.closedByAdminId || "sem-id"})`,
-    `Pagamento: ${paymentStatusLabel(order)}`,
+    `Pagamento: ${paymentTranscriptLabel(order)}`,
     `Total: ${totalLine(order, panel)}`,
     `Total numerico: ${money(totals.amount)}`,
     `Criado em: ${order.createdAt || ""}`,
@@ -2867,6 +2876,9 @@ function completionChannelId() {
 }
 function completionFeedEnabled() {
   return config.completion?.enabled !== false && process.env.COMPLETION_FEED_ENABLED !== "false";
+}
+function completionTranscriptEnabled() {
+  return config.completion?.transcriptEnabled === true || process.env.COMPLETION_TRANSCRIPT_ENABLED === "true";
 }
 function cancellationChannelId() {
   return String(process.env.CANCELLATION_CHANNEL_ID || config.cancellation?.channelId || DEFAULT_CANCELLATION_CHANNEL_ID).trim();
@@ -2955,7 +2967,7 @@ async function sendCompletionReceipt(guild, order, panel, sourceChannel = null) 
     )
     .setTimestamp(new Date(order.closedAt || Date.now()));
 
-  const transcript = sourceChannel
+  const transcript = sourceChannel && completionTranscriptEnabled()
     ? await buildOrderTranscriptAttachment(sourceChannel, order, panel, "finalizado").catch(error => {
         console.log(`Nao consegui gerar transcript da compra ${order.id}: ${error.message}`);
         return null;
