@@ -94,7 +94,7 @@ const paymentProofUploads = new Map();
 const cartDeleteTimers = new Map();
 const publicPanelScanCache = new Map();
 const orderActionLocks = new Set();
-let statusVoiceReconnectTimer = null;
+const statusVoiceReconnectTimers = new Map();
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
 const PROOF_UPLOAD_TTL_MS = 2 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -1125,7 +1125,8 @@ function defaultStaffGuild() {
     backupMessageId: "",
     successChannelId: "",
     successMessageEnabled: false,
-    customerRoleId: ""
+    customerRoleId: "",
+    serverConfig: {}
   };
 }
 function getStaffGuild(guildId) {
@@ -1139,9 +1140,22 @@ function getStaffGuild(guildId) {
 }
 function saveStaffGuild(guildId, staffGuild) {
   const db = readStaff();
-  db.guilds[guildId] = staffGuild;
+  db.guilds[guildId] = { ...defaultStaffGuild(), ...staffGuild, users: staffGuild.users || {}, serverConfig: staffGuild.serverConfig || {} };
   writeStaff(db);
-  persistStaffGuildRelationalAsync(guildId, staffGuild);
+  persistStaffGuildRelationalAsync(guildId, db.guilds[guildId]);
+}
+function serverConfig(guildId) {
+  return getStaffGuild(guildId).serverConfig || {};
+}
+function saveServerConfig(guildId, patch) {
+  const staff = getStaffGuild(guildId);
+  staff.serverConfig = {
+    ...(staff.serverConfig || {}),
+    ...patch,
+    updatedAt: new Date().toISOString()
+  };
+  saveStaffGuild(guildId, staff);
+  return staff.serverConfig;
 }
 function getStaffProfile(guildId, userId) {
   const staff = getStaffGuild(guildId);
@@ -1263,11 +1277,13 @@ function plainText(value) {
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
 }
-function resellerRoleId() {
-  return String(process.env.RESELLER_ROLE_ID || config.resellerRoleId || DEFAULT_RESELLER_ROLE_ID || "").trim();
+function resellerRoleId(guildId = "") {
+  const saved = guildId ? serverConfig(guildId).resellerRoleId : "";
+  return String(saved || process.env.RESELLER_ROLE_ID || config.resellerRoleId || DEFAULT_RESELLER_ROLE_ID || "").trim();
 }
-function resellerDiscountPercent() {
-  const value = Number.parseFloat(String(process.env.RESELLER_DISCOUNT_PERCENT ?? config.resellerDiscountPercent ?? 10).replace(",", "."));
+function resellerDiscountPercent(guildId = "") {
+  const saved = guildId ? serverConfig(guildId).resellerDiscountPercent : undefined;
+  const value = Number.parseFloat(String(saved ?? process.env.RESELLER_DISCOUNT_PERCENT ?? config.resellerDiscountPercent ?? 10).replace(",", "."));
   if (!Number.isFinite(value) || value <= 0) return 0;
   return Math.min(90, value);
 }
@@ -1275,8 +1291,8 @@ function memberHasRole(member, roleId) {
   return Boolean(roleId && member?.roles?.cache?.has(roleId));
 }
 function discountForMember(member) {
-  const roleId = resellerRoleId();
-  const percent = resellerDiscountPercent();
+  const roleId = resellerRoleId(member?.guild?.id || "");
+  const percent = resellerDiscountPercent(member?.guild?.id || "");
   if (!roleId || percent <= 0 || !memberHasRole(member, roleId)) return null;
   return {
     type: "role",
@@ -1527,7 +1543,11 @@ async function recoverStaffBackup(guild, fallbackChannel = null) {
     backupChannelId: backupMessage.channel.id,
     backupMessageId: backupMessage.id
   };
-  for (const key of ["panelChannelId", "panelMessageId", "successChannelId", "customerRoleId"]) {
+  for (const key of ["panelChannelId", "panelMessageId", "successChannelId", "customerRoleId", "serverConfig"]) {
+    if (key === "serverConfig") {
+      if (current.serverConfig && Object.keys(current.serverConfig).length) merged.serverConfig = current.serverConfig;
+      continue;
+    }
     if (current[key]) merged[key] = current[key];
   }
   if (current.successMessageEnabled) merged.successMessageEnabled = current.successMessageEnabled;
@@ -2879,8 +2899,9 @@ async function buildOrderTranscriptAttachment(channel, order, panel, status) {
   const text = `${header}\nMENSAGENS RECENTES DO CARRINHO:\n${messages}\n`;
   return new AttachmentBuilder(Buffer.from(text, "utf8"), { name: transcriptFileName(order, status) });
 }
-function completionChannelId() {
-  return String(process.env.COMPLETION_CHANNEL_ID || config.completion?.channelId || DEFAULT_COMPLETION_CHANNEL_ID).trim();
+function completionChannelId(guildId = "") {
+  const saved = guildId ? serverConfig(guildId).completionChannelId : "";
+  return String(saved || process.env.COMPLETION_CHANNEL_ID || config.completion?.channelId || DEFAULT_COMPLETION_CHANNEL_ID).trim();
 }
 function completionFeedEnabled() {
   return config.completion?.enabled !== false && process.env.COMPLETION_FEED_ENABLED !== "false";
@@ -2888,8 +2909,9 @@ function completionFeedEnabled() {
 function completionTranscriptEnabled() {
   return config.completion?.transcriptEnabled === true || process.env.COMPLETION_TRANSCRIPT_ENABLED === "true";
 }
-function cancellationChannelId() {
-  return String(process.env.CANCELLATION_CHANNEL_ID || config.cancellation?.channelId || DEFAULT_CANCELLATION_CHANNEL_ID).trim();
+function cancellationChannelId(guildId = "") {
+  const saved = guildId ? serverConfig(guildId).cancellationChannelId : "";
+  return String(saved || process.env.CANCELLATION_CHANNEL_ID || config.cancellation?.channelId || DEFAULT_CANCELLATION_CHANNEL_ID).trim();
 }
 function cancellationFeedEnabled() {
   return config.cancellation?.enabled !== false && process.env.CANCELLATION_FEED_ENABLED !== "false";
@@ -2911,6 +2933,7 @@ function configuredCustomerRoleIds(guildId) {
   const staff = getStaffGuild(guildId);
   return [
     staff.customerRoleId,
+    serverConfig(guildId).customerRoleId,
     process.env.CUSTOMER_ROLE_ID,
     config.customerRoleId,
     DEFAULT_CUSTOMER_ROLE_ID
@@ -2940,7 +2963,7 @@ async function grantCustomerRole(guild, userId) {
 async function sendSuccessFeed(guild, order, panel) {
   const staff = getStaffGuild(guild.id);
   if (!staff.successMessageEnabled || !staff.successChannelId) return false;
-  if (staff.successChannelId === completionChannelId()) return false;
+  if (staff.successChannelId === completionChannelId(guild.id)) return false;
 
   const channel = await guild.channels.fetch(staff.successChannelId).catch(() => null);
   if (!channel?.isTextBased()) return false;
@@ -2957,7 +2980,7 @@ async function sendSuccessFeed(guild, order, panel) {
 async function sendCompletionReceipt(guild, order, panel, sourceChannel = null) {
   if (!completionFeedEnabled()) return false;
 
-  const channelId = completionChannelId();
+  const channelId = completionChannelId(guild.id);
   if (!channelId) return false;
 
   const channel = await guild.channels.fetch(channelId).catch(() => null);
@@ -2994,7 +3017,7 @@ async function sendCancellationNotice(guild, order, panel, actor, sourceChannel 
   if (!cancellationFeedEnabled()) return false;
   if (actor?.id && actor.id !== order.userId && config.cancellation?.notifyAdminCancels !== true) return false;
 
-  const channelId = cancellationChannelId();
+  const channelId = cancellationChannelId(guild.id);
   if (!channelId) return false;
 
   const channel = await guild.channels.fetch(channelId).catch(() => null);
@@ -5056,6 +5079,7 @@ function commandHelpEmbed(member) {
   ];
   const setupCommands = [
     "`/configds`, `!configds`, `!painel`, `!loja` ou `!setup` - abre o configurador da loja no canal.",
+    "`/configserver` ou `!configserver` - configura canais, cargos e call de status do servidor.",
     "`/setup-atendimento` ou `!atendimento` - cria/atualiza o painel ON/OFF dos ADMs.",
     "`/configpix` ou `!configpix` - configura Pix do ADM.",
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
@@ -5224,6 +5248,10 @@ function channelPermissionNames(channel, label = "") {
     PermissionFlagsBits.ViewChannel,
     PermissionFlagsBits.ManageChannels
   ];
+  if ([ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(channel?.type)) return [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.Connect
+  ];
   if (channel?.isTextBased?.()) return [
     PermissionFlagsBits.ViewChannel,
     PermissionFlagsBits.SendMessages,
@@ -5255,7 +5283,7 @@ async function discordPermissionWarnings(guild, panels = [], staff = null) {
   const roleIds = [
     ["cargo ADM", config.adminRoleId],
     ["cargo cliente", configuredCustomerRoleId(guild.id)],
-    ["cargo premium/revendedor", resellerRoleId()]
+    ["cargo premium/revendedor", resellerRoleId(guild.id)]
   ].filter(([, roleId]) => roleId);
   for (const [label, roleId] of roleIds) {
     const role = await guild.roles.fetch(roleId).catch(() => null);
@@ -5273,9 +5301,10 @@ async function discordPermissionWarnings(guild, panels = [], staff = null) {
     ["categoria de fechados", config.categories?.closed],
     ["categoria de tickets", config.categories?.ticketOpen],
     ["canal do painel de ticket", config.ticketPanel?.channelId],
-    ["canal de vendas concluidas", completionChannelId()],
-    ["canal de cancelamentos", cancellationChannelId()],
-    ["canal de avaliacoes", reviewConfig().channelId],
+    ["canal de vendas concluidas", completionChannelId(guild.id)],
+    ["canal de cancelamentos", cancellationChannelId(guild.id)],
+    ["canal de avaliacoes", reviewConfig({ guildId: guild.id }).channelId],
+    ["call de status", statusVoiceChannelId(guild.id)],
     ["painel de atendimento", staff?.panelChannelId],
     ...panels.flatMap(panel => [
       [`painel publicado ${panel.title || panel.id}`, panel.publishedChannelId],
@@ -5368,6 +5397,314 @@ async function sendDiagnosticsCommand(context) {
     return actionReply(context, { content: "So ADM pode ver diagnostico do bot.", ephemeral: true });
   }
   return actionReply(context, { embeds: [await buildDiagnosticsEmbed(context.guild)], ephemeral: true });
+}
+function boolText(value) {
+  return value ? "Ligado" : "Desligado";
+}
+function parseBooleanConfig(value, fallback = true) {
+  const text = plainText(value).trim();
+  if (!text) return fallback;
+  if (["1", "sim", "s", "true", "on", "ligado", "ativo", "ativado"].includes(text)) return true;
+  if (["0", "nao", "n", "false", "off", "desligado", "inativo", "desativado"].includes(text)) return false;
+  return fallback;
+}
+function roleMentionOrId(roleId) {
+  return roleId ? `<@&${roleId}>` : "Nao configurado";
+}
+function channelMentionOrId(channelId) {
+  return channelId ? `<#${channelId}>` : "Nao configurado";
+}
+function serverConfigEmbed(guild) {
+  const guildId = guild?.id || "";
+  const statusChannelId = statusVoiceChannelId(guildId);
+  const completionId = completionChannelId(guildId);
+  const cancellationId = cancellationChannelId(guildId);
+  const review = reviewConfig({ guildId });
+  const customerRole = configuredCustomerRoleId(guildId);
+  const resellerRole = resellerRoleId(guildId);
+  const resellerDiscount = resellerDiscountPercent(guildId);
+
+  return new EmbedBuilder()
+    .setTitle("Config do servidor")
+    .setColor(0x28f6a1)
+    .addFields(
+      {
+        name: "Call de status",
+        value: `Status: **${boolText(statusVoiceEnabled(guildId))}**\nCanal: ${channelMentionOrId(statusChannelId)}`,
+        inline: false
+      },
+      {
+        name: "Canais",
+        value: [
+          `Vendas concluidas: ${channelMentionOrId(completionId)}`,
+          `Cancelamentos: ${channelMentionOrId(cancellationId)}`,
+          `Avaliacoes: ${channelMentionOrId(review.channelId)}`
+        ].join("\n"),
+        inline: false
+      },
+      {
+        name: "Cargos e desconto",
+        value: [
+          `Cliente: ${roleMentionOrId(customerRole)}`,
+          `Premium/revendedor: ${roleMentionOrId(resellerRole)}`,
+          `Desconto premium: **${resellerDiscount}%**`
+        ].join("\n"),
+        inline: false
+      }
+    )
+    .setFooter({ text: "As alteracoes ficam salvas no storage do bot, sem editar arquivo no deploy." })
+    .setTimestamp();
+}
+function serverConfigRows() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("cfgsrv:call")
+        .setLabel("Call")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("cfgsrv:channels")
+        .setLabel("Canais")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("cfgsrv:roles")
+        .setLabel("Cargos")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("cfgsrv:reconnect")
+        .setLabel("Reconectar call")
+        .setStyle(ButtonStyle.Success)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("cfgsrv:refresh")
+        .setLabel("Atualizar")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+function serverConfigCallModal(guildId) {
+  return new ModalBuilder()
+    .setCustomId("cfgsrvmodal:call")
+    .setTitle("Configurar call")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("statusVoiceChannelId")
+          .setLabel("ID da call de status")
+          .setPlaceholder("1515799363857809494")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(statusVoiceChannelId(guildId).slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("statusVoiceEnabled")
+          .setLabel("Ligado? sim/nao")
+          .setPlaceholder("sim")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(20)
+          .setRequired(false)
+          .setValue(statusVoiceEnabled(guildId) ? "sim" : "nao")
+      )
+    );
+}
+function serverConfigChannelsModal(guildId) {
+  return new ModalBuilder()
+    .setCustomId("cfgsrvmodal:channels")
+    .setTitle("Configurar canais")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("completionChannelId")
+          .setLabel("Canal de vendas concluidas")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(completionChannelId(guildId).slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("cancellationChannelId")
+          .setLabel("Canal de cancelamentos")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(cancellationChannelId(guildId).slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reviewChannelId")
+          .setLabel("Canal de avaliacoes")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(reviewConfig({ guildId }).channelId.slice(0, 30))
+      )
+    );
+}
+function serverConfigRolesModal(guildId) {
+  return new ModalBuilder()
+    .setCustomId("cfgsrvmodal:roles")
+    .setTitle("Configurar cargos")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("customerRoleId")
+          .setLabel("Cargo cliente")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(configuredCustomerRoleId(guildId).slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("resellerRoleId")
+          .setLabel("Cargo premium/revendedor")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(resellerRoleId(guildId).slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("resellerDiscountPercent")
+          .setLabel("Desconto premium em porcentagem")
+          .setPlaceholder("10")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(10)
+          .setRequired(false)
+          .setValue(String(resellerDiscountPercent(guildId)))
+      )
+    );
+}
+async function showServerConfig(context) {
+  if (!isAdmin(context.member)) {
+    return actionReply(context, { content: "So ADM pode configurar o servidor.", ephemeral: true });
+  }
+  await ensureStaffState(context.guild, context.channel).catch(() => null);
+  return actionReply(context, {
+    embeds: [serverConfigEmbed(context.guild)],
+    components: serverConfigRows(),
+    ephemeral: true
+  });
+}
+async function handleServerConfigButton(interaction) {
+  if (!await requireAdminInteraction(interaction, "So ADM pode configurar o servidor.")) return;
+  await ensureStaffState(interaction.guild, interaction.channel).catch(() => null);
+  const [, action] = interaction.customId.split(":");
+  if (action === "call") return interaction.showModal(serverConfigCallModal(interaction.guildId));
+  if (action === "channels") return interaction.showModal(serverConfigChannelsModal(interaction.guildId));
+  if (action === "roles") return interaction.showModal(serverConfigRolesModal(interaction.guildId));
+  if (action === "reconnect") {
+    await disconnectStatusVoiceChannel(interaction.guildId);
+    await connectStatusVoiceChannel(interaction.guild).catch(error => {
+      console.log(`Falha ao reconectar call via configserver: ${error.message}`);
+    });
+    return interaction.reply({
+      content: `Tentei reconectar na call ${channelMentionOrId(statusVoiceChannelId(interaction.guildId))}.`,
+      embeds: [serverConfigEmbed(interaction.guild)],
+      components: serverConfigRows(),
+      ephemeral: true
+    });
+  }
+  if (action === "refresh") {
+    return interaction.update({
+      embeds: [serverConfigEmbed(interaction.guild)],
+      components: serverConfigRows()
+    });
+  }
+}
+async function validateConfiguredChannel(guild, channelId, types, label) {
+  if (!channelId) return null;
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel) return `${label} (${channelId}) nao existe ou o bot nao consegue ver.`;
+  if (types?.length && !types.includes(channel.type)) return `${label} precisa ser do tipo correto.`;
+  return null;
+}
+async function persistServerConfigStorage(interaction) {
+  await flushPersistentFile(STAFF_FILE).catch(error => {
+    console.log(`Nao consegui confirmar configserver no storage: ${error.message}`);
+  });
+  await saveStaffBackup(interaction.guild, interaction.channel).catch(error => {
+    console.log(`Nao consegui salvar backup do configserver: ${error.message}`);
+  });
+}
+function sanitizeOptionalId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return normalizeChannelId(raw);
+}
+function sanitizeOptionalRoleId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.match(/\d{15,25}/)?.[0] || "";
+}
+async function handleServerConfigModal(interaction) {
+  if (!isAdmin(interaction.member)) {
+    return interaction.reply({ content: "So ADM pode configurar o servidor.", ephemeral: true });
+  }
+  const [, section] = interaction.customId.split(":");
+  await ensureStaffState(interaction.guild, interaction.channel).catch(() => null);
+
+  if (section === "call") {
+    const channelId = sanitizeOptionalId(interaction.fields.getTextInputValue("statusVoiceChannelId"));
+    const enabled = parseBooleanConfig(interaction.fields.getTextInputValue("statusVoiceEnabled"), statusVoiceEnabled(interaction.guildId));
+    if (interaction.fields.getTextInputValue("statusVoiceChannelId").trim() && !channelId) {
+      return interaction.reply({ content: "ID da call invalido.", ephemeral: true });
+    }
+    const channelError = await validateConfiguredChannel(interaction.guild, channelId, [ChannelType.GuildVoice, ChannelType.GuildStageVoice], "Call de status");
+    if (channelError) return interaction.reply({ content: channelError, ephemeral: true });
+    saveServerConfig(interaction.guildId, { statusVoiceChannelId: channelId, statusVoiceEnabled: enabled });
+    await persistServerConfigStorage(interaction);
+    if (enabled) await connectStatusVoiceChannel(interaction.guild).catch(error => console.log(`Falha ao entrar na call configurada: ${error.message}`));
+    else await disconnectStatusVoiceChannel(interaction.guildId);
+  }
+
+  if (section === "channels") {
+    const completionId = sanitizeOptionalId(interaction.fields.getTextInputValue("completionChannelId"));
+    const cancellationId = sanitizeOptionalId(interaction.fields.getTextInputValue("cancellationChannelId"));
+    const reviewId = sanitizeOptionalId(interaction.fields.getTextInputValue("reviewChannelId"));
+    for (const [label, channelId] of [
+      ["Canal de vendas concluidas", completionId],
+      ["Canal de cancelamentos", cancellationId],
+      ["Canal de avaliacoes", reviewId]
+    ]) {
+      const error = await validateConfiguredChannel(interaction.guild, channelId, [ChannelType.GuildText, ChannelType.GuildAnnouncement], label);
+      if (error) return interaction.reply({ content: error, ephemeral: true });
+    }
+    saveServerConfig(interaction.guildId, {
+      completionChannelId: completionId,
+      cancellationChannelId: cancellationId,
+      reviewChannelId: reviewId
+    });
+    await persistServerConfigStorage(interaction);
+  }
+
+  if (section === "roles") {
+    const customerRoleId = sanitizeOptionalRoleId(interaction.fields.getTextInputValue("customerRoleId"));
+    const reseller = sanitizeOptionalRoleId(interaction.fields.getTextInputValue("resellerRoleId"));
+    const discountRaw = interaction.fields.getTextInputValue("resellerDiscountPercent").replace(",", ".");
+    const discount = Number.parseFloat(discountRaw);
+    if (interaction.fields.getTextInputValue("customerRoleId").trim() && !customerRoleId) return interaction.reply({ content: "ID do cargo cliente invalido.", ephemeral: true });
+    if (interaction.fields.getTextInputValue("resellerRoleId").trim() && !reseller) return interaction.reply({ content: "ID do cargo premium/revendedor invalido.", ephemeral: true });
+    if (!Number.isFinite(discount) || discount < 0 || discount > 90) return interaction.reply({ content: "Desconto invalido. Use um numero de 0 a 90.", ephemeral: true });
+    saveServerConfig(interaction.guildId, {
+      customerRoleId,
+      resellerRoleId: reseller,
+      resellerDiscountPercent: discount
+    });
+    await persistServerConfigStorage(interaction);
+  }
+
+  writeAuditLog(interaction, "server.config_updated", { section, serverConfig: serverConfig(interaction.guildId) });
+  return interaction.reply({
+    content: "Config do servidor salva.",
+    embeds: [serverConfigEmbed(interaction.guild)],
+    components: serverConfigRows(),
+    ephemeral: true
+  });
 }
 async function openCart(interaction) {
   await interaction.deferReply({ ephemeral: true });
@@ -6017,7 +6354,8 @@ function normalizeChannelId(value) {
   return raw.match(/\d{15,25}/)?.[0] || "";
 }
 function reviewConfig(options = {}) {
-  const channelId = normalizeChannelId(options.reviewChannelId || config.review?.channelId || process.env.REVIEW_CHANNEL_ID || "");
+  const saved = options.guildId ? serverConfig(options.guildId) : {};
+  const channelId = normalizeChannelId(options.reviewChannelId || saved.reviewChannelId || config.review?.channelId || process.env.REVIEW_CHANNEL_ID || "");
   return {
     channelId,
     message: clampText(options.reviewMessage || config.review?.message || "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.", 1000),
@@ -6046,7 +6384,7 @@ function reviewOptionsFromText(rawContent) {
   };
 }
 async function sendReviewRequest(context, order, options = {}) {
-  const review = reviewConfig(options);
+  const review = reviewConfig({ ...options, guildId: actionGuildId(context) });
   const text = reviewMessageText(order, review);
   await context.channel.send({
     content: `<@${order.userId}> ${text}`,
@@ -6665,41 +7003,66 @@ async function handlePendingImageUpload(message) {
   return true;
 }
 
-function statusVoiceChannelId() {
-  return String(process.env.STATUS_VOICE_CHANNEL_ID || config.statusVoice?.channelId || DEFAULT_STATUS_VOICE_CHANNEL_ID).trim();
+function statusVoiceChannelId(guildId = "") {
+  const saved = guildId ? serverConfig(guildId).statusVoiceChannelId : "";
+  return String(saved || process.env.STATUS_VOICE_CHANNEL_ID || config.statusVoice?.channelId || DEFAULT_STATUS_VOICE_CHANNEL_ID).trim();
 }
-function statusVoiceEnabled() {
-  return config.statusVoice?.enabled !== false && process.env.STATUS_VOICE_ENABLED !== "false";
+function statusVoiceEnabled(guildId = "") {
+  if (process.env.STATUS_VOICE_ENABLED === "false") return false;
+  const saved = guildId ? serverConfig(guildId).statusVoiceEnabled : undefined;
+  if (typeof saved === "boolean") return saved;
+  return config.statusVoice?.enabled !== false;
 }
-function scheduleStatusVoiceReconnect(delayMs = 30000) {
-  if (statusVoiceReconnectTimer || !statusVoiceEnabled()) return;
-  statusVoiceReconnectTimer = setTimeout(() => {
-    statusVoiceReconnectTimer = null;
-    connectStatusVoiceChannel().catch(error => {
+function scheduleStatusVoiceReconnect(guildId, delayMs = 30000) {
+  const key = String(guildId || "");
+  if (!key || statusVoiceReconnectTimers.has(key) || !statusVoiceEnabled(key)) return;
+  const timer = setTimeout(() => {
+    statusVoiceReconnectTimers.delete(key);
+    connectStatusVoiceChannel(key).catch(error => {
       console.log(`Nao consegui reconectar na call de status: ${error.message}`);
-      scheduleStatusVoiceReconnect();
+      scheduleStatusVoiceReconnect(key);
     });
   }, delayMs);
+  statusVoiceReconnectTimers.set(key, timer);
 }
-function watchStatusVoiceConnection(connection) {
+function clearStatusVoiceReconnect(guildId) {
+  const key = String(guildId || "");
+  const timer = statusVoiceReconnectTimers.get(key);
+  if (timer) clearTimeout(timer);
+  statusVoiceReconnectTimers.delete(key);
+}
+function watchStatusVoiceConnection(connection, guildId) {
   if (connection.__dragonStoreStatusWatcher) return;
   connection.__dragonStoreStatusWatcher = true;
   connection.on("stateChange", (_, state) => {
     if (state.status === VoiceConnectionStatus.Destroyed || state.status === VoiceConnectionStatus.Disconnected) {
-      scheduleStatusVoiceReconnect(state.status === VoiceConnectionStatus.Disconnected ? 10000 : 30000);
+      scheduleStatusVoiceReconnect(guildId, state.status === VoiceConnectionStatus.Disconnected ? 10000 : 30000);
     }
   });
   connection.on("error", error => {
     console.log(`Erro na call de status: ${error.message}`);
-    scheduleStatusVoiceReconnect(15000);
+    scheduleStatusVoiceReconnect(guildId, 15000);
   });
 }
-async function connectStatusVoiceChannel() {
-  if (!statusVoiceEnabled()) return null;
-  const channelId = statusVoiceChannelId();
+async function disconnectStatusVoiceChannel(guildId) {
+  clearStatusVoiceReconnect(guildId);
+  const existing = getVoiceConnection(String(guildId || ""));
+  if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) existing.destroy();
+}
+async function connectStatusVoiceChannel(guildOrId) {
+  const guildId = typeof guildOrId === "string" ? guildOrId : guildOrId?.id || "";
+  if (!guildId || !statusVoiceEnabled(guildId)) {
+    if (guildId) await disconnectStatusVoiceChannel(guildId);
+    return null;
+  }
+  const channelId = statusVoiceChannelId(guildId);
   if (!channelId) return null;
 
-  const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(() => null);
+  const guild = typeof guildOrId === "string" ? client.guilds.cache.get(guildId) : guildOrId;
+  const channel = guild?.channels?.cache?.get(channelId) ||
+    await guild?.channels?.fetch(channelId).catch(() => null) ||
+    client.channels.cache.get(channelId) ||
+    await client.channels.fetch(channelId).catch(() => null);
   if (!channel || ![ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(channel.type)) {
     console.log(`Call de status ${channelId} nao encontrada ou nao e canal de voz.`);
     return null;
@@ -6720,7 +7083,7 @@ async function connectStatusVoiceChannel() {
     VoiceConnectionStatus.Connecting
   ]);
   if (existing && existingChannelId === channel.id && reusableStatuses.has(existing.state.status)) {
-    watchStatusVoiceConnection(existing);
+    watchStatusVoiceConnection(existing, channel.guild.id);
     return existing;
   }
   if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -6733,30 +7096,32 @@ async function connectStatusVoiceChannel() {
     adapterCreator: channel.guild.voiceAdapterCreator,
     selfDeaf: true
   });
-  watchStatusVoiceConnection(connection);
+  watchStatusVoiceConnection(connection, channel.guild.id);
 
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+    clearStatusVoiceReconnect(channel.guild.id);
     console.log(`Bot entrou na call de status: ${channel.name || channel.id}`);
   } catch (error) {
-    console.log(`Nao consegui confirmar entrada na call de status ${channel.name || channel.id}: ${error.message}`);
-    connection.destroy();
-    scheduleStatusVoiceReconnect(30000);
+    const currentStatus = connection.state?.status || "desconhecido";
+    console.log(`Call de status ${channel.name || channel.id} ainda nao confirmou Ready (${error.message}); mantendo conexao em estado ${currentStatus}.`);
+    if (currentStatus === VoiceConnectionStatus.Destroyed) scheduleStatusVoiceReconnect(channel.guild.id, 30000);
+    else scheduleStatusVoiceReconnect(channel.guild.id, 60000);
   }
   return connection;
 }
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`Bot online como ${client.user.tag}`);
-  await connectStatusVoiceChannel().catch(error => {
-    console.log(`Nao consegui entrar na call de status: ${error.message}`);
-    scheduleStatusVoiceReconnect();
-  });
   const recoveredProcessing = recoverStaleProcessingOrders();
   if (recoveredProcessing) console.log(`${recoveredProcessing} carrinho(s) preso(s) em processing foram reabertos automaticamente.`);
   for (const guild of client.guilds.cache.values()) {
     await ensureStaffState(guild, null).catch(error => {
       console.log(`Nao consegui recuperar atendimento em ${guild.id}: ${error.message}`);
+    });
+    await connectStatusVoiceChannel(guild).catch(error => {
+      console.log(`Nao consegui entrar na call de status em ${guild.id}: ${error.message}`);
+      scheduleStatusVoiceReconnect(guild.id);
     });
     await refreshStaffPanel(guild.id).catch(() => null);
     const panelStore = readPanels();
@@ -6785,6 +7150,11 @@ client.on("messageCreate", async message => {
   if ([`${config.prefix || "!"}configds`, `${config.prefix || "!"}painel`, `${config.prefix || "!"}loja`, `${config.prefix || "!"}setup`].includes(content)) {
     await message.delete().catch(() => null);
     return startConfig(message.channel, message.member, message.author);
+  }
+
+  if (content === `${config.prefix || "!"}configserver`) {
+    await message.delete().catch(() => null);
+    return showServerConfig(message);
   }
 
   if (content === `${config.prefix || "!"}atendimento`) {
@@ -6916,6 +7286,7 @@ async function handleInteraction(interaction) {
         await interaction.reply({ content: "Abri o configurador neste canal.", ephemeral: true });
         return startConfig(interaction.channel, interaction.member, interaction.user);
       }
+      if (interaction.commandName === "configserver") return showServerConfig(interaction);
       if (interaction.commandName === "setup-ticket") return setupTicket(interaction);
       if (interaction.commandName === "setup-atendimento") return setupStaffPanel(interaction);
       if (interaction.commandName === "salvarpix") return savePixBackupCommand(interaction);
@@ -6979,6 +7350,7 @@ async function handleInteraction(interaction) {
       if (interaction.customId.startsWith("rmconfirm:")) return handleRemoveConfirm(interaction);
       if (interaction.customId.startsWith("rmcancel:")) return handleRemoveCancel(interaction);
       if (interaction.customId.startsWith("cfg:")) return handleConfigButton(interaction);
+      if (interaction.customId.startsWith("cfgsrv:")) return handleServerConfigButton(interaction);
       if (interaction.customId.startsWith("staff:")) return handleStaffButton(interaction);
       if (interaction.customId.startsWith("addcar:")) return handleAddCartButton(interaction);
       if (interaction.customId.startsWith("rank:")) {
@@ -7005,6 +7377,7 @@ async function handleInteraction(interaction) {
       if (act === "tclose") return closeTicket(interaction, id);
     }
     if (interaction.isModalSubmit() && interaction.customId === "pixmodal") return handlePixModal(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("cfgsrvmodal:")) return handleServerConfigModal(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("addcarsearch:")) return handleAddCartSearchSubmit(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("addcarqty:")) return handleAddCartQuantitySubmit(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("quickmodal:")) return handleQuickOrderSubmit(interaction);

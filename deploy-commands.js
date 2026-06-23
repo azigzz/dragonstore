@@ -18,6 +18,9 @@ const commands = [
     .setName("configds")
     .setDescription("Abre o configurador visual da loja."),
   new SlashCommandBuilder()
+    .setName("configserver")
+    .setDescription("Abre as configuracoes gerais do servidor."),
+  new SlashCommandBuilder()
     .setName("setup-ticket")
     .setDescription("Envia o painel de ticket no canal configurado."),
   new SlashCommandBuilder()

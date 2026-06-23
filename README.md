@@ -19,6 +19,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - Resumo de carrinho com quantidade, subtotal e total estimado.
 - Atendimento ON/OFF por ADM.
 - Presenca em call de status enquanto o bot estiver ligado.
+- `/configserver` e `!configserver` para trocar call, canais, cargos e desconto pelo Discord.
 - Pix, QR Code e mensagem extra por atendente.
 - Assumir compra, reenviar Pix e finalizar compra.
 - DM segura para cliente na abertura do carrinho e na finalizacao.
@@ -74,6 +75,8 @@ No Discord:
 !help
 /configds
 !configds
+/configserver
+!configserver
 !painel
 !loja
 !setup
@@ -348,7 +351,7 @@ Os dados ficam em JSON dentro da pasta `data`:
 
 - `data/panels.json`
 - `data/orders.json`
-- `data/staff.json`
+- `data/staff.json` (Pix dos ADMs, painel de atendimento e overrides do `/configserver`)
 
 Em hospedagem gratis, esses arquivos podem sumir em redeploy/restart dependendo da plataforma. Para loja em producao, o proximo passo recomendado e migrar esses dados para Neon/PostgreSQL.
 
