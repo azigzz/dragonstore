@@ -3,6 +3,7 @@
 /* eslint-disable @next/next/no-img-element */
 
 import { ArrowLeft, ExternalLink, Search, ShoppingCart } from "lucide-react";
+import { AnimatePresence, motion } from "framer-motion";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import CartDrawer, { type CartItem } from "@/components/CartDrawer";
@@ -101,7 +102,12 @@ export default function CategoryStorefront({ store, config, category }: Category
         <div className="absolute inset-0 bg-[linear-gradient(90deg,#07090f_0%,rgba(7,9,15,.94)_54%,rgba(7,9,15,.72)_100%)]" />
         <div className="grid-texture pointer-events-none absolute inset-0 opacity-30" />
         <div className="dragon-container relative grid gap-6 py-8 sm:py-10 lg:grid-cols-[1fr_360px] lg:items-center">
-          <div className="max-w-3xl">
+          <motion.div
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.38 }}
+            className="max-w-3xl"
+          >
             <Link href="/#categorias" className="mb-5 inline-flex items-center gap-2 rounded-md border border-white/15 bg-black/35 px-3 py-2 text-sm font-bold text-slate-100 transition hover:border-emerald-300/40 hover:text-white">
               <ArrowLeft className="h-4 w-4" />
               Voltar ao catalogo
@@ -111,6 +117,14 @@ export default function CategoryStorefront({ store, config, category }: Category
             <p className="mt-4 max-w-2xl text-base leading-7 text-slate-200">
               {description}
             </p>
+            <div className="mt-5 flex flex-wrap gap-2">
+              <span className="rounded-md border border-white/10 bg-white/[.06] px-3 py-2 text-xs font-bold uppercase text-slate-200">
+                {category.products.length} {category.products.length === 1 ? "opcao disponivel" : "opcoes disponiveis"}
+              </span>
+              <span className="rounded-md border border-emerald-300/25 bg-emerald-300/10 px-3 py-2 text-xs font-bold uppercase text-emerald-100">
+                Atendimento pelo Discord
+              </span>
+            </div>
             <div className="mt-6 flex flex-col gap-3 sm:flex-row">
               <a
                 href="#produtos"
@@ -129,10 +143,15 @@ export default function CategoryStorefront({ store, config, category }: Category
                 <ExternalLink className="h-4 w-4" />
               </a>
             </div>
-          </div>
-          <div className="hidden overflow-hidden rounded-lg border border-white/10 bg-white/[.04] shadow-neon lg:block">
+          </motion.div>
+          <motion.div
+            initial={{ opacity: 0, scale: 0.98 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.38, delay: 0.08 }}
+            className="hidden overflow-hidden rounded-lg border border-white/10 bg-white/[.04] shadow-neon lg:block"
+          >
             <img src={heroImage} alt={category.title} className="aspect-[4/3] w-full object-cover" />
-          </div>
+          </motion.div>
         </div>
       </section>
 
@@ -152,23 +171,30 @@ export default function CategoryStorefront({ store, config, category }: Category
                 value={query}
                 onChange={event => setQuery(event.target.value)}
                 placeholder="Buscar produto"
-                className="h-11 w-full rounded-md border border-white/10 bg-white/[.06] pl-10 pr-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-emerald-300/50"
+                className="premium-surface h-11 w-full rounded-md border border-white/10 pl-10 pr-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-emerald-300/50 focus:shadow-neon"
               />
             </label>
           </div>
 
           {filteredProducts.length ? (
             <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-              {filteredProducts.map(product => (
-                <ProductCard
+              {filteredProducts.map((product, index) => (
+                <motion.div
                   key={product.id}
-                  product={product}
-                  fallbackImage={heroImage}
-                  categoryId={category.id}
-                  categoryTitle={category.title}
-                  discordUrl={discordUrl}
-                  onAdd={addProduct}
-                />
+                  initial={{ opacity: 0, y: 12 }}
+                  whileInView={{ opacity: 1, y: 0 }}
+                  viewport={{ once: true, margin: "-80px" }}
+                  transition={{ duration: 0.25, delay: Math.min(index * 0.03, 0.18) }}
+                >
+                  <ProductCard
+                    product={product}
+                    fallbackImage={heroImage}
+                    categoryId={category.id}
+                    categoryTitle={category.title}
+                    discordUrl={discordUrl}
+                    onAdd={addProduct}
+                  />
+                </motion.div>
               ))}
             </div>
           ) : (
@@ -191,15 +217,20 @@ export default function CategoryStorefront({ store, config, category }: Category
         onClear={() => setCart([])}
       />
 
-      {notice ? (
-        <button
-          type="button"
-          onClick={() => setCartOpen(true)}
-          className="fixed bottom-4 left-1/2 z-40 w-[calc(100%-32px)] max-w-md -translate-x-1/2 rounded-lg border border-emerald-300/30 bg-[#10141f] px-4 py-3 text-left text-sm font-bold text-emerald-100 shadow-neon transition hover:bg-[#151b29]"
-        >
-          {notice} <span className="text-white">Ver carrinho</span>
-        </button>
-      ) : null}
+      <AnimatePresence>
+        {notice ? (
+          <motion.button
+            type="button"
+            onClick={() => setCartOpen(true)}
+            initial={{ opacity: 0, y: 16, x: "-50%" }}
+            animate={{ opacity: 1, y: 0, x: "-50%" }}
+            exit={{ opacity: 0, y: 16, x: "-50%" }}
+            className="fixed bottom-4 left-1/2 z-40 w-[calc(100%-32px)] max-w-md rounded-lg border border-emerald-300/30 bg-[#10141f] px-4 py-3 text-left text-sm font-bold text-emerald-100 shadow-neon transition hover:bg-[#151b29]"
+          >
+            {notice} <span className="text-white">Ver carrinho</span>
+          </motion.button>
+        ) : null}
+      </AnimatePresence>
     </main>
   );
 }

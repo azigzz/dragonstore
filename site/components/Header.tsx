@@ -16,10 +16,10 @@ export default function Header({ config, cartCount, onCartClick }: HeaderProps) 
   const discordUrl = publicDiscordInvite(config.discordInviteUrl);
 
   return (
-    <header className="fixed inset-x-0 top-0 z-40 border-b border-white/10 bg-[#07090f]/82 backdrop-blur-xl">
+    <header className="fixed inset-x-0 top-0 z-40 border-b border-white/10 bg-[#07090f]/78 shadow-[0_14px_60px_rgba(0,0,0,.22)] backdrop-blur-xl">
       <div className="dragon-container flex h-16 items-center justify-between gap-3">
-        <a href="/" className="flex min-w-0 items-center gap-3">
-          <span className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-md border border-emerald-300/30 bg-[#061b2d]">
+        <a href="/" className="group flex min-w-0 items-center gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-md border border-emerald-300/30 bg-[#061b2d] transition group-hover:border-emerald-200/70">
             <img
               src="/dragon-store-logo.png"
               alt="Dragon Store"
@@ -27,7 +27,7 @@ export default function Header({ config, cartCount, onCartClick }: HeaderProps) 
             />
           </span>
           <span className="min-w-0">
-            <span className="block truncate text-sm font-black uppercase text-white">{config.storeName}</span>
+            <span className="block truncate text-sm font-black uppercase text-white transition group-hover:text-emerald-100">{config.storeName}</span>
             <span className="block truncate text-xs text-slate-400">{config.subtitle}</span>
           </span>
         </a>
@@ -48,7 +48,7 @@ export default function Header({ config, cartCount, onCartClick }: HeaderProps) 
             href={discordUrl}
             target="_blank"
             rel="noreferrer"
-            className="inline-flex h-10 items-center gap-2 rounded-md bg-emerald-300 px-3 text-sm font-black text-black transition hover:bg-cyan-200"
+            className="inline-flex h-10 items-center gap-2 rounded-md bg-emerald-300 px-3 text-sm font-black text-black transition hover:bg-cyan-200 hover:shadow-[0_0_30px_rgba(40,246,161,.22)]"
           >
             <ExternalLink className="h-4 w-4" />
             <span className="hidden sm:inline">Entrar no Discord</span>

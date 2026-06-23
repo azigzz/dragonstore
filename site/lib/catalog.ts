@@ -7,6 +7,7 @@ const PRODUCT_DESCRIPTION = "Produto digital disponivel para compra via atendime
 
 const BAD_PUBLIC_TEXT = [
   "loja em configuracao",
+  "produto da loja",
   "adicione produtos",
   "quando tudo estiver pronto",
   "precos e nomes seguem",
@@ -104,6 +105,10 @@ export function catalogTagsFor(categories: StoreCategory[]) {
   return Array.from(tags.entries()).map(([id, label]) => ({ id, label }));
 }
 
+export function catalogKindLabel(seed: string) {
+  return KIND_LABELS[catalogKind(seed)];
+}
+
 export function fallbackCatalogImage(seed: string) {
   const kind = catalogKind(seed);
   const theme = KIND_THEMES[kind];
@@ -128,8 +133,12 @@ export function fallbackCatalogImage(seed: string) {
       <rect width="1200" height="760" rx="44" fill="url(#glow)"/>
       <rect width="1200" height="760" rx="44" fill="url(#grid)" opacity=".45"/>
       <path d="M-80 620C170 470 290 720 538 574 700 480 771 314 1014 334c115 10 193 74 286 161v265H-80Z" fill="rgba(0,0,0,.28)"/>
+      <path d="M70 650C220 540 408 690 590 582 770 475 824 214 1116 260" fill="none" stroke="${theme.accent}" stroke-width="10" stroke-linecap="round" opacity=".72"/>
+      <path d="M70 650C220 540 408 690 590 582 770 475 824 214 1116 260" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" opacity=".42"/>
       <circle cx="918" cy="228" r="122" fill="rgba(255,255,255,.10)"/>
       <circle cx="918" cy="228" r="74" fill="rgba(0,0,0,.22)"/>
+      <rect x="74" y="548" width="252" height="58" rx="18" fill="rgba(0,0,0,.30)" stroke="rgba(255,255,255,.18)"/>
+      <text x="105" y="586" fill="${theme.accent}" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="900">COMPRA PELO DISCORD</text>
       <text x="74" y="116" fill="rgba(255,255,255,.72)" font-family="Inter, Arial, sans-serif" font-size="30" font-weight="800" letter-spacing="4">DRAGON STORE</text>
       <text x="74" y="414" fill="#ffffff" font-family="Inter, Arial, sans-serif" font-size="96" font-weight="900">${title}</text>
       <text x="78" y="482" fill="rgba(255,255,255,.72)" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="700">Produtos digitais pelo Discord</text>
