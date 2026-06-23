@@ -2,7 +2,7 @@
 
 Site profissional em Next.js para divulgar as categorias e produtos digitais da Dragon Store e finalizar pedidos pelo Discord.
 
-O site tenta buscar produtos do bot em `GET /api/public-store`. Se o bot estiver offline ou sem token correto, usa `data/fallback-store.json` e a config local.
+O site tenta buscar produtos do bot em `GET /api/public-store`. Se o bot estiver offline ou sem token correto, usa um catalogo estatico seguro sem mostrar mensagens tecnicas para o cliente.
 
 ## Instalar localmente
 
@@ -130,8 +130,10 @@ Resposta esperada:
 2. Entre com `ADMIN_PASSWORD`.
 3. Configure textos, links, API do bot, cor, imagem e fallback.
 4. Clique em **Testar bot** para validar a conexao.
-5. Clique em **Sincronizar** para salvar categorias e produtos do bot como fallback runtime.
-6. Clique em **Salvar** para persistir a config no ambiente atual.
+5. Clique em **Sincronizar** para salvar categorias e produtos do bot no fallback administrativo.
+6. Clique em **Salvar** para persistir a config.
+
+Em producao na Vercel, o painel admin so salva alteracoes quando houver storage externo configurado, como Upstash KV (`KV_REST_API_URL`/`KV_REST_API_TOKEN` ou `UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN`). Sem storage externo, use variaveis de ambiente para configuracao permanente.
 
 ## Atualizar produtos
 
@@ -143,16 +145,15 @@ O fluxo principal continua no Discord:
 4. O site mostra cada painel como uma categoria clicavel, com imagem, descricao e menor preco.
 5. A pagina da categoria lista todos os produtos daquela secao.
 
-Se o bot estiver offline, o site mostra os produtos fallback.
+Se o bot estiver offline, o site mostra um catalogo local com textos comerciais e imagens por tipo de categoria.
 
 ## Limitacoes atuais
 
 - Sem pagamento automatico.
 - O carrinho finaliza pelo Discord.
 - O resumo do pedido e copiado para o cliente enviar no ticket.
-- Se o bot estiver offline, usa fallback.
-- A Vercel nao salva arquivo local de forma persistente em producao.
-- O painel admin salva em `data/site-config.runtime.json`, util em dev e em runtime, mas para producao permanente prefira variaveis de ambiente ou banco futuro.
+- A Vercel nao permite escrita persistente em arquivo local em producao.
+- O painel admin salva em arquivo local apenas em desenvolvimento. Em producao, configure KV externo ou use variaveis de ambiente.
 
 ## Seguranca
 

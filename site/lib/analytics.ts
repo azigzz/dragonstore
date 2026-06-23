@@ -1,5 +1,3 @@
-import fs from "node:fs/promises";
-import path from "node:path";
 import crypto from "node:crypto";
 import type { AnalyticsSummary } from "@/lib/types";
 
@@ -21,29 +19,21 @@ type AnalyticsStore = {
   events: AnalyticsEvent[];
 };
 
-const ANALYTICS_PATH = process.env.ANALYTICS_FILE_PATH || path.join(process.cwd(), "data", "analytics.runtime.json");
-const ANALYTICS_TMP_PATH = path.join("/tmp", "dragon-store-analytics.json");
+const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const KV_ANALYTICS_KEY = process.env.SITE_ANALYTICS_KV_KEY || "dragon-store:site-analytics";
+const ANALYTICS_FILE_NAME = "analytics.runtime.json";
 const MAX_EVENTS = 20000;
 
 function emptyStore(): AnalyticsStore {
   return { events: [] };
 }
 
-async function readJsonFile(file: string) {
-  try {
-    return JSON.parse(await fs.readFile(file, "utf8")) as Partial<AnalyticsStore>;
-  } catch {
-    return null;
-  }
+function isProductionRuntime() {
+  return Boolean(process.env.VERCEL || process.env.NODE_ENV === "production");
 }
 
-async function writeJsonFile(file: string, data: AnalyticsStore) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(data, null, 2));
-}
-
-export async function readAnalyticsStore(): Promise<AnalyticsStore> {
-  const data = await readJsonFile(ANALYTICS_PATH) || await readJsonFile(ANALYTICS_TMP_PATH);
+function normalizeStore(data: Partial<AnalyticsStore> | null): AnalyticsStore {
   if (!data || !Array.isArray(data.events)) return emptyStore();
   return {
     events: data.events
@@ -64,12 +54,87 @@ export async function readAnalyticsStore(): Promise<AnalyticsStore> {
   };
 }
 
+async function readJsonFile(file: string) {
+  const fs = await import("node:fs/promises");
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8")) as Partial<AnalyticsStore>;
+  } catch {
+    return null;
+  }
+}
+
+async function writeJsonFile(file: string, data: AnalyticsStore) {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify(data, null, 2));
+}
+
+async function localAnalyticsPaths() {
+  const path = await import("node:path");
+  return [
+    process.env.ANALYTICS_FILE_PATH || path.join(process.cwd(), "data", ANALYTICS_FILE_NAME),
+    path.join("/tmp", "dragon-store-analytics.json")
+  ];
+}
+
+async function readKvAnalytics() {
+  if (!KV_REST_API_URL || !KV_REST_API_TOKEN) return null;
+  try {
+    const response = await fetch(`${KV_REST_API_URL.replace(/\/$/, "")}/get/${encodeURIComponent(KV_ANALYTICS_KEY)}`, {
+      headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` },
+      cache: "no-store"
+    });
+    if (!response.ok) return null;
+    const payload = await response.json().catch(() => ({})) as { result?: unknown };
+    if (!payload.result) return null;
+    return typeof payload.result === "string"
+      ? JSON.parse(payload.result) as Partial<AnalyticsStore>
+      : payload.result as Partial<AnalyticsStore>;
+  } catch {
+    return null;
+  }
+}
+
+async function writeKvAnalytics(store: AnalyticsStore) {
+  if (!KV_REST_API_URL || !KV_REST_API_TOKEN) return false;
+  const response = await fetch(`${KV_REST_API_URL.replace(/\/$/, "")}/set/${encodeURIComponent(KV_ANALYTICS_KEY)}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${KV_REST_API_TOKEN}`,
+      "Content-Type": "text/plain"
+    },
+    body: JSON.stringify({ events: store.events.slice(-MAX_EVENTS) })
+  });
+  return response.ok;
+}
+
+export async function readAnalyticsStore(): Promise<AnalyticsStore> {
+  const kvData = await readKvAnalytics();
+  if (kvData) return normalizeStore(kvData);
+  if (isProductionRuntime()) return emptyStore();
+
+  for (const file of await localAnalyticsPaths()) {
+    const data = await readJsonFile(file);
+    if (data) return normalizeStore(data);
+  }
+  return emptyStore();
+}
+
 async function writeAnalyticsStore(store: AnalyticsStore) {
   const data = { events: store.events.slice(-MAX_EVENTS) };
+  if (await writeKvAnalytics(data)) return;
+
+  if (isProductionRuntime()) {
+    console.info("Analytics storage externo nao configurado; evento mantido apenas nos logs.");
+    return;
+  }
+
+  const paths = await localAnalyticsPaths();
   try {
-    await writeJsonFile(ANALYTICS_PATH, data);
+    await writeJsonFile(paths[0], data);
   } catch {
-    await writeJsonFile(ANALYTICS_TMP_PATH, data);
+    await writeJsonFile(paths[1], data);
   }
 }
 

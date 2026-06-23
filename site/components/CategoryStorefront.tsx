@@ -1,13 +1,15 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element */
+
 import { ArrowLeft, ExternalLink, Search, ShoppingCart } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import CartDrawer, { type CartItem } from "@/components/CartDrawer";
 import Header from "@/components/Header";
 import ProductCard from "@/components/ProductCard";
+import { categoryDescription, categoryImage, categoryPriceLabel, publicDiscordInvite } from "@/lib/catalog";
 import { trackEvent } from "@/lib/client-analytics";
-import { formatBRL } from "@/lib/money";
 import type { SiteConfig, StoreCategory, StoreData, StoreProduct } from "@/lib/types";
 
 type CategoryStorefrontProps = {
@@ -18,25 +20,14 @@ type CategoryStorefrontProps = {
 
 const CART_STORAGE_KEY = "dragon-store-cart";
 
-function cleanDescription(text: string) {
-  return String(text || "")
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
-    .trim();
-}
-
-function priceLabel(category: StoreCategory) {
-  return typeof category.minPrice === "number"
-    ? `A partir de ${formatBRL(category.minPrice)}`
-    : "Valores no atendimento";
-}
-
 export default function CategoryStorefront({ store, config, category }: CategoryStorefrontProps) {
   const [cartOpen, setCartOpen] = useState(false);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("");
-  const heroImage = category.imageUrl || store.imageUrl || config.heroImageUrl || "/dragon-store-hero.png";
+  const heroImage = categoryImage(category, store.imageUrl || config.heroImageUrl || "/dragon-store-hero.png");
+  const description = categoryDescription(category.description);
+  const discordUrl = publicDiscordInvite(config.discordInviteUrl || store.discordInviteUrl);
   const cartCount = cart.reduce((total, item) => total + item.quantity, 0);
   const filteredProducts = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -102,25 +93,25 @@ export default function CategoryStorefront({ store, config, category }: Category
     <main>
       <Header config={config} cartCount={cartCount} onCartClick={() => setCartOpen(true)} />
 
-      <section
-        className="relative overflow-hidden border-b border-white/10 bg-cover bg-center pt-24"
-        style={{
-          backgroundImage: `linear-gradient(90deg, rgba(7,9,15,.42) 0%, rgba(7,9,15,.78) 44%, rgba(7,9,15,.98) 100%), url(${heroImage})`
-        }}
-      >
+      <section className="relative overflow-hidden border-b border-white/10 bg-[#07090f] pt-20">
+        <div
+          className="absolute inset-y-0 right-0 hidden w-1/2 bg-cover bg-center opacity-35 lg:block"
+          style={{ backgroundImage: `url(${heroImage})` }}
+        />
+        <div className="absolute inset-0 bg-[linear-gradient(90deg,#07090f_0%,rgba(7,9,15,.94)_54%,rgba(7,9,15,.72)_100%)]" />
         <div className="grid-texture pointer-events-none absolute inset-0 opacity-30" />
-        <div className="dragon-container relative grid min-h-[58vh] content-center pb-14">
+        <div className="dragon-container relative grid gap-6 py-8 sm:py-10 lg:grid-cols-[1fr_360px] lg:items-center">
           <div className="max-w-3xl">
             <Link href="/#categorias" className="mb-5 inline-flex items-center gap-2 rounded-md border border-white/15 bg-black/35 px-3 py-2 text-sm font-bold text-slate-100 transition hover:border-emerald-300/40 hover:text-white">
               <ArrowLeft className="h-4 w-4" />
               Voltar ao catalogo
             </Link>
-            <p className="text-sm font-bold uppercase text-emerald-200">{priceLabel(category)}</p>
-            <h1 className="mt-3 text-4xl font-black leading-[1.05] text-white sm:text-5xl lg:text-6xl">{category.title}</h1>
-            <p className="mt-5 whitespace-pre-line text-base leading-7 text-slate-200 sm:text-lg">
-              {cleanDescription(category.description)}
+            <p className="text-sm font-bold uppercase text-emerald-200">{categoryPriceLabel(category)}</p>
+            <h1 className="mt-3 text-4xl font-black leading-[1.05] text-white sm:text-5xl">{category.title}</h1>
+            <p className="mt-4 max-w-2xl text-base leading-7 text-slate-200">
+              {description}
             </p>
-            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row">
               <a
                 href="#produtos"
                 className="inline-flex h-12 items-center justify-center gap-2 rounded-md bg-emerald-300 px-5 text-sm font-black text-black transition hover:bg-cyan-200"
@@ -128,29 +119,30 @@ export default function CategoryStorefront({ store, config, category }: Category
                 Ver produtos
                 <ShoppingCart className="h-4 w-4" />
               </a>
-              {config.discordInviteUrl ? (
-                <a
-                  href={config.discordInviteUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex h-12 items-center justify-center gap-2 rounded-md border border-white/15 bg-white/[.06] px-5 text-sm font-black text-white transition hover:border-violet-300/40 hover:bg-violet-300/10"
-                >
-                  Entrar no Discord
-                  <ExternalLink className="h-4 w-4" />
-                </a>
-              ) : null}
+              <a
+                href={discordUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-12 items-center justify-center gap-2 rounded-md border border-white/15 bg-white/[.06] px-5 text-sm font-black text-white transition hover:border-violet-300/40 hover:bg-violet-300/10"
+              >
+                Entrar no Discord
+                <ExternalLink className="h-4 w-4" />
+              </a>
             </div>
+          </div>
+          <div className="hidden overflow-hidden rounded-lg border border-white/10 bg-white/[.04] shadow-neon lg:block">
+            <img src={heroImage} alt={category.title} className="aspect-[4/3] w-full object-cover" />
           </div>
         </div>
       </section>
 
-      <section id="produtos" className="bg-[#07090f] py-14 sm:py-20">
+      <section id="produtos" className="bg-[#07090f] py-10 sm:py-14">
         <div className="dragon-container">
           <div className="mb-8 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
               <p className="text-sm font-bold uppercase text-emerald-200">Produtos</p>
               <h2 className="mt-2 text-3xl font-black text-white">{category.title}</h2>
-              <p className="mt-2 text-sm text-slate-400">
+              <p className="mt-2 text-xs font-semibold uppercase text-slate-500">
                 {category.products.length} {category.products.length === 1 ? "produto disponivel" : "produtos disponiveis"} nesta secao.
               </p>
             </div>
@@ -174,13 +166,14 @@ export default function CategoryStorefront({ store, config, category }: Category
                   fallbackImage={heroImage}
                   categoryId={category.id}
                   categoryTitle={category.title}
+                  discordUrl={discordUrl}
                   onAdd={addProduct}
                 />
               ))}
             </div>
           ) : (
             <div className="rounded-lg border border-dashed border-white/15 p-8 text-slate-300">
-              Nenhum produto encontrado nessa busca.
+              Nenhum produto disponivel nesta categoria no momento.
             </div>
           )}
         </div>

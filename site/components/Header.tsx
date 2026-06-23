@@ -3,6 +3,7 @@
 /* eslint-disable @next/next/no-img-element */
 
 import { ExternalLink, ShoppingCart } from "lucide-react";
+import { publicDiscordInvite } from "@/lib/catalog";
 import type { SiteConfig } from "@/lib/types";
 
 type HeaderProps = {
@@ -12,6 +13,8 @@ type HeaderProps = {
 };
 
 export default function Header({ config, cartCount, onCartClick }: HeaderProps) {
+  const discordUrl = publicDiscordInvite(config.discordInviteUrl);
+
   return (
     <header className="fixed inset-x-0 top-0 z-40 border-b border-white/10 bg-[#07090f]/82 backdrop-blur-xl">
       <div className="dragon-container flex h-16 items-center justify-between gap-3">
@@ -41,18 +44,16 @@ export default function Header({ config, cartCount, onCartClick }: HeaderProps) 
             <span className="rounded bg-emerald-300 px-1.5 py-0.5 text-xs font-black text-black">{cartCount}</span>
           </button>
 
-          {config.discordInviteUrl ? (
-            <a
-              href={config.discordInviteUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex h-10 items-center gap-2 rounded-md bg-emerald-300 px-3 text-sm font-black text-black transition hover:bg-cyan-200"
-            >
-              <ExternalLink className="h-4 w-4" />
-              <span className="hidden sm:inline">Entrar no Discord</span>
-              <span className="sm:hidden">Discord</span>
-            </a>
-          ) : null}
+          <a
+            href={discordUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex h-10 items-center gap-2 rounded-md bg-emerald-300 px-3 text-sm font-black text-black transition hover:bg-cyan-200"
+          >
+            <ExternalLink className="h-4 w-4" />
+            <span className="hidden sm:inline">Entrar no Discord</span>
+            <span className="sm:hidden">Discord</span>
+          </a>
         </div>
       </div>
     </header>

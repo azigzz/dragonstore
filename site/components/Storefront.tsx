@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import CartDrawer, { type CartItem } from "@/components/CartDrawer";
 import CategoryCard from "@/components/CategoryCard";
 import Header from "@/components/Header";
+import { catalogKind, catalogTagsFor, publicDiscordInvite } from "@/lib/catalog";
 import { trackEvent } from "@/lib/client-analytics";
 import type { SiteConfig, StoreData, StoreProduct } from "@/lib/types";
 
@@ -21,16 +22,25 @@ export default function Storefront({ store, config }: StorefrontProps) {
   const [cartOpen, setCartOpen] = useState(false);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [query, setQuery] = useState("");
+  const [tag, setTag] = useState("todos");
   const heroImage = store.imageUrl || config.heroImageUrl || "/dragon-store-hero.png";
   const categories = store.categories?.length ? store.categories : [];
   const products = store.products || [];
   const cartCount = cart.reduce((total, item) => total + item.quantity, 0);
   const trust = useMemo(() => config.trustBadges.slice(0, 5), [config.trustBadges]);
-  const productCountText = `${categories.length} ${categories.length === 1 ? "secao" : "secoes"} e ${products.length} ${products.length === 1 ? "produto" : "produtos"} no catalogo.`;
+  const discordUrl = publicDiscordInvite(config.discordInviteUrl || store.discordInviteUrl);
+  const filters = useMemo(() => [{ id: "todos", label: "Todos" }, ...catalogTagsFor(categories)], [categories]);
+  const productCountText = `${categories.length} ${categories.length === 1 ? "categoria" : "categorias"} · ${products.length} ${products.length === 1 ? "produto" : "produtos"}`;
   const filteredCategories = useMemo(() => {
     const term = query.trim().toLowerCase();
-    if (!term) return categories;
-    return categories.filter(category => {
+    const byTag = tag === "todos"
+      ? categories
+      : categories.filter(category => {
+          const seed = `${category.title} ${category.description} ${category.products.map(product => `${product.name} ${product.description}`).join(" ")}`;
+          return catalogKind(seed) === tag;
+        });
+    if (!term) return byTag;
+    return byTag.filter(category => {
       return [
         category.title,
         category.description,
@@ -40,7 +50,7 @@ export default function Storefront({ store, config }: StorefrontProps) {
         .toLowerCase()
         .includes(term);
     });
-  }, [categories, query]);
+  }, [categories, query, tag]);
 
   useEffect(() => {
     try {
@@ -83,14 +93,14 @@ export default function Storefront({ store, config }: StorefrontProps) {
     <main>
       <Header config={config} cartCount={cartCount} onCartClick={() => setCartOpen(true)} />
 
-      <section
-        className="relative min-h-[76vh] overflow-hidden border-b border-white/10 bg-cover bg-center pt-24"
-        style={{
-          backgroundImage: `linear-gradient(90deg, rgba(7,9,15,.48) 0%, rgba(7,9,15,.72) 38%, rgba(7,9,15,.98) 100%), url(${heroImage})`
-        }}
-      >
-        <div className="grid-texture pointer-events-none absolute inset-0 opacity-35" />
-        <div className="dragon-container relative grid min-h-[calc(76vh-96px)] content-center pb-20 lg:justify-items-end">
+      <section className="relative overflow-hidden border-b border-white/10 bg-[#07090f] pt-20">
+        <div
+          className="absolute inset-0 bg-cover bg-center opacity-30 blur-[2px]"
+          style={{ backgroundImage: `url(${heroImage})` }}
+        />
+        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(7,9,15,.96),rgba(7,9,15,.84)_48%,rgba(7,9,15,.98))]" />
+        <div className="grid-texture pointer-events-none absolute inset-0 opacity-25" />
+        <div className="dragon-container relative grid gap-8 py-10 sm:py-12 lg:grid-cols-[1.05fr_.95fr] lg:items-center">
           <motion.div
             initial={{ opacity: 0, y: 18 }}
             animate={{ opacity: 1, y: 0 }}
@@ -99,60 +109,56 @@ export default function Storefront({ store, config }: StorefrontProps) {
           >
             <div className="mb-5 inline-flex items-center gap-2 rounded-md border border-emerald-300/30 bg-black/35 px-3 py-2 text-xs font-bold uppercase text-emerald-100 backdrop-blur">
               <BadgeCheck className="h-4 w-4" />
-              Catalogo atualizado
+              Compra pelo Discord
             </div>
-            <h1 className="text-4xl font-black leading-[1.05] text-white sm:text-5xl lg:text-6xl">
-              {config.heroTitle || store.title}
+            <h1 className="text-4xl font-black leading-[1.05] text-white sm:text-5xl">
+              Produtos digitais com compra rapida pelo Discord
             </h1>
             <p className="mt-5 max-w-xl text-base leading-7 text-slate-200 sm:text-lg">
-              {config.heroText || store.description}
+              Escolha seus produtos, monte seu carrinho e finalize com atendimento direto no nosso servidor.
             </p>
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
               <a
-                href="#categorias"
+                href={discordUrl}
+                target="_blank"
+                rel="noreferrer"
                 className="inline-flex h-12 items-center justify-center gap-2 rounded-md bg-emerald-300 px-5 text-sm font-black text-black transition hover:bg-cyan-200"
               >
-                Ver categorias
+                Entrar no Discord
                 <ArrowRight className="h-4 w-4" />
               </a>
-              {config.discordInviteUrl ? (
-                <a
-                  href={config.discordInviteUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex h-12 items-center justify-center gap-2 rounded-md border border-white/15 bg-white/[.06] px-5 text-sm font-black text-white transition hover:border-violet-300/40 hover:bg-violet-300/10"
-                >
-                  Entrar no Discord
-                </a>
-              ) : null}
+              <a
+                href="#categorias"
+                className="inline-flex h-12 items-center justify-center gap-2 rounded-md border border-white/15 bg-white/[.06] px-5 text-sm font-black text-white transition hover:border-violet-300/40 hover:bg-violet-300/10"
+              >
+                Ver produtos
+              </a>
             </div>
           </motion.div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            {trust.slice(0, 4).map((label, index) => {
+              const Icon = icons[index] || ShieldCheck;
+              return (
+                <div key={label} className="flex min-h-20 items-center gap-3 rounded-lg border border-white/10 bg-white/[.045] p-4 backdrop-blur">
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-emerald-300/10 text-emerald-100">
+                    <Icon className="h-5 w-5" />
+                  </span>
+                  <strong className="text-sm text-white">{label}</strong>
+                </div>
+              );
+            })}
+          </div>
         </div>
       </section>
 
-      <section className="border-b border-white/10 bg-[#090d15] py-8">
-        <div className="dragon-container grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-          {trust.map((label, index) => {
-            const Icon = icons[index] || ShieldCheck;
-            return (
-              <div key={label} className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/[.04] p-4">
-                <span className="flex h-10 w-10 items-center justify-center rounded-md bg-emerald-300/10 text-emerald-100">
-                  <Icon className="h-5 w-5" />
-                </span>
-                <strong className="text-sm text-white">{label}</strong>
-              </div>
-            );
-          })}
-        </div>
-      </section>
-
-      <section id="categorias" className="bg-[#07090f] py-14 sm:py-20">
+      <section id="categorias" className="bg-[#07090f] py-10 sm:py-14">
         <div className="dragon-container">
           <div className="mb-8 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
             <div>
               <p className="text-sm font-bold uppercase text-emerald-200">Catalogo</p>
               <h2 className="mt-2 text-3xl font-black text-white">Categorias da loja</h2>
-              <p className="mt-2 text-sm text-slate-400">{productCountText}</p>
+              <p className="mt-2 text-xs font-semibold uppercase text-slate-500">{productCountText}</p>
             </div>
             <label className="relative w-full sm:max-w-sm">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
@@ -164,6 +170,25 @@ export default function Storefront({ store, config }: StorefrontProps) {
               />
             </label>
           </div>
+
+          {filters.length > 1 ? (
+            <div className="mb-6 flex flex-wrap gap-2">
+              {filters.map(filter => (
+                <button
+                  key={filter.id}
+                  type="button"
+                  onClick={() => setTag(filter.id)}
+                  className={`h-9 rounded-md border px-3 text-sm font-bold transition ${
+                    tag === filter.id
+                      ? "border-emerald-300 bg-emerald-300 text-black"
+                      : "border-white/10 bg-white/[.04] text-slate-200 hover:border-emerald-300/40"
+                  }`}
+                >
+                  {filter.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
 
           {filteredCategories.length ? (
             <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
@@ -177,7 +202,7 @@ export default function Storefront({ store, config }: StorefrontProps) {
             </div>
           ) : (
             <div className="rounded-lg border border-dashed border-white/15 p-8 text-slate-300">
-              Nenhuma categoria encontrada nessa busca.
+              Nenhum resultado encontrado. Voce ainda pode entrar no Discord para comprar.
             </div>
           )}
         </div>

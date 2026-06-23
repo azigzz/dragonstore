@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import baseConfig from "@/data/site-config.json";
 import fallbackStore from "@/data/fallback-store.json";
+import { categoryDescription, productDescription, publicDiscordInvite } from "@/lib/catalog";
 import type { AdminConfigPayload, SiteConfig, StoreCategory, StoreProduct } from "@/lib/types";
 
 const CONFIG_PATH = path.join(process.cwd(), "data", "site-config.json");
@@ -23,7 +24,7 @@ function asProducts(value: unknown): StoreProduct[] {
         name: String(product.name || "Produto"),
         price: String(product.price || "A combinar"),
         priceCents: typeof product.priceCents === "number" ? product.priceCents : null,
-        description: String(product.description || "Produto digital da Dragon Store"),
+        description: productDescription(product.description),
         stock: String(product.stock || "sob consulta"),
         imageUrl: product.imageUrl ? String(product.imageUrl) : "/dragon-store-hero.png",
         type: product.type ? String(product.type) : "normal"
@@ -44,8 +45,8 @@ function asCategories(value: unknown): StoreCategory[] {
         panelId: category.panelId ? String(category.panelId) : undefined,
         scopeId: category.scopeId ? String(category.scopeId) : undefined,
         title: String(category.title || `Categoria ${index + 1}`).slice(0, 120),
-        description: String(category.description || "Produtos digitais da Dragon Store").slice(0, 1200),
-        imageUrl: category.imageUrl ? String(category.imageUrl).slice(0, 500) : "/dragon-store-hero.png",
+        description: categoryDescription(category.description).slice(0, 1200),
+        imageUrl: category.imageUrl ? String(category.imageUrl).slice(0, 500) : "",
         thumbnailUrl: category.thumbnailUrl ? String(category.thumbnailUrl).slice(0, 500) : "",
         color: category.color ? normalizeColor(String(category.color)) : undefined,
         minPrice: typeof category.minPrice === "number" ? category.minPrice : null,
@@ -84,11 +85,7 @@ function normalizeColor(value?: string) {
 }
 
 export function normalizeDiscordInvite(value?: string) {
-  const target = "https://discord.gg/ZyxwUekHWh";
-  const raw = String(value || "").trim();
-  if (!raw) return target;
-  if (/5fyPxMXBTC|Y2MqnVwXnq|rapp28qmR4/i.test(raw)) return target;
-  return raw;
+  return publicDiscordInvite(value);
 }
 
 async function readJsonFile(file: string) {
@@ -157,6 +154,10 @@ async function writeRuntimeConfig(data: SiteConfig) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "erro desconhecido";
     errors.push(`KV: ${message}`);
+  }
+
+  if (process.env.VERCEL || process.env.NODE_ENV === "production") {
+    throw new Error("Configure um storage externo para salvar alteracoes em producao. Em Vercel, use Upstash KV ou variaveis de ambiente.");
   }
 
   for (const file of RUNTIME_CONFIG_PATHS) {

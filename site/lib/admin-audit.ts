@@ -1,7 +1,3 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-
-const AUDIT_PATH = process.env.ADMIN_AUDIT_FILE_PATH || path.join("/tmp", "dragon-store-admin-audit.json");
 const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
 const KV_AUDIT_KEY = process.env.SITE_ADMIN_AUDIT_KV_KEY || "dragon-store:site-admin-audit";
@@ -57,12 +53,7 @@ async function readAuditEvents() {
     }
   }
 
-  try {
-    const parsed = JSON.parse(await fs.readFile(AUDIT_PATH, "utf8"));
-    return Array.isArray(parsed) ? parsed as AdminAuditEvent[] : [];
-  } catch {
-    return [];
-  }
+  return [];
 }
 
 async function writeAuditEvents(events: AdminAuditEvent[]) {
@@ -78,8 +69,7 @@ async function writeAuditEvents(events: AdminAuditEvent[]) {
     if (response.ok) return;
   }
 
-  await fs.mkdir(path.dirname(AUDIT_PATH), { recursive: true });
-  await fs.writeFile(AUDIT_PATH, JSON.stringify(events, null, 2));
+  console.info("Admin audit storage externo nao configurado; evento mantido apenas nos logs.");
 }
 
 export async function appendAdminAudit(request: Request, action: string, details: unknown = {}) {

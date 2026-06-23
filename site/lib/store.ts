@@ -1,4 +1,5 @@
 import fallbackStore from "@/data/fallback-store.json";
+import { categoryDescription, categoryImage, productDescription, productImage, publicDiscordInvite } from "@/lib/catalog";
 import { normalizeDiscordInvite, readSiteConfig, saveSiteConfig } from "@/lib/config";
 import { parsePrice } from "@/lib/money";
 import type { SiteConfig, StoreCategory, StoreData, StoreProduct } from "@/lib/types";
@@ -24,9 +25,17 @@ function normalizeProducts(products: unknown, defaultImage: string): StoreProduc
         name: String(product.name || "Produto"),
         price: String(product.price || "A combinar"),
         priceCents: typeof product.priceCents === "number" ? product.priceCents : null,
-        description: String(product.description || "Produto digital da Dragon Store"),
+        description: productDescription(product.description),
         stock: String(product.stock || "sob consulta"),
-        imageUrl: product.imageUrl ? String(product.imageUrl) : defaultImage,
+        imageUrl: productImage({
+          id: String(product.id || `product-${index + 1}`),
+          name: String(product.name || "Produto"),
+          price: String(product.price || "A combinar"),
+          description: productDescription(product.description),
+          stock: String(product.stock || "sob consulta"),
+          imageUrl: product.imageUrl ? String(product.imageUrl) : "",
+          type: product.type ? String(product.type) : "normal"
+        }, defaultImage),
         type: product.type ? String(product.type) : "normal"
       };
     })
@@ -54,19 +63,27 @@ function normalizeCategories(categories: unknown, defaultImage: string, fallback
       while (seen.has(id)) id = `${slugify(idBase)}-${suffix++}`;
       seen.add(id);
 
-      const image = category.imageUrl ? String(category.imageUrl) : defaultImage;
+      const image = category.imageUrl ? String(category.imageUrl) : "";
       const products = normalizeProducts(category.products, image);
-      return {
+      const normalizedCategory = {
         id,
         panelId: category.panelId ? String(category.panelId) : undefined,
         scopeId: category.scopeId ? String(category.scopeId) : undefined,
         title,
-        description: String(category.description || "Produtos digitais da Dragon Store"),
+        description: categoryDescription(category.description),
         imageUrl: image,
         thumbnailUrl: category.thumbnailUrl ? String(category.thumbnailUrl) : "",
         color: category.color ? String(category.color) : undefined,
         minPrice: typeof category.minPrice === "number" ? category.minPrice : minProductPrice(products),
         products
+      };
+      return {
+        ...normalizedCategory,
+        imageUrl: categoryImage(normalizedCategory, defaultImage),
+        products: products.map(product => ({
+          ...product,
+          imageUrl: productImage(product, categoryImage(normalizedCategory, defaultImage), `${title} ${normalizedCategory.description}`)
+        }))
       };
     })
     .filter(category => category.products.length)
@@ -78,7 +95,7 @@ function categoryFromProducts(products: StoreProduct[], store: Pick<StoreData, "
   return [{
     id: slugify(store.title || "catalogo"),
     title: store.title || "Catalogo Dragon Store",
-    description: store.description || "Produtos digitais da Dragon Store",
+    description: categoryDescription(store.description),
     imageUrl: store.imageUrl || "/dragon-store-hero.png",
     color: store.color,
     minPrice: minProductPrice(products),
@@ -114,7 +131,7 @@ function fallbackData(config: SiteConfig, message?: string): StoreData {
     categories: finalCategories,
     products,
     source: "fallback",
-    sourceMessage: message || "Usando produtos fallback."
+    sourceMessage: message || "Catalogo carregado."
   };
 }
 
@@ -148,13 +165,13 @@ function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
     imageUrl: image,
     thumbnailUrl: raw.thumbnailUrl || "",
     color: raw.color || config.primaryColor,
-    discordInviteUrl: normalizeDiscordInvite(config.discordInviteUrl || raw.discordInviteUrl || ""),
+    discordInviteUrl: publicDiscordInvite(config.discordInviteUrl || raw.discordInviteUrl || ""),
     ticketChannelId: raw.ticketChannelId || "",
     categories: finalCategories,
     products: finalProducts,
     updatedAt: raw.updatedAt,
     source: "bot",
-    sourceMessage: config.manualCatalogEnabled ? "Catalogo manual do painel admin." : "Produtos sincronizados do bot."
+    sourceMessage: "Catalogo carregado."
   };
 }
 

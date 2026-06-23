@@ -2,6 +2,7 @@
 
 import { Copy, ExternalLink, Minus, Plus, ShoppingCart, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { publicDiscordInvite } from "@/lib/catalog";
 import { cartTotal, formatBRL, hasUnknownPrices, parsePrice } from "@/lib/money";
 import type { SiteConfig, StoreData, StoreProduct } from "@/lib/types";
 
@@ -46,14 +47,14 @@ export default function CartDrawer({
   const products = expandedItems(items);
   const total = cartTotal(products);
   const unknown = hasUnknownPrices(products);
-  const discordUrl = config.ticketChannelUrl || store.discordInviteUrl || config.discordInviteUrl;
+  const discordUrl = publicDiscordInvite(config.ticketChannelUrl || store.discordInviteUrl || config.discordInviteUrl);
 
   useEffect(() => {
     setCode(orderCode());
   }, []);
 
   const summary = useMemo(() => {
-    const lines = items.map(item => `${item.quantity}x ${item.product.name} - ${item.product.price}`);
+    const lines = items.map(item => `${item.product.name} ${item.quantity}x - ${item.product.price}`);
     return [
       `PEDIDO DRAGON STORE #${code}`,
       "",
@@ -69,7 +70,7 @@ export default function CartDrawer({
     if (!items.length) return;
     try {
       await navigator.clipboard.writeText(summary);
-      setMessage("Resumo copiado. Abra o Discord e envie o codigo para a equipe finalizar.");
+      setMessage("Resumo copiado. Envie no Discord para finalizar com a equipe.");
     } catch {
       setMessage("Nao consegui copiar automaticamente. Selecione o resumo do pedido e copie manualmente.");
     }
@@ -186,7 +187,7 @@ export default function CartDrawer({
             className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-black text-black transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-45"
           >
             <ExternalLink className="h-4 w-4" />
-            Copiar e abrir Discord
+            Finalizar pelo Discord
           </button>
         </div>
       </aside>
