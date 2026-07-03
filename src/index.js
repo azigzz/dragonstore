@@ -1,10 +1,12 @@
 require("dotenv").config();
 
-const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
+const oauthConfig = require("./config");
+const { countVerifiedUsers } = require("./verifiedStore");
+const { createOAuthServer, pullVerifiedUsersToBackup } = require("./oauthServer");
 const {
   entersState,
   getVoiceConnection,
@@ -35,9 +37,6 @@ const DEFAULT_CANCELLATION_CHANNEL_ID = "1516561891919528037";
 const DEFAULT_STATUS_VOICE_CHANNEL_ID = "1515799363857809494";
 const STAFF_BACKUP_MARKER = "DRAGON_STORE_STAFF_BACKUP_V1";
 const STAFF_BACKUP_FILE = "dragon-store-staff-backup.json";
-
-const PORT = process.env.PORT || 3000;
-http.createServer(handleHttpRequest).listen(PORT, () => console.log(`Health server rodando na porta ${PORT}`));
 
 const DATA_DIR = process.env.BOT_DATA_DIR || path.join(__dirname, "..", "data");
 const PANELS_FILE = path.join(DATA_DIR, "panels.json");
@@ -80,6 +79,7 @@ ensureJsonFile(STAFF_FILE, { guilds: {} });
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates]
 });
+const oauthHttp = createOAuthServer(client, handleHttpRequest);
 client.on("error", error => {
   console.error("Erro do client Discord:", error);
 });
@@ -1381,7 +1381,11 @@ function publicDiscordInviteUrl(value) {
   return raw;
 }
 function isAdmin(member) {
-  return Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator) || member?.roles?.cache?.has(config.adminRoleId));
+  return Boolean(
+    member?.permissions?.has(PermissionFlagsBits.Administrator) ||
+    member?.roles?.cache?.has(config.adminRoleId) ||
+    (oauthConfig.ADMIN_ROLE_ID && member?.roles?.cache?.has(oauthConfig.ADMIN_ROLE_ID))
+  );
 }
 async function requireAdminInteraction(interaction, text = "Você precisa ser ADM para usar esse comando.") {
   if (isAdmin(interaction.member)) return true;
@@ -2641,6 +2645,82 @@ async function handleHttpRequest(req, res) {
 
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
   res.end("Bot online");
+}
+function verificationPanelPayload() {
+  const startUrl = oauthConfig.oauthStartUrl();
+  const ready = Boolean(startUrl && oauthConfig.CLIENT_ID && oauthConfig.CLIENT_SECRET && oauthConfig.REDIRECT_URI);
+  const embed = new EmbedBuilder()
+    .setTitle("Verificacao Dragon Store")
+    .setDescription([
+      "Clique no botao abaixo para liberar seu acesso com seguranca.",
+      "",
+      "**Ao verificar, voce libera acesso ao servidor e autoriza ser adicionado ao servidor reserva oficial caso este servidor caia ou mude.**",
+      "",
+      "A verificacao usa OAuth2 oficial do Discord e solicita apenas `identify` e `guilds.join`."
+    ].join("\n"))
+    .setColor(parseColor("#28f6a1"))
+    .addFields(
+      { name: "Acesso", value: "Cargo cliente aplicado automaticamente.", inline: true },
+      { name: "Reserva oficial", value: "Entrada autorizada em caso de troca/queda.", inline: true },
+      { name: "Privacidade", value: "Tokens ficam salvos apenas no backend do bot.", inline: false }
+    )
+    .setFooter({ text: ready ? "Verificacao rapida pelo Discord" : "OAuth2 ainda nao configurado no .env" })
+    .setTimestamp();
+
+  const button = new ButtonBuilder()
+    .setLabel(ready ? "Verificar" : "OAuth indisponivel")
+    .setStyle(ready ? ButtonStyle.Link : ButtonStyle.Secondary)
+    .setEmoji("✅")
+    .setDisabled(!ready);
+  if (ready) button.setURL(startUrl);
+  else button.setCustomId("oauth:not-ready");
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(button)] };
+}
+async function sendVerificationPanel(message) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode enviar o painel de verificacao.");
+  await message.delete().catch(() => null);
+  return message.channel.send(verificationPanelPayload());
+}
+async function sendVerifiedCount(message) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode ver a contagem de verificados.");
+  await message.delete().catch(() => null);
+  const count = countVerifiedUsers();
+  const embed = new EmbedBuilder()
+    .setTitle("Usuarios verificados")
+    .setDescription(`Total de pessoas verificadas: **${count}**`)
+    .setColor(parseColor("#33d6ff"))
+    .setTimestamp();
+  return message.channel.send({ embeds: [embed] });
+}
+async function pullBackupCommand(message) {
+  if (!isAdmin(message.member)) return message.reply("So ADM pode puxar usuarios para o servidor reserva.");
+  await message.delete().catch(() => null);
+  const loading = await message.channel.send("Puxando usuarios verificados para o servidor reserva...");
+  try {
+    const summary = await pullVerifiedUsersToBackup();
+    const embed = new EmbedBuilder()
+      .setTitle("Backup de verificados")
+      .setDescription(`Processo concluido para **${summary.total}** usuario(s) verificado(s).`)
+      .setColor(parseColor(summary.failed ? "#ffb020" : "#28f6a1"))
+      .addFields(
+        { name: "Adicionados com sucesso", value: String(summary.added), inline: true },
+        { name: "Ja estavam no servidor", value: String(summary.already), inline: true },
+        { name: "Falharam", value: String(summary.failed), inline: true }
+      )
+      .setFooter({ text: "Tokens expirados sao renovados automaticamente antes da tentativa." })
+      .setTimestamp();
+    if (summary.failures?.length) {
+      embed.addFields({
+        name: "Primeiras falhas",
+        value: summary.failures.slice(0, 5).map(item => `\`${item.discord_id}\`: ${item.reason}`).join("\n").slice(0, 1024),
+        inline: false
+      });
+    }
+    return loading.edit({ content: "", embeds: [embed] });
+  } catch (error) {
+    return loading.edit(`Nao consegui puxar backup: ${error.message}`);
+  }
 }
 function getOrderPanel(order, guildId) {
   return (order?.panelId && getPanelById(guildId, order.panelId)) ||
@@ -5085,6 +5165,9 @@ function commandHelpEmbed(member) {
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
     "`/setup-ticket` - envia o painel de ticket.",
     "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
+    "`!verificacao` - envia o painel OAuth2 com botao Verificar.",
+    "`!verificados` - mostra quantas pessoas ja concluiram a verificacao.",
+    "`!puxarbackup` - adiciona verificados ao servidor reserva usando OAuth2.",
     "`/status-loja` ou `!status-loja` - mostra resumo da loja.",
     "`/pedidos` ou `!pedidos` - lista pedidos abertos e permite assumir o proximo.",
     "`/diagnostico` ou `!diagnostico` - mostra saude do bot, KV, Pix, paineis e carrinhos."
@@ -7147,6 +7230,18 @@ client.on("messageCreate", async message => {
     return sendHelpCommand(message);
   }
 
+  if (content === `${prefix}verificacao` || content === `${prefix}verificação`) {
+    return sendVerificationPanel(message);
+  }
+
+  if (content === `${prefix}verificados`) {
+    return sendVerifiedCount(message);
+  }
+
+  if (content === `${prefix}puxarbackup`) {
+    return pullBackupCommand(message);
+  }
+
   if ([`${config.prefix || "!"}configds`, `${config.prefix || "!"}painel`, `${config.prefix || "!"}loja`, `${config.prefix || "!"}setup`].includes(content)) {
     await message.delete().catch(() => null);
     return startConfig(message.channel, message.member, message.author);
@@ -7412,6 +7507,7 @@ if (!token) {
 }
 function shutdown(signal) {
   console.log(`${signal} recebido; salvando persistencia pendente antes de sair.`);
+  oauthHttp?.server?.close?.(() => null);
   drainPersistentWriteQueues()
     .finally(() => closePostgresPool())
     .finally(() => process.exit(0));

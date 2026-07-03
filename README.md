@@ -25,6 +25,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - DM segura para cliente na abertura do carrinho e na finalizacao.
 - Caixa surpresa de brindes digitais com pesos/chances, sorteada somente ao finalizar a compra.
 - Ticket de suporte privado.
+- Verificacao OAuth2 com `identify` e `guilds.join`, cargo cliente automatico e backup para servidor reserva.
 - `/status-loja` com produtos, carrinhos abertos, vendas fechadas, faturamento estimado e ADMs online.
 - `/setupsucess` para definir o canal publico de vendas entregues, com nome do cliente mascarado.
 - `/avaliacao` e `!avaliação` para finalizar carrinho pedindo avaliacao ao cliente.
@@ -44,7 +45,14 @@ Crie as variaveis no Render ou no `.env` local:
 ```env
 DISCORD_TOKEN=token_do_bot
 CLIENT_ID=id_da_aplicacao
+CLIENT_SECRET=secret_da_aplicacao
+REDIRECT_URI=https://seu-bot.onrender.com/auth/discord/callback
 GUILD_ID=id_do_servidor
+MAIN_GUILD_ID=id_do_servidor_principal
+CLIENT_ROLE_ID=id_do_cargo_cliente
+BACKUP_GUILD_ID=id_do_servidor_reserva
+ADMIN_ROLE_ID=id_do_cargo_admin
+PORT=10000
 PUBLIC_STORE_API_TOKEN=gere_um_token_grande_e_dificil
 DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
 STATUS_VOICE_CHANNEL_ID=1515799363857809494
@@ -60,6 +68,14 @@ PUBLIC_STORE_SCAN_MESSAGE_LIMIT=75
 ```
 
 Nunca coloque token real no codigo.
+
+Para o OAuth2 funcionar, no Discord Developer Portal adicione exatamente o mesmo `REDIRECT_URI` em:
+
+```txt
+Application -> OAuth2 -> Redirects
+```
+
+Depois use `!verificacao` em um canal. O bot envia um painel com botao **Verificar** apontando para `/auth/discord/start`.
 
 ## Comandos
 
@@ -104,6 +120,9 @@ No Discord:
 /gastos-reset
 /status-loja
 !status-loja
+!verificacao
+!verificados
+!puxarbackup
 ```
 
 Para `!configds`, `!atendimento` e `!status-loja`, ative no Discord Developer Portal:
@@ -141,6 +160,9 @@ Depois do deploy, use `/diagnostico` no servidor para conferir KV, paineis, Pix,
 Comandos operacionais uteis:
 
 - `/help` ou `!help`: mostra a lista de comandos; ADMs veem tambem a area administrativa.
+- `!verificacao`: envia painel OAuth2 com botao Verificar.
+- `!verificados`: mostra a quantidade de usuarios verificados.
+- `!puxarbackup`: tenta adicionar verificados ao servidor reserva, renovando tokens expirados.
 - `/salvarpix` ou `!salvarpix`: salva o backup do Pix/painel de atendimento no Discord.
 - `/addcar` ou `!addcar [pesquisa]`: dentro de um carrinho, busca produtos de todos os paineis do servidor, deixa pesquisar e pergunta a quantidade antes de adicionar. Ex: `!addcar steam`.
 - `/diagnostico` ou `!diagnostico`: mostra KV, paineis, produtos, Pix, atendimento e alertas de configuracao.
