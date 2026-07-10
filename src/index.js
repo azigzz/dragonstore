@@ -9,6 +9,7 @@ const instanceConfig = require("./instanceConfig");
 const { countVerifiedUsers } = require("./verifiedStore");
 const { createOAuthServer, pullVerifiedUsersToBackup } = require("./oauthServer");
 const { createServerBackup, restoreServerBackup, validateServerBackup } = require("./serverBackup");
+const { currentSetupSummary, provisionStoreSetup } = require("./storeSetup");
 const {
   entersState,
   getVoiceConnection,
@@ -66,11 +67,21 @@ const postgresWriteQueues = new Map();
 let postgresPool = null;
 let postgresStoreReady = false;
 
+function errorSummary(error) {
+  if (!error) return { message: "Erro desconhecido" };
+  return {
+    message: String(error.message || error).slice(0, 500),
+    code: error.code ?? undefined,
+    status: error.status ?? undefined,
+    method: error.method ?? undefined
+  };
+}
+
 process.on("unhandledRejection", error => {
-  console.error("Erro async nao tratado:", error);
+  console.error("Erro async nao tratado:", errorSummary(error));
 });
 process.on("uncaughtException", error => {
-  console.error("Erro fatal nao tratado:", error);
+  console.error("Erro fatal nao tratado:", errorSummary(error));
   drainPersistentWriteQueues().finally(() => closePostgresPool()).finally(() => process.exit(1));
 });
 
@@ -84,10 +95,10 @@ const client = new Client({
 });
 const oauthHttp = createOAuthServer(client, handleHttpRequest);
 client.on("error", error => {
-  console.error("Erro do client Discord:", error);
+  console.error("Erro do client Discord:", errorSummary(error));
 });
 client.on("shardError", error => {
-  console.error("Erro de shard Discord:", error);
+  console.error("Erro de shard Discord:", errorSummary(error));
 });
 
 const sessions = new Map();
@@ -105,6 +116,39 @@ const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
 const ADD_CART_SESSION_TTL_MS = 10 * 60 * 1000;
 const SERVER_RESTORE_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SERVER_BACKUP_BYTES = 8 * 1024 * 1024;
+const CONFIG_SESSION_TTL_MS = 60 * 60 * 1000;
+const EPHEMERAL_CLEANUP_INTERVAL_MS = 60 * 1000;
+
+function sweepExpiredEntries(map, now = Date.now()) {
+  let removed = 0;
+  for (const [key, value] of map.entries()) {
+    if (Number(value?.expiresAt || 0) > 0 && Number(value.expiresAt) <= now) {
+      map.delete(key);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+function cleanupEphemeralState() {
+  const now = Date.now();
+  return sweepExpiredEntries(sessions, now) +
+    sweepExpiredEntries(addCartSessions, now) +
+    sweepExpiredEntries(imageUploads, now) +
+    sweepExpiredEntries(paymentProofUploads, now) +
+    sweepExpiredEntries(serverRestoreSessions, now);
+}
+function ephemeralStateStats() {
+  return {
+    configSessions: sessions.size,
+    addCartSessions: addCartSessions.size,
+    imageUploads: imageUploads.size,
+    paymentProofUploads: paymentProofUploads.size,
+    restoreSessions: serverRestoreSessions.size,
+    actionLocks: orderActionLocks.size
+  };
+}
+const ephemeralCleanupTimer = setInterval(cleanupEphemeralState, EPHEMERAL_CLEANUP_INTERVAL_MS);
+ephemeralCleanupTimer.unref?.();
 
 function cloneJson(data) {
   return JSON.parse(JSON.stringify(data));
@@ -2659,7 +2703,7 @@ async function handleHttpRequest(req, res) {
     try {
       return sendHttpJson(res, 200, await publicStorePayload());
     } catch (error) {
-      console.error("Erro na API publica da loja:", error?.message || error);
+      console.error("Erro na API publica da loja:", errorSummary(error));
       return sendHttpJson(res, 500, { error: "Nao foi possivel carregar a loja." });
     }
   }
@@ -4280,8 +4324,15 @@ async function startConfig(channel, member, user) {
     savePanel(guildId, panel, channel.id);
   }
 
-  sessions.set(sessionId, { guildId, scopeId: channel.id, channelId: channel.id, messageId: msg.id, ownerId: user.id, createdAt: Date.now() });
-  setTimeout(() => sessions.delete(sessionId), 60 * 60 * 1000);
+  sessions.set(sessionId, {
+    guildId,
+    scopeId: channel.id,
+    channelId: channel.id,
+    messageId: msg.id,
+    ownerId: user.id,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + CONFIG_SESSION_TTL_MS
+  });
 }
 function catalogPanelSnapshot(panel) {
   const quick = quickOrderConfig(panel);
@@ -4609,7 +4660,6 @@ async function startFullServerRestoreCommand(context, attachment) {
       userId: user.id,
       expiresAt: Date.now() + SERVER_RESTORE_SESSION_TTL_MS
     });
-    setTimeout(() => serverRestoreSessions.delete(sessionId), SERVER_RESTORE_SESSION_TTL_MS + 1000);
     return actionReply(context, {
       content: [
         `Backup de **${payload.sourceGuildName || payload.guild?.name || "servidor"}** carregado.`,
@@ -4779,6 +4829,10 @@ async function handleServerRestoreButton(interaction) {
     const storeReport = await restoreStoreFromServerBackup(interaction.guild, result, ceoUserId);
     await connectStatusVoiceChannel(interaction.guild).catch(() => null);
     const report = result.report;
+    const reportFiles = report.failures.length ? [new AttachmentBuilder(
+      Buffer.from(["DRAGON STORE - RELATORIO DE RESTAURACAO", "", ...report.failures.map((item, index) => `${index + 1}. ${item}`)].join("\n"), "utf8"),
+      { name: `relatorio-restauracao-${Date.now()}.txt` }
+    )] : [];
     return interaction.editReply({
       content: [
         "Restauracao concluida.",
@@ -4790,7 +4844,8 @@ async function handleServerRestoreButton(interaction) {
         `Falhas nao criticas: ${report.failures.length}.`,
         "Configure seu Pix com /configpix e rode /diagnostico antes de abrir a loja."
       ].join("\n"),
-      components: []
+      components: [],
+      files: reportFiles
     });
   } catch (error) {
     return interaction.editReply({ content: `A restauracao parou por erro: ${error.message}\nO que ja foi criado foi mantido; rode novamente para reaproveitar e continuar.`, components: [] });
@@ -4798,7 +4853,8 @@ async function handleServerRestoreButton(interaction) {
 }
 async function sessionOrReply(interaction, sessionId) {
   const s = sessions.get(sessionId);
-  if (!s) {
+  if (!s || Number(s.expiresAt || 0) <= Date.now()) {
+    if (s) sessions.delete(sessionId);
     await interaction.reply({ content: "Sessão expirada. Use `!configds` ou `/configds` de novo.", ephemeral: true });
     return null;
   }
@@ -5112,9 +5168,6 @@ async function queueImageUpload(interaction, sessionId, pending) {
     expiresAt: Date.now() + IMAGE_UPLOAD_TTL_MS
   };
   imageUploads.set(key, uploadState);
-  setTimeout(() => {
-    if (imageUploads.get(key)?.expiresAt === uploadState.expiresAt) imageUploads.delete(key);
-  }, IMAGE_UPLOAD_TTL_MS + 1000);
 
   const s = sessions.get(sessionId);
   const panel = getPanel(interaction.guildId, s?.scopeId || interaction.channelId);
@@ -5714,6 +5767,7 @@ function commandHelpEmbed(member) {
   const setupCommands = [
     "`/configds`, `!configds`, `!painel`, `!loja` ou `!setup` - abre o configurador da loja no canal.",
     "`/configserver` ou `!configserver` - configura canais, cargos e call de status do servidor.",
+    "`/setup-loja` ou `!setup-loja` - completa o setup sem substituir o que ja existe.",
     "`/backup` ou `!backup` - gera um clone seguro da estrutura, interface e catalogo.",
     "`/restaurar` ou `!restaurar` - recria o backup completo em outro servidor.",
     "`/exportarloja` ou `!exportarloja` - baixa paineis e produtos sem dados privados.",
@@ -5974,6 +6028,7 @@ async function discordPermissionWarnings(guild, panels = [], staff = null) {
   return warnings;
 }
 async function buildDiagnosticsEmbed(guild) {
+  cleanupEphemeralState();
   const guildId = guild?.id || String(guild || "");
   const panelStore = readPanels();
   const guildStore = ensurePanelStore(panelStore, guildId);
@@ -6014,6 +6069,7 @@ async function buildDiagnosticsEmbed(guild) {
     ? `<#${staff.panelChannelId}> / \`${staff.panelMessageId}\``
     : "Nao vinculado";
   const warningLine = warnings.length ? warnings.map(item => `- ${item}`).join("\n") : "Nenhum alerta critico detectado.";
+  const temporary = ephemeralStateStats();
 
   return new EmbedBuilder()
     .setTitle("Diagnostico Dragon Store")
@@ -6024,6 +6080,11 @@ async function buildDiagnosticsEmbed(guild) {
       { name: "Carrinhos", value: `${openOrders.length} aberto(s)\n${processingOrders.length} processando\n${closedOrders.length} fechado(s)\n${cancelledOrders.length} cancelado(s)`, inline: true },
       { name: "Atendimento", value: `${staffWithPix} ADM(s) com Pix\n${onlineStaff} ADM(s) ON\nPainel: ${staffPanelLine}`, inline: false },
       { name: "Auditoria", value: `${auditCount} evento(s) recentes salvos`, inline: true },
+      {
+        name: "Estado temporario",
+        value: `${temporary.configSessions} config | ${temporary.addCartSessions} addcar | ${temporary.imageUploads + temporary.paymentProofUploads} upload(s) | ${temporary.actionLocks} trava(s)`,
+        inline: true
+      },
       { name: "Site/API", value: `Token publico: ${process.env.PUBLIC_STORE_API_TOKEN?.trim() ? "configurado" : "faltando"}\nScan paineis: ${process.env.PUBLIC_STORE_SCAN_CHANNELS === "false" ? "manual" : "ativo"}\nInvite: ${publicDiscordInviteUrl(process.env.DISCORD_INVITE_URL)}`, inline: false },
       { name: "Alertas", value: warningLine.slice(0, 1024), inline: false }
     )
@@ -6035,6 +6096,152 @@ async function sendDiagnosticsCommand(context) {
     return actionReply(context, { content: "So ADM pode ver diagnostico do bot.", ephemeral: true });
   }
   return actionReply(context, { embeds: [await buildDiagnosticsEmbed(context.guild)], ephemeral: true });
+}
+function automaticSetupCurrent(guildId) {
+  const staff = getStaffGuild(guildId);
+  const savedStoreCategoryId = serverConfig(guildId).storeCategoryId || "";
+  const inferredStoreCategoryId = [
+    staff.panelChannelId,
+    completionChannelId(guildId),
+    reviewConfig({ guildId }).channelId,
+    ticketPanelChannelId(guildId)
+  ].map(channelId => client.channels.cache.get(channelId)?.parentId).find(Boolean) || "";
+  return {
+    adminRoleId: adminRoleId(guildId),
+    customerRoleId: configuredCustomerRoleId(guildId),
+    resellerRoleId: resellerRoleId(guildId),
+    cartOpenCategoryId: categoryId(guildId, "cartOpen"),
+    closedCategoryId: categoryId(guildId, "closed"),
+    ticketOpenCategoryId: categoryId(guildId, "ticketOpen"),
+    storeCategoryId: savedStoreCategoryId || inferredStoreCategoryId,
+    staffPanelChannelId: staff.panelChannelId || "",
+    completionChannelId: completionChannelId(guildId),
+    reviewChannelId: reviewConfig({ guildId }).channelId,
+    cancellationChannelId: cancellationChannelId(guildId),
+    ticketPanelChannelId: ticketPanelChannelId(guildId),
+    statusVoiceChannelId: statusVoiceChannelId(guildId)
+  };
+}
+function automaticSetupRows(userId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`autosetup:confirm:${userId}`).setLabel("Criar apenas o que falta").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`autosetup:cancel:${userId}`).setLabel("Cancelar").setStyle(ButtonStyle.Secondary)
+  )];
+}
+async function showAutomaticSetup(context) {
+  if (!serverBackupManager(context)) {
+    return actionReply(context, { content: "So o dono do servidor ou o CEO configurado pode abrir o setup automatico.", ephemeral: true });
+  }
+  await Promise.all([context.guild.roles.fetch(), context.guild.channels.fetch()]);
+  const summary = currentSetupSummary(context.guild, automaticSetupCurrent(context.guild.id));
+  const ready = summary.filter(item => item.ready).length;
+  const lines = summary.map(item => `${item.ready ? "OK" : "FALTA"} - ${item.label}${item.id ? `: \`${item.id}\`` : ""}`);
+  const embed = new EmbedBuilder()
+    .setTitle("Setup seguro da loja")
+    .setDescription([
+      `Prontidao atual: **${ready}/${summary.length}** itens principais.`,
+      "O assistente reaproveita IDs validos e nomes existentes. Ele nao apaga, renomeia ou substitui produtos, Pix, pedidos e paineis publicados."
+    ].join("\n\n"))
+    .setColor(ready === summary.length ? 0x57f287 : 0xfee75c)
+    .addFields({ name: "Checklist", value: lines.join("\n").slice(0, 1024), inline: false })
+    .setFooter({ text: `Instancia ${instanceConfig.STORE_INSTANCE_ID} | Operacao idempotente` })
+    .setTimestamp();
+  return actionReply(context, {
+    embeds: [embed],
+    components: automaticSetupRows(actionUser(context).id),
+    ephemeral: true
+  });
+}
+function isTicketPanelMessage(message) {
+  return message?.author?.id === client.user?.id && message.components?.some(row =>
+    row.components?.some(component => componentCustomId(component) === "openticket")
+  );
+}
+async function ensureAutomaticStaffPanel(guild, channelId) {
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || channel.type === ChannelType.GuildForum) return null;
+  const staff = getStaffGuild(guild.id);
+  let message = await recoverStaffPanelMessage(guild, channel, staff);
+  const payload = { embeds: [buildStaffPanelEmbed(guild.id)], components: staffPanelRows() };
+  if (message) await message.edit(payload);
+  else message = await channel.send(payload);
+  staff.panelChannelId = channel.id;
+  staff.panelMessageId = message.id;
+  saveStaffGuild(guild.id, staff);
+  return message;
+}
+async function ensureAutomaticTicketPanel(guild, channelId) {
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || channel.type === ChannelType.GuildForum) return null;
+  let message = await findBotMessage(channel, isTicketPanelMessage);
+  const button = new ButtonBuilder()
+    .setCustomId("openticket")
+    .setLabel(config.ticketPanel.buttonLabel)
+    .setEmoji(config.ticketPanel.buttonEmoji)
+    .setStyle(ButtonStyle.Primary);
+  const payload = { embeds: [ticketPanelEmbed()], components: [new ActionRowBuilder().addComponents(button)] };
+  if (message) await message.edit(payload);
+  else message = await channel.send(payload);
+  return message;
+}
+async function handleAutomaticSetupButton(interaction) {
+  const [, action, ownerId] = interaction.customId.split(":");
+  if (interaction.user.id !== ownerId || !serverBackupManager(interaction)) {
+    return interaction.reply({ content: "So quem abriu o setup pode confirmar.", ephemeral: true });
+  }
+  if (action === "cancel") return interaction.update({ content: "Setup cancelado. Nada foi alterado.", embeds: [], components: [] });
+  await interaction.deferUpdate();
+  try {
+    const current = automaticSetupCurrent(interaction.guildId);
+    const result = await provisionStoreSetup(interaction.guild, current, {
+      ceoUserId: String(process.env.CEO_USER_ID || interaction.user.id),
+      botUserId: client.user.id,
+      onProgress: text => interaction.editReply({ content: text, embeds: [], components: [] }).catch(() => null)
+    });
+    saveServerConfig(interaction.guildId, {
+      ...result.roles,
+      ...result.categories,
+      completionChannelId: result.channels.completionChannelId,
+      reviewChannelId: result.channels.reviewChannelId,
+      cancellationChannelId: result.channels.cancellationChannelId,
+      ticketPanelChannelId: result.channels.ticketPanelChannelId,
+      statusVoiceChannelId: result.channels.statusVoiceChannelId,
+      statusVoiceEnabled: true,
+      resellerDiscountPercent: resellerDiscountPercent(interaction.guildId)
+    });
+    const staff = getStaffGuild(interaction.guildId);
+    staff.panelChannelId = result.channels.staffPanelChannelId;
+    staff.customerRoleId = result.roles.customerRoleId;
+    saveStaffGuild(interaction.guildId, staff);
+    await ensureAutomaticStaffPanel(interaction.guild, result.channels.staffPanelChannelId);
+    await ensureAutomaticTicketPanel(interaction.guild, result.channels.ticketPanelChannelId);
+    const panelStore = readPanels();
+    const guildStore = ensurePanelStore(panelStore, interaction.guildId);
+    if (!allPublicPanels(guildStore).some(panel => (panel.products || []).length)) {
+      const productsChannel = await interaction.guild.channels.fetch(result.channels.productsChannelId).catch(() => null);
+      if (productsChannel?.isTextBased()) await startConfig(productsChannel, interaction.member, interaction.user);
+    }
+    await flushPersistentFile(STAFF_FILE);
+    await connectStatusVoiceChannel(interaction.guild).catch(() => null);
+    await saveStaffBackup(interaction.guild, await interaction.guild.channels.fetch(result.channels.staffPanelChannelId).catch(() => null)).catch(() => null);
+    writeAuditLog(interaction, "server.automatic_setup", { created: result.report.created, reused: result.report.reused });
+    return interaction.editReply({
+      content: [
+        "Setup concluido sem substituir configuracoes validas.",
+        `Criados: **${result.report.created.length}** | Reaproveitados: **${result.report.reused.length}**.`,
+        `Produtos: <#${result.channels.productsChannelId}> | Atendimento: <#${result.channels.staffPanelChannelId}>.`,
+        "Agora use /configpix e /diagnostico."
+      ].join("\n"),
+      embeds: [],
+      components: []
+    });
+  } catch (error) {
+    return interaction.editReply({
+      content: `O setup parou em: ${error.message}\nO que ja estava certo foi mantido. Corrija a permissao indicada e execute novamente.`,
+      embeds: [],
+      components: []
+    });
+  }
 }
 function boolText(value) {
   return value ? "Ligado" : "Desligado";
@@ -6645,10 +6852,6 @@ function canEditOrder(member, userId, order) {
 function rememberAddCartSession(session) {
   session.expiresAt = Date.now() + ADD_CART_SESSION_TTL_MS;
   addCartSessions.set(session.id, session);
-  setTimeout(() => {
-    const current = addCartSessions.get(session.id);
-    if (current?.expiresAt && current.expiresAt <= Date.now()) addCartSessions.delete(session.id);
-  }, ADD_CART_SESSION_TTL_MS + 1000);
   return session;
 }
 function getAddCartSession(interaction) {
@@ -7912,6 +8115,11 @@ client.on("messageCreate", async message => {
     return startFullServerRestoreCommand(message, message.attachments.first());
   }
 
+  if (content === `${prefix}setup-loja`) {
+    await message.delete().catch(() => null);
+    return showAutomaticSetup(message);
+  }
+
   if (content === `${prefix}exportarloja`) {
     return exportStoreCatalog(message);
   }
@@ -8067,6 +8275,7 @@ async function handleInteraction(interaction) {
         return startConfig(interaction.channel, interaction.member, interaction.user);
       }
       if (interaction.commandName === "configserver") return showServerConfig(interaction);
+      if (interaction.commandName === "setup-loja") return showAutomaticSetup(interaction);
       if (interaction.commandName === "backup") return createFullServerBackupCommand(interaction);
       if (interaction.commandName === "restaurar") return startFullServerRestoreCommand(interaction, interaction.options.getAttachment("arquivo"));
       if (interaction.commandName === "exportarloja") return exportStoreCatalog(interaction);
@@ -8137,6 +8346,7 @@ async function handleInteraction(interaction) {
       if (interaction.commandName === "gastos-reset") return resetSpendCommand(interaction);
     }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith("autosetup:")) return handleAutomaticSetupButton(interaction);
       if (interaction.customId.startsWith("serverrestore:")) return handleServerRestoreButton(interaction);
       if (interaction.customId.startsWith("rmconfirm:")) return handleRemoveConfirm(interaction);
       if (interaction.customId.startsWith("rmcancel:")) return handleRemoveCancel(interaction);
@@ -8191,8 +8401,14 @@ async function handleInteraction(interaction) {
 }
 
 async function handleInteractionError(interaction, err) {
-  console.error(err);
-  const payload = { content: `Erro: \`${err.message}\``, ephemeral: true };
+  const summary = errorSummary(err);
+  if ([10062, 40060].includes(Number(summary.code))) {
+    console.warn(`Interacao ignorada (${summary.code}): ${summary.message}`);
+    return;
+  }
+  console.error("Falha ao processar interacao:", summary);
+  const safeMessage = summary.message.replace(/`/g, "'").slice(0, 1500);
+  const payload = { content: `Erro: \`${safeMessage}\``, ephemeral: true };
   await actionReply(interaction, payload).catch(() => null);
 }
 
@@ -8203,6 +8419,7 @@ if (!token) {
 }
 function shutdown(signal) {
   console.log(`${signal} recebido; salvando persistencia pendente antes de sair.`);
+  clearInterval(ephemeralCleanupTimer);
   oauthHttp?.server?.close?.(() => null);
   drainPersistentWriteQueues()
     .finally(() => closePostgresPool())
@@ -8215,6 +8432,6 @@ async function boot() {
   await client.login(token);
 }
 boot().catch(error => {
-  console.error("Falha ao iniciar bot:", error);
+  console.error("Falha ao iniciar bot:", errorSummary(error));
   process.exit(1);
 });

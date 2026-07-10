@@ -16,6 +16,9 @@ const commands = [
     .setName("configserver")
     .setDescription("Abre as configuracoes gerais do servidor."),
   new SlashCommandBuilder()
+    .setName("setup-loja")
+    .setDescription("Cria somente os cargos e canais que faltam na loja."),
+  new SlashCommandBuilder()
     .setName("backup")
     .setDescription("Gera um backup completo da estrutura e da loja."),
   new SlashCommandBuilder()
@@ -244,7 +247,11 @@ async function deployCommands() {
     await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
     console.log("Comandos registrados.");
   } catch (err) {
-    console.error(err);
+    console.error("Falha ao registrar comandos:", {
+      message: String(err?.message || err).slice(0, 500),
+      code: err?.code,
+      status: err?.status
+    });
     process.exit(1);
   }
 }

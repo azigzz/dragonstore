@@ -72,6 +72,7 @@ Integre o Mercado Pago somente no segundo servico. Use uma aplicacao e um webhoo
 ## Checklist antes de abrir
 
 - Rode `/configserver` e configure cargo ADM, cargo cliente, premium, categorias, canais e call.
+- Em servidor vazio, use `/setup-loja` para criar somente a estrutura que estiver faltando.
 - Rode `/diagnostico` e corrija todos os alertas.
 - Configure o Pix apenas dos ADMs da loja nova.
 - Abra um carrinho de teste, pague, entregue, finalize e cancele outro.

@@ -20,6 +20,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - Atendimento ON/OFF por ADM.
 - Presenca em call de status enquanto o bot estiver ligado.
 - `/configserver` e `!configserver` para trocar call, canais, cargos e desconto pelo Discord.
+- `/setup-loja` e `!setup-loja` para criar apenas cargos/canais ausentes, sem substituir a loja configurada.
 - `/backup` e `/restaurar` para clonar estrutura, permissoes, visual, paineis e catalogo em outra instalacao.
 - Pix, QR Code e mensagem extra por atendente.
 - Assumir compra, reenviar Pix e finalizar compra.
@@ -99,6 +100,8 @@ No Discord:
 !configds
 /configserver
 !configserver
+/setup-loja
+!setup-loja
 !painel
 !loja
 !setup
