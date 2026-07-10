@@ -45,6 +45,8 @@ Crie as variaveis no Render ou no `.env` local:
 ```env
 DISCORD_TOKEN=token_do_bot
 CLIENT_ID=id_da_aplicacao
+STORE_INSTANCE_ID=primary
+STRICT_GUILD_ISOLATION=true
 CLIENT_SECRET=secret_da_aplicacao
 REDIRECT_URI=https://seu-bot.onrender.com/auth/discord/callback
 GUILD_ID=id_do_servidor
@@ -66,6 +68,8 @@ PUBLIC_STORE_SCAN_CHANNELS=true
 PUBLIC_STORE_SCAN_CHANNEL_LIMIT=80
 PUBLIC_STORE_SCAN_MESSAGE_LIMIT=75
 ```
+
+Para operar uma segunda loja sem misturar pedidos, Pix ou pagamentos, use outra instancia do bot. O passo a passo esta em [docs/SECOND-STORE-SETUP.md](docs/SECOND-STORE-SETUP.md).
 
 Nunca coloque token real no codigo.
 
@@ -123,6 +127,10 @@ No Discord:
 !verificacao
 !verificados
 !puxarbackup
+/exportarloja
+!exportarloja
+/importarloja
+!importarloja 1
 ```
 
 Para `!configds`, `!atendimento` e `!status-loja`, ative no Discord Developer Portal:

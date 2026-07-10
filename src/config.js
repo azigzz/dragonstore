@@ -1,4 +1,5 @@
 const path = require("node:path");
+const { STORE_INSTANCE_ID } = require("./instanceConfig");
 
 // Variaveis para colocar no .env do bot:
 // DISCORD_TOKEN=token_do_bot
@@ -12,6 +13,9 @@ const path = require("node:path");
 // PORT=10000
 
 const DATA_DIR = process.env.BOT_DATA_DIR || path.join(__dirname, "..", "data");
+const verifiedFileName = STORE_INSTANCE_ID === "primary"
+  ? "verifiedUsers.json"
+  : `verifiedUsers.${STORE_INSTANCE_ID}.json`;
 
 function requiredEnv(name) {
   return String(process.env[name] || "").trim();
@@ -29,7 +33,7 @@ function oauthStartUrl() {
 
 module.exports = {
   DATA_DIR,
-  VERIFIED_USERS_FILE: path.join(DATA_DIR, "verifiedUsers.json"),
+  VERIFIED_USERS_FILE: path.join(DATA_DIR, verifiedFileName),
   DISCORD_TOKEN: requiredEnv("DISCORD_TOKEN"),
   CLIENT_ID: requiredEnv("CLIENT_ID"),
   CLIENT_SECRET: requiredEnv("CLIENT_SECRET"),

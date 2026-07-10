@@ -21,6 +21,25 @@ const commands = [
     .setName("configserver")
     .setDescription("Abre as configuracoes gerais do servidor."),
   new SlashCommandBuilder()
+    .setName("exportarloja")
+    .setDescription("Exporta paineis e produtos sem dados privados."),
+  new SlashCommandBuilder()
+    .setName("importarloja")
+    .setDescription("Importa um painel exportado para este canal.")
+    .addAttachmentOption(option =>
+      option
+        .setName("arquivo")
+        .setDescription("Arquivo JSON criado pelo comando exportarloja.")
+        .setRequired(true)
+    )
+    .addStringOption(option =>
+      option
+        .setName("painel")
+        .setDescription("Numero ou titulo do painel dentro do arquivo.")
+        .setMaxLength(100)
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName("setup-ticket")
     .setDescription("Envia o painel de ticket no canal configurado."),
   new SlashCommandBuilder()

@@ -5,6 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
 const oauthConfig = require("./config");
+const instanceConfig = require("./instanceConfig");
 const { countVerifiedUsers } = require("./verifiedStore");
 const { createOAuthServer, pullVerifiedUsersToBackup } = require("./oauthServer");
 const {
@@ -36,17 +37,18 @@ const DEFAULT_COMPLETION_CHANNEL_ID = "1515799364155478138";
 const DEFAULT_CANCELLATION_CHANNEL_ID = "1516561891919528037";
 const DEFAULT_STATUS_VOICE_CHANNEL_ID = "1515799363857809494";
 const STAFF_BACKUP_MARKER = "DRAGON_STORE_STAFF_BACKUP_V1";
-const STAFF_BACKUP_FILE = "dragon-store-staff-backup.json";
+const INSTANCE_FILE_SUFFIX = instanceConfig.STORE_INSTANCE_ID === "primary" ? "" : `.${instanceConfig.STORE_INSTANCE_ID}`;
+const STAFF_BACKUP_FILE = `dragon-store-staff-backup${INSTANCE_FILE_SUFFIX}.json`;
 
 const DATA_DIR = process.env.BOT_DATA_DIR || path.join(__dirname, "..", "data");
-const PANELS_FILE = path.join(DATA_DIR, "panels.json");
-const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
-const STAFF_FILE = path.join(DATA_DIR, "staff.json");
+const PANELS_FILE = path.join(DATA_DIR, `panels${INSTANCE_FILE_SUFFIX}.json`);
+const ORDERS_FILE = path.join(DATA_DIR, `orders${INSTANCE_FILE_SUFFIX}.json`);
+const STAFF_FILE = path.join(DATA_DIR, `staff${INSTANCE_FILE_SUFFIX}.json`);
 const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "";
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "";
-const BOT_KV_PREFIX = process.env.BOT_KV_PREFIX || "dragon-store:bot";
+const BOT_KV_PREFIX = instanceConfig.isolatedStoragePrefix(process.env.BOT_KV_PREFIX);
 const DATABASE_URL = process.env.DATABASE_URL?.trim() || "";
-const BOT_DB_PREFIX = process.env.BOT_DB_PREFIX || BOT_KV_PREFIX;
+const BOT_DB_PREFIX = instanceConfig.isolatedStoragePrefix(process.env.BOT_DB_PREFIX || BOT_KV_PREFIX);
 const KV_FILE_KEYS = {
   [PANELS_FILE]: `${BOT_KV_PREFIX}:panels`,
   [ORDERS_FILE]: `${BOT_KV_PREFIX}:orders`,
@@ -1279,7 +1281,7 @@ function plainText(value) {
 }
 function resellerRoleId(guildId = "") {
   const saved = guildId ? serverConfig(guildId).resellerRoleId : "";
-  return String(saved || process.env.RESELLER_ROLE_ID || config.resellerRoleId || DEFAULT_RESELLER_ROLE_ID || "").trim();
+  return String(saved || process.env.RESELLER_ROLE_ID || legacyStoreValue(config.resellerRoleId, DEFAULT_RESELLER_ROLE_ID)).trim();
 }
 function resellerDiscountPercent(guildId = "") {
   const saved = guildId ? serverConfig(guildId).resellerDiscountPercent : undefined;
@@ -1380,11 +1382,26 @@ function publicDiscordInviteUrl(value) {
   if (/5fyPxMXBTC|Y2MqnVwXnq|rapp28qmR4/i.test(raw)) return target;
   return raw;
 }
+function legacyStoreValue(value, fallback = "") {
+  return instanceConfig.STORE_INSTANCE_ID === "primary" ? (value || fallback) : "";
+}
+function adminRoleId(guildId = "") {
+  const saved = guildId ? serverConfig(guildId).adminRoleId : "";
+  return String(saved || process.env.ADMIN_ROLE_ID || legacyStoreValue(config.adminRoleId)).trim();
+}
+function categoryId(guildId, key) {
+  const saved = guildId ? serverConfig(guildId)[`${key}CategoryId`] : "";
+  const envKey = `${String(key).replace(/([A-Z])/g, "_$1").toUpperCase()}_CATEGORY_ID`;
+  return String(saved || process.env[envKey] || legacyStoreValue(config.categories?.[key])).trim();
+}
+function ticketPanelChannelId(guildId = "") {
+  const saved = guildId ? serverConfig(guildId).ticketPanelChannelId : "";
+  return String(saved || process.env.TICKET_PANEL_CHANNEL_ID || legacyStoreValue(config.ticketPanel?.channelId)).trim();
+}
 function isAdmin(member) {
   return Boolean(
     member?.permissions?.has(PermissionFlagsBits.Administrator) ||
-    member?.roles?.cache?.has(config.adminRoleId) ||
-    (oauthConfig.ADMIN_ROLE_ID && member?.roles?.cache?.has(oauthConfig.ADMIN_ROLE_ID))
+    member?.roles?.cache?.has(adminRoleId(member?.guild?.id || ""))
   );
 }
 async function requireAdminInteraction(interaction, text = "Você precisa ser ADM para usar esse comando.") {
@@ -2596,7 +2613,7 @@ async function publicStorePayload() {
     thumbnailUrl: panel.thumbnailUrl || "",
     color: normColor(panel.color || "#9b00ff"),
     discordInviteUrl: publicDiscordInviteUrl(process.env.DISCORD_INVITE_URL),
-    ticketChannelId: config.ticketPanel?.channelId || "",
+    ticketChannelId: ticketPanelChannelId(guildId),
     categories,
     products,
     updatedAt: panel.updatedAt || new Date().toISOString()
@@ -2981,7 +2998,7 @@ async function buildOrderTranscriptAttachment(channel, order, panel, status) {
 }
 function completionChannelId(guildId = "") {
   const saved = guildId ? serverConfig(guildId).completionChannelId : "";
-  return String(saved || process.env.COMPLETION_CHANNEL_ID || config.completion?.channelId || DEFAULT_COMPLETION_CHANNEL_ID).trim();
+  return String(saved || process.env.COMPLETION_CHANNEL_ID || legacyStoreValue(config.completion?.channelId, DEFAULT_COMPLETION_CHANNEL_ID)).trim();
 }
 function completionFeedEnabled() {
   return config.completion?.enabled !== false && process.env.COMPLETION_FEED_ENABLED !== "false";
@@ -2991,7 +3008,7 @@ function completionTranscriptEnabled() {
 }
 function cancellationChannelId(guildId = "") {
   const saved = guildId ? serverConfig(guildId).cancellationChannelId : "";
-  return String(saved || process.env.CANCELLATION_CHANNEL_ID || config.cancellation?.channelId || DEFAULT_CANCELLATION_CHANNEL_ID).trim();
+  return String(saved || process.env.CANCELLATION_CHANNEL_ID || legacyStoreValue(config.cancellation?.channelId, DEFAULT_CANCELLATION_CHANNEL_ID)).trim();
 }
 function cancellationFeedEnabled() {
   return config.cancellation?.enabled !== false && process.env.CANCELLATION_FEED_ENABLED !== "false";
@@ -3015,8 +3032,7 @@ function configuredCustomerRoleIds(guildId) {
     staff.customerRoleId,
     serverConfig(guildId).customerRoleId,
     process.env.CUSTOMER_ROLE_ID,
-    config.customerRoleId,
-    DEFAULT_CUSTOMER_ROLE_ID
+    legacyStoreValue(config.customerRoleId, DEFAULT_CUSTOMER_ROLE_ID)
   ].map(value => String(value || "").trim()).filter(Boolean).filter((value, index, list) => list.indexOf(value) === index);
 }
 async function grantCustomerRole(guild, userId) {
@@ -4263,6 +4279,137 @@ async function startConfig(channel, member, user) {
   sessions.set(sessionId, { guildId, scopeId: channel.id, channelId: channel.id, messageId: msg.id, ownerId: user.id, createdAt: Date.now() });
   setTimeout(() => sessions.delete(sessionId), 60 * 60 * 1000);
 }
+function catalogPanelSnapshot(panel) {
+  const quick = quickOrderConfig(panel);
+  return {
+    title: clampText(panel.title, 256, "Painel da loja"),
+    description: clampText(panel.description, 4096),
+    color: normColor(panel.color),
+    imageUrl: validUrl(panel.imageUrl) ? String(panel.imageUrl || "") : "",
+    thumbnailUrl: validUrl(panel.thumbnailUrl) ? String(panel.thumbnailUrl || "") : "",
+    quickOrder: {
+      title: clampText(quick.title, 256, "Compre aqui"),
+      description: clampText(quick.description, 4096),
+      buttonLabel: clampText(quick.buttonLabel, 80, "Comprar"),
+      question1: clampText(quick.question1, 45),
+      question2: clampText(quick.question2, 45)
+    },
+    products: (panel.products || []).slice(0, 250).map(item => ({
+      name: clampText(item.name, 100, "Produto"),
+      price: clampText(item.price, 40, "R$ 0,00"),
+      priceCents: Number.isFinite(Number(item.priceCents)) ? Number(item.priceCents) : priceCentsFromValue(item.price),
+      description: clampText(item.description, 1000, "Produto da loja."),
+      stock: clampText(item.stock, 40, "infinito"),
+      imageUrl: validUrl(item.imageUrl) ? String(item.imageUrl || "") : "",
+      type: clampText(item.type, 40, "product"),
+      rewards: Array.isArray(item.rewards) ? cloneJson(item.rewards.slice(0, 100)) : undefined
+    }))
+  };
+}
+function storeCatalogExport(guildId) {
+  const store = readPanels();
+  const guildStore = ensurePanelStore(store, guildId);
+  const panels = allPublicPanels(guildStore)
+    .filter(panel => (panel.products || []).length || panel.title || panel.description)
+    .map(catalogPanelSnapshot);
+  return {
+    format: "dragon-store-catalog",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    sourceInstance: instanceConfig.STORE_INSTANCE_ID,
+    panels
+  };
+}
+async function exportStoreCatalog(context) {
+  if (!isAdmin(context.member)) return actionReply(context, { content: "So ADM pode exportar a loja.", ephemeral: true });
+  const data = storeCatalogExport(actionGuildId(context));
+  if (!data.panels.length) return actionReply(context, { content: "Nao encontrei paineis para exportar.", ephemeral: true });
+  const file = new AttachmentBuilder(Buffer.from(JSON.stringify(data, null, 2), "utf8"), {
+    name: `catalogo-${instanceConfig.STORE_INSTANCE_ID}-${Date.now()}.json`
+  });
+  return actionReply(context, {
+    content: `Exportei **${data.panels.length} painel(is)**. O arquivo contem somente catalogo e visual; nao leva Pix, equipe, clientes, vendas, carrinhos, tokens ou IDs de canais.`,
+    files: [file],
+    ephemeral: true
+  });
+}
+async function readCatalogAttachment(attachment) {
+  if (!attachment?.url) throw new Error("Envie o arquivo JSON gerado por !exportarloja.");
+  if (Number(attachment.size) > 2 * 1024 * 1024) throw new Error("O arquivo passa do limite de 2 MB.");
+  const response = await fetch(attachment.url, { signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error(`Nao consegui baixar o arquivo (HTTP ${response.status}).`);
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > 2 * 1024 * 1024) throw new Error("O arquivo passa do limite de 2 MB.");
+  const payload = JSON.parse(text);
+  if (payload?.format !== "dragon-store-catalog" || payload?.version !== 1 || !Array.isArray(payload.panels)) {
+    throw new Error("Esse nao e um catalogo Dragon Store valido.");
+  }
+  if (!payload.panels.length || payload.panels.length > 100) throw new Error("Quantidade de paineis invalida no arquivo.");
+  return payload;
+}
+function selectImportedPanel(payload, selector = "") {
+  const wanted = plainText(selector).trim();
+  if (!wanted && payload.panels.length === 1) return payload.panels[0];
+  if (/^\d+$/.test(wanted)) return payload.panels[Number(wanted) - 1] || null;
+  if (wanted) return payload.panels.find(panel => plainText(panel.title).trim() === wanted) || null;
+  return null;
+}
+function importedPanelForChannel(source, guildId, channelId) {
+  const panel = defaultPanel(guildId, channelId);
+  panel.title = clampText(source.title, 256, panel.title);
+  panel.description = clampText(source.description, 4096, panel.description);
+  panel.color = normColor(source.color);
+  panel.imageUrl = validUrl(source.imageUrl) ? String(source.imageUrl || "") : "";
+  panel.thumbnailUrl = validUrl(source.thumbnailUrl) ? String(source.thumbnailUrl || "") : "";
+  const quick = source.quickOrder && typeof source.quickOrder === "object" ? source.quickOrder : {};
+  panel.quickOrder = {
+    ...defaultQuickOrder(),
+    title: clampText(quick.title, 256, "Compre aqui"),
+    description: clampText(quick.description, 4096, defaultQuickOrder().description),
+    buttonLabel: clampText(quick.buttonLabel, 80, "Comprar"),
+    question1: clampText(quick.question1, 45),
+    question2: clampText(quick.question2, 45),
+    publishedChannelId: "",
+    publishedMessageId: ""
+  };
+  panel.products = (Array.isArray(source.products) ? source.products : []).slice(0, 250).map(item => ({
+    id: `p${random7()}`,
+    name: clampText(item?.name, 100, "Produto"),
+    price: clampText(item?.price, 40, "R$ 0,00"),
+    priceCents: Number.isFinite(Number(item?.priceCents)) ? Number(item.priceCents) : priceCentsFromValue(item?.price),
+    description: clampText(item?.description, 1000, "Produto da loja."),
+    stock: clampText(item?.stock, 40, "infinito"),
+    imageUrl: validUrl(item?.imageUrl) ? String(item.imageUrl || "") : "",
+    type: clampText(item?.type, 40, "product"),
+    rewards: Array.isArray(item?.rewards) ? cloneJson(item.rewards.slice(0, 100)) : undefined
+  }));
+  return panel;
+}
+async function importStoreCatalog(context, attachment, selector = "") {
+  if (!isAdmin(context.member)) return actionReply(context, { content: "So ADM pode importar catalogo.", ephemeral: true });
+  try {
+    const payload = await readCatalogAttachment(attachment);
+    const source = selectImportedPanel(payload, selector);
+    if (!source) {
+      const choices = payload.panels.slice(0, 20).map((panel, index) => `${index + 1}. ${clampText(panel.title, 80, "Sem titulo")}`).join("\n");
+      return actionReply(context, {
+        content: `Escolha qual painel importar pelo numero ou titulo. Exemplo: \`!importarloja 2\` junto do arquivo.\n\n${choices}`,
+        ephemeral: true
+      });
+    }
+    const panel = importedPanelForChannel(source, actionGuildId(context), context.channel.id);
+    savePanel(actionGuildId(context), panel, context.channel.id);
+    writeAuditLog(context, "store.catalog_imported", { panelId: panel.id, title: panel.title, productCount: panel.products.length });
+    await flushPersistentFile(PANELS_FILE);
+    await actionReply(context, {
+      content: `Painel **${panel.title}** importado neste canal com **${panel.products.length} produto(s)**. Agora abra \`!configds\` para revisar e publicar.`,
+      ephemeral: true
+    });
+    return startConfig(context.channel, context.member, actionUser(context));
+  } catch (error) {
+    return actionReply(context, { content: `Nao consegui importar: ${error.message}`, ephemeral: true });
+  }
+}
 async function sessionOrReply(interaction, sessionId) {
   const s = sessions.get(sessionId);
   if (!s) {
@@ -4969,14 +5116,18 @@ async function handlePresetSelect(interaction) {
 }
 
 async function privateChannel(guild, user, name, parent) {
+  const staffRoleId = adminRoleId(guild.id);
+  const overwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
+    { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageMessages] }
+  ];
+  if (staffRoleId) {
+    overwrites.splice(2, 0, { id: staffRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] });
+  }
   return guild.channels.create({
     name, type: ChannelType.GuildText, parent,
-    permissionOverwrites: [
-      { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-      { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
-      { id: config.adminRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
-      { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageMessages] }
-    ]
+    permissionOverwrites: overwrites
   });
 }
 function panelForManualCart(guildId, channelId) {
@@ -5012,7 +5163,7 @@ async function openManualCartCommand(context, targetUser) {
   const panel = panelForManualCart(guild.id, context.channel.id);
   const discount = discountForMember(member);
   const id = orderId("order");
-  const ch = await privateChannel(guild, targetUser, `carrinho-${safeName(targetUser.username)}-aberto-${id}`, config.categories.cartOpen);
+  const ch = await privateChannel(guild, targetUser, `carrinho-${safeName(targetUser.username)}-aberto-${id}`, categoryId(guild.id, "cartOpen") || undefined);
   const order = {
     id,
     guildId: guild.id,
@@ -5149,6 +5300,23 @@ function proofButtonRow(orderId) {
 function cartActionRows(orderId) {
   return [cartButtons(orderId), proofButtonRow(orderId)];
 }
+function helpFields(name, lines) {
+  const fields = [];
+  let chunk = [];
+  let length = 0;
+  for (const line of lines) {
+    const extra = line.length + (chunk.length ? 1 : 0);
+    if (chunk.length && length + extra > 1000) {
+      fields.push({ name: fields.length ? `${name} (continua)` : name, value: chunk.join("\n"), inline: false });
+      chunk = [];
+      length = 0;
+    }
+    chunk.push(line);
+    length += line.length + (chunk.length > 1 ? 1 : 0);
+  }
+  if (chunk.length) fields.push({ name: fields.length ? `${name} (continua)` : name, value: chunk.join("\n"), inline: false });
+  return fields;
+}
 function commandHelpEmbed(member) {
   const prefix = config.prefix || "!";
   const admin = isAdmin(member);
@@ -5160,6 +5328,8 @@ function commandHelpEmbed(member) {
   const setupCommands = [
     "`/configds`, `!configds`, `!painel`, `!loja` ou `!setup` - abre o configurador da loja no canal.",
     "`/configserver` ou `!configserver` - configura canais, cargos e call de status do servidor.",
+    "`/exportarloja` ou `!exportarloja` - baixa paineis e produtos sem dados privados.",
+    "`/importarloja` ou `!importarloja [painel]` - importa um painel exportado neste canal.",
     "`/setup-atendimento` ou `!atendimento` - cria/atualiza o painel ON/OFF dos ADMs.",
     "`/configpix` ou `!configpix` - configura Pix do ADM.",
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
@@ -5202,10 +5372,7 @@ function commandHelpEmbed(member) {
     .setTimestamp();
 
   if (admin) {
-    embed.addFields(
-      { name: "Admin - Setup", value: setupCommands.join("\n"), inline: false },
-      { name: "Admin - Vendas", value: salesCommands.join("\n"), inline: false }
-    );
+    embed.addFields(...helpFields("Admin - Setup", setupCommands), ...helpFields("Admin - Vendas", salesCommands));
   } else {
     embed.addFields({ name: "Administracao", value: "Comandos de admin aparecem aqui apenas para quem tem permissao.", inline: false });
   }
@@ -5364,7 +5531,7 @@ async function discordPermissionWarnings(guild, panels = [], staff = null) {
   if (missingBase.length) warnings.push(`Bot sem permissao global: ${missingBase.map(permissionName).join(", ")}.`);
 
   const roleIds = [
-    ["cargo ADM", config.adminRoleId],
+    ["cargo ADM", adminRoleId(guild.id)],
     ["cargo cliente", configuredCustomerRoleId(guild.id)],
     ["cargo premium/revendedor", resellerRoleId(guild.id)]
   ].filter(([, roleId]) => roleId);
@@ -5380,10 +5547,10 @@ async function discordPermissionWarnings(guild, panels = [], staff = null) {
   }
 
   const channelTargets = [
-    ["categoria de carrinhos", config.categories?.cartOpen],
-    ["categoria de fechados", config.categories?.closed],
-    ["categoria de tickets", config.categories?.ticketOpen],
-    ["canal do painel de ticket", config.ticketPanel?.channelId],
+    ["categoria de carrinhos", categoryId(guild.id, "cartOpen")],
+    ["categoria de fechados", categoryId(guild.id, "closed")],
+    ["categoria de tickets", categoryId(guild.id, "ticketOpen")],
+    ["canal do painel de ticket", ticketPanelChannelId(guild.id)],
     ["canal de vendas concluidas", completionChannelId(guild.id)],
     ["canal de cancelamentos", cancellationChannelId(guild.id)],
     ["canal de avaliacoes", reviewConfig({ guildId: guild.id }).channelId],
@@ -5506,6 +5673,7 @@ function serverConfigEmbed(guild) {
   const customerRole = configuredCustomerRoleId(guildId);
   const resellerRole = resellerRoleId(guildId);
   const resellerDiscount = resellerDiscountPercent(guildId);
+  const staffRole = adminRoleId(guildId);
 
   return new EmbedBuilder()
     .setTitle("Config do servidor")
@@ -5521,21 +5689,32 @@ function serverConfigEmbed(guild) {
         value: [
           `Vendas concluidas: ${channelMentionOrId(completionId)}`,
           `Cancelamentos: ${channelMentionOrId(cancellationId)}`,
-          `Avaliacoes: ${channelMentionOrId(review.channelId)}`
+          `Avaliacoes: ${channelMentionOrId(review.channelId)}`,
+          `Painel de suporte: ${channelMentionOrId(ticketPanelChannelId(guildId))}`
         ].join("\n"),
         inline: false
       },
       {
         name: "Cargos e desconto",
         value: [
+          `ADM: ${roleMentionOrId(staffRole)}`,
           `Cliente: ${roleMentionOrId(customerRole)}`,
           `Premium/revendedor: ${roleMentionOrId(resellerRole)}`,
           `Desconto premium: **${resellerDiscount}%**`
         ].join("\n"),
         inline: false
+      },
+      {
+        name: "Categorias",
+        value: [
+          `Carrinhos: ${channelMentionOrId(categoryId(guildId, "cartOpen"))}`,
+          `Fechados: ${channelMentionOrId(categoryId(guildId, "closed"))}`,
+          `Tickets: ${channelMentionOrId(categoryId(guildId, "ticketOpen"))}`
+        ].join("\n"),
+        inline: false
       }
     )
-    .setFooter({ text: "As alteracoes ficam salvas no storage do bot, sem editar arquivo no deploy." })
+    .setFooter({ text: `Instancia: ${instanceConfig.STORE_INSTANCE_ID} | Config salva no storage isolado.` })
     .setTimestamp();
 }
 function serverConfigRows() {
@@ -5552,6 +5731,10 @@ function serverConfigRows() {
       new ButtonBuilder()
         .setCustomId("cfgsrv:roles")
         .setLabel("Cargos")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("cfgsrv:categories")
+        .setLabel("Categorias")
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("cfgsrv:reconnect")
@@ -5624,6 +5807,15 @@ function serverConfigChannelsModal(guildId) {
           .setMaxLength(30)
           .setRequired(false)
           .setValue(reviewConfig({ guildId }).channelId.slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("ticketPanelChannelId")
+          .setLabel("Canal do painel de suporte")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(ticketPanelChannelId(guildId).slice(0, 30))
       )
     );
 }
@@ -5632,6 +5824,15 @@ function serverConfigRolesModal(guildId) {
     .setCustomId("cfgsrvmodal:roles")
     .setTitle("Configurar cargos")
     .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("adminRoleId")
+          .setLabel("Cargo ADM")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(adminRoleId(guildId).slice(0, 30))
+      ),
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId("customerRoleId")
@@ -5662,6 +5863,40 @@ function serverConfigRolesModal(guildId) {
       )
     );
 }
+function serverConfigCategoriesModal(guildId) {
+  return new ModalBuilder()
+    .setCustomId("cfgsrvmodal:categories")
+    .setTitle("Configurar categorias")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("cartOpenCategoryId")
+          .setLabel("Categoria de carrinhos")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(categoryId(guildId, "cartOpen").slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("closedCategoryId")
+          .setLabel("Categoria de finalizados")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(categoryId(guildId, "closed").slice(0, 30))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("ticketOpenCategoryId")
+          .setLabel("Categoria de tickets")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(30)
+          .setRequired(false)
+          .setValue(categoryId(guildId, "ticketOpen").slice(0, 30))
+      )
+    );
+}
 async function showServerConfig(context) {
   if (!isAdmin(context.member)) {
     return actionReply(context, { content: "So ADM pode configurar o servidor.", ephemeral: true });
@@ -5680,6 +5915,7 @@ async function handleServerConfigButton(interaction) {
   if (action === "call") return interaction.showModal(serverConfigCallModal(interaction.guildId));
   if (action === "channels") return interaction.showModal(serverConfigChannelsModal(interaction.guildId));
   if (action === "roles") return interaction.showModal(serverConfigRolesModal(interaction.guildId));
+  if (action === "categories") return interaction.showModal(serverConfigCategoriesModal(interaction.guildId));
   if (action === "reconnect") {
     await disconnectStatusVoiceChannel(interaction.guildId);
     await connectStatusVoiceChannel(interaction.guild).catch(error => {
@@ -5749,10 +5985,12 @@ async function handleServerConfigModal(interaction) {
     const completionId = sanitizeOptionalId(interaction.fields.getTextInputValue("completionChannelId"));
     const cancellationId = sanitizeOptionalId(interaction.fields.getTextInputValue("cancellationChannelId"));
     const reviewId = sanitizeOptionalId(interaction.fields.getTextInputValue("reviewChannelId"));
+    const ticketPanelId = sanitizeOptionalId(interaction.fields.getTextInputValue("ticketPanelChannelId"));
     for (const [label, channelId] of [
       ["Canal de vendas concluidas", completionId],
       ["Canal de cancelamentos", cancellationId],
-      ["Canal de avaliacoes", reviewId]
+      ["Canal de avaliacoes", reviewId],
+      ["Canal do painel de suporte", ticketPanelId]
     ]) {
       const error = await validateConfiguredChannel(interaction.guild, channelId, [ChannelType.GuildText, ChannelType.GuildAnnouncement], label);
       if (error) return interaction.reply({ content: error, ephemeral: true });
@@ -5760,24 +5998,48 @@ async function handleServerConfigModal(interaction) {
     saveServerConfig(interaction.guildId, {
       completionChannelId: completionId,
       cancellationChannelId: cancellationId,
-      reviewChannelId: reviewId
+      reviewChannelId: reviewId,
+      ticketPanelChannelId: ticketPanelId
     });
     await persistServerConfigStorage(interaction);
   }
 
   if (section === "roles") {
+    const admin = sanitizeOptionalRoleId(interaction.fields.getTextInputValue("adminRoleId"));
     const customerRoleId = sanitizeOptionalRoleId(interaction.fields.getTextInputValue("customerRoleId"));
     const reseller = sanitizeOptionalRoleId(interaction.fields.getTextInputValue("resellerRoleId"));
     const discountRaw = interaction.fields.getTextInputValue("resellerDiscountPercent").replace(",", ".");
     const discount = Number.parseFloat(discountRaw);
+    if (interaction.fields.getTextInputValue("adminRoleId").trim() && !admin) return interaction.reply({ content: "ID do cargo ADM invalido.", ephemeral: true });
     if (interaction.fields.getTextInputValue("customerRoleId").trim() && !customerRoleId) return interaction.reply({ content: "ID do cargo cliente invalido.", ephemeral: true });
     if (interaction.fields.getTextInputValue("resellerRoleId").trim() && !reseller) return interaction.reply({ content: "ID do cargo premium/revendedor invalido.", ephemeral: true });
     if (!Number.isFinite(discount) || discount < 0 || discount > 90) return interaction.reply({ content: "Desconto invalido. Use um numero de 0 a 90.", ephemeral: true });
     saveServerConfig(interaction.guildId, {
+      adminRoleId: admin,
       customerRoleId,
       resellerRoleId: reseller,
       resellerDiscountPercent: discount
     });
+    await persistServerConfigStorage(interaction);
+  }
+
+  if (section === "categories") {
+    const values = {
+      cartOpenCategoryId: sanitizeOptionalId(interaction.fields.getTextInputValue("cartOpenCategoryId")),
+      closedCategoryId: sanitizeOptionalId(interaction.fields.getTextInputValue("closedCategoryId")),
+      ticketOpenCategoryId: sanitizeOptionalId(interaction.fields.getTextInputValue("ticketOpenCategoryId"))
+    };
+    for (const [field, label] of [
+      ["cartOpenCategoryId", "Categoria de carrinhos"],
+      ["closedCategoryId", "Categoria de finalizados"],
+      ["ticketOpenCategoryId", "Categoria de tickets"]
+    ]) {
+      const raw = interaction.fields.getTextInputValue(field).trim();
+      if (raw && !values[field]) return interaction.reply({ content: `${label}: ID invalido.`, ephemeral: true });
+      const error = await validateConfiguredChannel(interaction.guild, values[field], [ChannelType.GuildCategory], label);
+      if (error) return interaction.reply({ content: error, ephemeral: true });
+    }
+    saveServerConfig(interaction.guildId, values);
     await persistServerConfigStorage(interaction);
   }
 
@@ -5807,7 +6069,7 @@ async function openCart(interaction) {
   await resetSelectMessage(interaction, saleMessage(panel));
   const discount = discountForMember(interaction.member);
   const id = orderId("order");
-  const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, config.categories.cartOpen);
+  const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, categoryId(interaction.guildId, "cartOpen") || undefined);
   const order = {
     id,
     guildId: interaction.guildId,
@@ -5887,7 +6149,7 @@ async function handleQuickOrderSubmit(interaction) {
   const answer2 = interaction.fields.getTextInputValue("answer2").trim();
   const discount = discountForMember(interaction.member);
   const id = orderId("order");
-  const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, config.categories.cartOpen);
+  const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, categoryId(interaction.guildId, "cartOpen") || undefined);
   const order = {
     id,
     guildId: interaction.guildId,
@@ -6343,7 +6605,11 @@ async function callAdmin(interaction, id, type = "order") {
   else db.orders[record.id] = record;
   writeOrders(db);
 
-  await interaction.channel.send({ content: `<@&${config.adminRoleId}> ${config.messages.adminCall}\nID: **${record.id || id}** | Cliente: <@${record.userId}>` });
+  const staffRoleId = adminRoleId(interaction.guildId);
+  await interaction.channel.send({
+    content: `${staffRoleId ? `<@&${staffRoleId}> ` : ""}${config.messages.adminCall}\nID: **${record.id || id}** | Cliente: <@${record.userId}>`,
+    allowedMentions: { roles: staffRoleId ? [staffRoleId] : [], users: [record.userId] }
+  });
   return interaction.reply({ content: "ADM chamado.", ephemeral: true });
 }
 async function viewCart(interaction, id) {
@@ -6438,7 +6704,7 @@ function normalizeChannelId(value) {
 }
 function reviewConfig(options = {}) {
   const saved = options.guildId ? serverConfig(options.guildId) : {};
-  const channelId = normalizeChannelId(options.reviewChannelId || saved.reviewChannelId || config.review?.channelId || process.env.REVIEW_CHANNEL_ID || "");
+  const channelId = normalizeChannelId(options.reviewChannelId || saved.reviewChannelId || process.env.REVIEW_CHANNEL_ID || legacyStoreValue(config.review?.channelId));
   return {
     channelId,
     message: clampText(options.reviewMessage || config.review?.message || "Obrigado pela compra! Se possivel, deixe uma avaliacao no chat {channel}.", 1000),
@@ -6742,7 +7008,8 @@ async function cancelCart(interaction, id) {
   });
 
   await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "cancelado") : `carrinho-${safeName(order.username)}-cancelado-${order.id}`).catch(() => null);
-  if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
+  const closedCategoryId = categoryId(interaction.guildId, "closed");
+  if (closedCategoryId) await interaction.channel.setParent(closedCategoryId, { lockPermissions: false }).catch(() => null);
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
   scheduleCartDeletion(order);
   await interaction.channel.send({ content: `<@${order.userId}> Compra #${order.id} cancelada. Este canal sera apagado automaticamente em 3 dias.`, embeds: [cartEmbed(order, panel)] }).catch(() => null);
@@ -6862,7 +7129,8 @@ async function finishCart(interaction, id, options = {}) {
   if (!postgresFinalize.used) applyFinalState(new Date().toISOString());
   writeOrders(db);
   await interaction.channel.setName(interaction.channel.name.includes("aberto") ? interaction.channel.name.replace("aberto", "fechado") : `carrinho-${safeName(order.username)}-fechado-${order.id}`).catch(() => null);
-  if (config.categories.closed) await interaction.channel.setParent(config.categories.closed, { lockPermissions: false }).catch(() => null);
+  const closedCategoryId = categoryId(interaction.guildId, "closed");
+  if (closedCategoryId) await interaction.channel.setParent(closedCategoryId, { lockPermissions: false }).catch(() => null);
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
   const roleGranted = await grantCustomerRole(interaction.guild, order.userId);
   await sendCompletionReceipt(interaction.guild, order, panel, interaction.channel).catch(error => console.log(`Nao consegui enviar recibo da venda ${order.id}: ${error.message}`));
@@ -6903,15 +7171,16 @@ ${cartText(order, panel)}`.slice(0, 4096))
 function ticketPanelEmbed() { return new EmbedBuilder().setTitle(config.ticketPanel.title).setDescription(config.ticketPanel.description).setColor(parseColor(config.ticketPanel.embedColor, 0x2b2d31)); }
 async function setupTicket(interaction) {
   if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para enviar o painel de ticket.")) return;
-  const ch = await interaction.guild.channels.fetch(config.ticketPanel.channelId).catch(() => null);
-  if (!ch || !ch.isTextBased()) return interaction.reply({ content: "Canal de ticket inválido no config.json.", ephemeral: true });
+  const channelId = ticketPanelChannelId(interaction.guildId);
+  const ch = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : null;
+  if (!ch || !ch.isTextBased()) return interaction.reply({ content: "Configure o canal do painel de suporte em /configserver > Canais.", ephemeral: true });
   const btn = new ButtonBuilder().setCustomId("openticket").setLabel(config.ticketPanel.buttonLabel).setEmoji(config.ticketPanel.buttonEmoji).setStyle(ButtonStyle.Primary);
   await ch.send({ embeds: [ticketPanelEmbed()], components: [new ActionRowBuilder().addComponents(btn)] });
   return interaction.reply({ content: `Painel de ticket enviado em <#${ch.id}>.`, ephemeral: true });
 }
 async function openTicket(interaction) {
   const id = orderId("ticket");
-  const ch = await privateChannel(interaction.guild, interaction.user, `ticket-${safeName(interaction.user.username)}-aberto-${id}`, config.categories.ticketOpen || config.categories.cartOpen);
+  const ch = await privateChannel(interaction.guild, interaction.user, `ticket-${safeName(interaction.user.username)}-aberto-${id}`, categoryId(interaction.guildId, "ticketOpen") || categoryId(interaction.guildId, "cartOpen") || undefined);
   const db = readOrders(); db.tickets[id] = { id, status: "open", userId: interaction.user.id, username: interaction.user.username, channelId: ch.id, createdAt: new Date().toISOString(), closedAt: null }; writeOrders(db);
   const embed = new EmbedBuilder().setTitle(`🎫 Ticket #${id}`).setDescription(config.messages.ticketWelcome).setColor(0x2b2d31).addFields({ name: "Cliente", value: `<@${interaction.user.id}>`, inline: true });
   const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`tcall:${id}`).setLabel("Chamar ADM").setEmoji("📣").setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(`tclose:${id}`).setLabel("Fechar ticket").setEmoji("🔒").setStyle(ButtonStyle.Danger));
@@ -7000,11 +7269,12 @@ async function handlePaymentProofUpload(message) {
   paymentProofUploads.delete(key);
 
   await message.reply("Comprovante recebido e salvo no pedido. A equipe vai conferir o pagamento.").catch(() => null);
+  const staffRoleId = adminRoleId(message.guild.id);
   await message.channel.send({
-    content: `<@&${config.adminRoleId}> comprovante enviado no pedido #${order.id} por <@${order.userId}>.`,
+    content: `${staffRoleId ? `<@&${staffRoleId}> ` : ""}comprovante enviado no pedido #${order.id} por <@${order.userId}>.`,
     embeds: [cartEmbed(order, panel)],
     components: [cartButtons(order.id)],
-    allowedMentions: { roles: [config.adminRoleId], users: [order.userId] }
+    allowedMentions: { roles: staffRoleId ? [staffRoleId] : [], users: [order.userId] }
   }).catch(() => null);
   return true;
 }
@@ -7088,7 +7358,7 @@ async function handlePendingImageUpload(message) {
 
 function statusVoiceChannelId(guildId = "") {
   const saved = guildId ? serverConfig(guildId).statusVoiceChannelId : "";
-  return String(saved || process.env.STATUS_VOICE_CHANNEL_ID || config.statusVoice?.channelId || DEFAULT_STATUS_VOICE_CHANNEL_ID).trim();
+  return String(saved || process.env.STATUS_VOICE_CHANNEL_ID || legacyStoreValue(config.statusVoice?.channelId, DEFAULT_STATUS_VOICE_CHANNEL_ID)).trim();
 }
 function statusVoiceEnabled(guildId = "") {
   if (process.env.STATUS_VOICE_ENABLED === "false") return false;
@@ -7196,9 +7466,12 @@ async function connectStatusVoiceChannel(guildOrId) {
 
 client.once("clientReady", async () => {
   console.log(`Bot online como ${client.user.tag}`);
+  const install = instanceConfig.installationSummary();
+  console.log(`Instancia da loja: ${install.instanceId} | servidor: ${install.guildId || "nao travado"} | storage: ${BOT_DB_PREFIX}`);
   const recoveredProcessing = recoverStaleProcessingOrders();
   if (recoveredProcessing) console.log(`${recoveredProcessing} carrinho(s) preso(s) em processing foram reabertos automaticamente.`);
   for (const guild of client.guilds.cache.values()) {
+    if (!instanceConfig.acceptsGuild(guild.id)) continue;
     await ensureStaffState(guild, null).catch(error => {
       console.log(`Nao consegui recuperar atendimento em ${guild.id}: ${error.message}`);
     });
@@ -7219,6 +7492,7 @@ client.once("clientReady", async () => {
 
 client.on("messageCreate", async message => {
   if (message.author.bot || !message.guild) return;
+  if (!instanceConfig.acceptsGuild(message.guild.id)) return;
   if (await handlePaymentProofUpload(message)) return;
   if (await handlePendingImageUpload(message)) return;
   const rawContent = message.content.trim();
@@ -7240,6 +7514,15 @@ client.on("messageCreate", async message => {
 
   if (content === `${prefix}puxarbackup`) {
     return pullBackupCommand(message);
+  }
+
+  if (content === `${prefix}exportarloja`) {
+    return exportStoreCatalog(message);
+  }
+
+  if (content === `${prefix}importarloja` || content.startsWith(`${prefix}importarloja `)) {
+    const selector = rawContent.slice(`${prefix}importarloja`.length).trim();
+    return importStoreCatalog(message, message.attachments.first(), selector);
   }
 
   if ([`${config.prefix || "!"}configds`, `${config.prefix || "!"}painel`, `${config.prefix || "!"}loja`, `${config.prefix || "!"}setup`].includes(content)) {
@@ -7374,6 +7657,12 @@ client.on("interactionCreate", interaction => {
 });
 
 async function handleInteraction(interaction) {
+    if (interaction.guildId && !instanceConfig.acceptsGuild(interaction.guildId)) {
+      if (interaction.isRepliable()) {
+        await interaction.reply({ content: "Esta instalacao do bot pertence a outra loja.", ephemeral: true }).catch(() => null);
+      }
+      return;
+    }
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "help") return sendHelpCommand(interaction);
       if (interaction.commandName === "configds") {
@@ -7382,6 +7671,14 @@ async function handleInteraction(interaction) {
         return startConfig(interaction.channel, interaction.member, interaction.user);
       }
       if (interaction.commandName === "configserver") return showServerConfig(interaction);
+      if (interaction.commandName === "exportarloja") return exportStoreCatalog(interaction);
+      if (interaction.commandName === "importarloja") {
+        return importStoreCatalog(
+          interaction,
+          interaction.options.getAttachment("arquivo"),
+          interaction.options.getString("painel") || ""
+        );
+      }
       if (interaction.commandName === "setup-ticket") return setupTicket(interaction);
       if (interaction.commandName === "setup-atendimento") return setupStaffPanel(interaction);
       if (interaction.commandName === "salvarpix") return savePixBackupCommand(interaction);
