@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
+const { buildPostgresPoolOptions } = require("./postgresConfig");
 const oauthConfig = require("./config");
 const instanceConfig = require("./instanceConfig");
 const { countVerifiedUsers } = require("./verifiedStore");
@@ -90,9 +91,9 @@ ensureJsonFile(PANELS_FILE, { guilds: {} });
 ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {}, auditLogs: [] });
 ensureJsonFile(STAFF_FILE, { guilds: {} });
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates]
-});
+const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates];
+if (process.env.ENABLE_MESSAGE_CONTENT_INTENT !== "false") gatewayIntents.push(GatewayIntentBits.MessageContent);
+const client = new Client({ intents: gatewayIntents });
 const oauthHttp = createOAuthServer(client, handleHttpRequest);
 client.on("error", error => {
   console.error("Erro do client Discord:", errorSummary(error));
@@ -285,12 +286,9 @@ function enqueuePersistJsonToKv(file, data) {
 function postgresEnabled() {
   return Boolean(DATABASE_URL);
 }
-function postgresSsl() {
-  return process.env.DATABASE_SSL === "false" ? false : { rejectUnauthorized: false };
-}
 function getPostgresPool() {
   if (!postgresEnabled()) return null;
-  if (!postgresPool) postgresPool = new Pool({ connectionString: DATABASE_URL, ssl: postgresSsl() });
+  if (!postgresPool) postgresPool = new Pool(buildPostgresPoolOptions(DATABASE_URL));
   return postgresPool;
 }
 async function ensurePostgresStore() {
@@ -8432,6 +8430,9 @@ async function boot() {
   await client.login(token);
 }
 boot().catch(error => {
+  if (/Used disallowed intents/i.test(String(error?.message || ""))) {
+    console.error("Discord recusou os intents. Ative Message Content Intent em Developer Portal > Bot > Privileged Gateway Intents, ou use ENABLE_MESSAGE_CONTENT_INTENT=false para operar apenas por slash commands.");
+  }
   console.error("Falha ao iniciar bot:", errorSummary(error));
   process.exit(1);
 });

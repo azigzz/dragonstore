@@ -40,6 +40,12 @@ Nao reutilize entre as lojas:
 
 As variaveis de IDs de cargos/categorias podem ser preenchidas no Render ou pelo `/configserver` dentro do novo servidor.
 
+## Discord e Aiven
+
+Para os comandos com `!` funcionarem, abra a aplicacao nova em Discord Developer Portal, entre em **Bot** e ative **Message Content Intent** em **Privileged Gateway Intents**. A variavel `ENABLE_MESSAGE_CONTENT_INTENT=true` apenas informa o bot para pedir a intencao; ela nao substitui a ativacao no Portal.
+
+No Aiven, copie a Service URI completa da tela de conexao, com o banco correto e `sslmode=require`. O bot usa TLS automaticamente. Para validacao completa, baixe o CA Certificate da Aiven, converta para Base64 e configure `DATABASE_CA_CERT_BASE64` no Render.
+
 ## Copiar catalogo sem copiar dados privados
 
 1. Na loja principal, use `/exportarloja` ou `!exportarloja`.
