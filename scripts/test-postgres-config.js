@@ -12,4 +12,7 @@ assert.equal(verified.ssl.ca, "CERT\nLINE");
 
 const disabled = buildPostgresPoolOptions(url, { DATABASE_SSL: "false" });
 assert.equal(disabled.ssl, false);
+
+const directTls = buildPostgresPoolOptions(url, { DATABASE_DIRECT_TLS: "true" });
+assert.equal(directTls.sslnegotiation, "direct");
 console.log("Postgres configuration test passed.");

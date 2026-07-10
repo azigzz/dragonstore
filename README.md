@@ -82,7 +82,7 @@ Para o OAuth2 funcionar, no Discord Developer Portal adicione exatamente o mesmo
 Application -> OAuth2 -> Redirects
 ```
 
-Para os comandos com prefixo `!` funcionarem, ative **Message Content Intent** em `Developer Portal -> Bot -> Privileged Gateway Intents`. Para Aiven/Postgres, mantenha `DATABASE_SSL=true`; a URI pode usar `sslmode=require`.
+Para os comandos com prefixo `!` funcionarem, ative **Message Content Intent** em `Developer Portal -> Bot -> Privileged Gateway Intents`. Para Aiven/Postgres, mantenha `DATABASE_SSL=true`; a URI pode usar `sslmode=require`. Se o endpoint exigir handshake TLS direto, defina tambem `DATABASE_DIRECT_TLS=true`.
 
 Depois use `!verificacao` em um canal. O bot envia um painel com botao **Verificar** apontando para `/auth/discord/start`.
 

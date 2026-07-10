@@ -28,10 +28,18 @@ function buildPostgresPoolOptions(databaseUrl, env = process.env) {
   if (env.DATABASE_SSL === "false") return { connectionString, ssl: false };
 
   const ca = certificateFromEnv(env);
-  return {
+  const options = {
     connectionString,
     ssl: ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: false }
   };
+
+  // Alguns endpoints Aiven novos usam TLS direto, sem o pacote SSLRequest do
+  // protocolo Postgres. O pg suporta os dois modos nativamente.
+  if (String(env.DATABASE_DIRECT_TLS || "").trim().toLowerCase() === "true") {
+    options.sslnegotiation = "direct";
+  }
+
+  return options;
 }
 
 module.exports = { buildPostgresPoolOptions, certificateFromEnv, connectionStringWithoutSslQuery };

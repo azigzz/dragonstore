@@ -44,7 +44,7 @@ As variaveis de IDs de cargos/categorias podem ser preenchidas no Render ou pelo
 
 Para os comandos com `!` funcionarem, abra a aplicacao nova em Discord Developer Portal, entre em **Bot** e ative **Message Content Intent** em **Privileged Gateway Intents**. A variavel `ENABLE_MESSAGE_CONTENT_INTENT=true` apenas informa o bot para pedir a intencao; ela nao substitui a ativacao no Portal.
 
-No Aiven, copie a Service URI completa da tela de conexao, com o banco correto e `sslmode=require`. O bot usa TLS automaticamente. Para validacao completa, baixe o CA Certificate da Aiven, converta para Base64 e configure `DATABASE_CA_CERT_BASE64` no Render.
+No Aiven, copie a Service URI completa da tela de conexao, com o banco correto e `sslmode=require`. O bot usa TLS automaticamente. Para validacao completa, baixe o CA Certificate da Aiven, converta para Base64 e configure `DATABASE_CA_CERT_BASE64` no Render. Se esse endpoint usar TLS direto, configure tambem `DATABASE_DIRECT_TLS=true`.
 
 ## Copiar catalogo sem copiar dados privados
 
