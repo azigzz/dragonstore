@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.nova-loja
+.env.*.local
 data/*.json
 site/node_modules/
 site/.next/
