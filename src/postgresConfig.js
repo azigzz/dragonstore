@@ -10,9 +10,15 @@ function certificateFromEnv(env) {
   return String(env.DATABASE_CA_CERT || "").replace(/\\n/g, "\n").trim();
 }
 
+function normalizeConnectionString(databaseUrl) {
+  const value = String(databaseUrl || "").trim();
+  const quoted = value.match(/^(?:"([\s\S]*)"|'([\s\S]*)')$/);
+  return quoted ? (quoted[1] ?? quoted[2]).trim() : value;
+}
+
 function connectionStringWithoutSslQuery(databaseUrl) {
   try {
-    const url = new URL(databaseUrl);
+    const url = new URL(normalizeConnectionString(databaseUrl));
     for (const key of ["ssl", "sslmode", "sslrootcert", "sslcert", "sslkey"]) {
       url.searchParams.delete(key);
     }
@@ -22,8 +28,23 @@ function connectionStringWithoutSslQuery(databaseUrl) {
   }
 }
 
+function postgresTargetSummary(databaseUrl, options = {}) {
+  try {
+    const url = new URL(normalizeConnectionString(databaseUrl));
+    return {
+      host: url.hostname || "desconhecido",
+      port: url.port || "5432",
+      database: url.pathname.replace(/^\//, "") || "desconhecido",
+      tls: options.ssl ? "ativo" : "desligado",
+      negotiation: options.sslnegotiation || "postgres"
+    };
+  } catch {
+    return { host: "URI invalida", port: "-", database: "-", tls: "-", negotiation: "-" };
+  }
+}
+
 function buildPostgresPoolOptions(databaseUrl, env = process.env) {
-  const connectionString = connectionStringWithoutSslQuery(String(databaseUrl || "").trim());
+  const connectionString = connectionStringWithoutSslQuery(normalizeConnectionString(databaseUrl));
   if (!connectionString) return null;
   if (env.DATABASE_SSL === "false") return { connectionString, ssl: false };
 
@@ -42,4 +63,4 @@ function buildPostgresPoolOptions(databaseUrl, env = process.env) {
   return options;
 }
 
-module.exports = { buildPostgresPoolOptions, certificateFromEnv, connectionStringWithoutSslQuery };
+module.exports = { buildPostgresPoolOptions, certificateFromEnv, normalizeConnectionString, connectionStringWithoutSslQuery, postgresTargetSummary };

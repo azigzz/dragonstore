@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
-const { buildPostgresPoolOptions } = require("./postgresConfig");
+const { buildPostgresPoolOptions, postgresTargetSummary } = require("./postgresConfig");
 const oauthConfig = require("./config");
 const instanceConfig = require("./instanceConfig");
 const { countVerifiedUsers } = require("./verifiedStore");
@@ -288,7 +288,12 @@ function postgresEnabled() {
 }
 function getPostgresPool() {
   if (!postgresEnabled()) return null;
-  if (!postgresPool) postgresPool = new Pool(buildPostgresPoolOptions(DATABASE_URL));
+  if (!postgresPool) {
+    const options = buildPostgresPoolOptions(DATABASE_URL);
+    const target = postgresTargetSummary(DATABASE_URL, options);
+    console.log(`Postgres: ${target.host}:${target.port}/${target.database} | TLS ${target.tls} | negociacao ${target.negotiation}`);
+    postgresPool = new Pool(options);
+  }
   return postgresPool;
 }
 async function ensurePostgresStore() {
