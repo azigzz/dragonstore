@@ -4000,7 +4000,7 @@ async function findRecoverableSalePanel(channel, guildId, scopeId) {
 
   return found ? recoverPanelFromPublishedMessage(found, guildId, scopeId) : null;
 }
-async function findRecoverableSalePanels(channel, guildId, scopeId = null, limit = 75) {
+async function findRecoverableSalePanels(channel, guildId, scopeId = null, limit = 75, options = {}) {
   if (!channel?.messages?.fetch) return [];
   const messages = await channel.messages.fetch({ limit }).catch(() => null);
   if (!messages?.size) return [];
@@ -4018,14 +4018,18 @@ async function findRecoverableSalePanels(channel, guildId, scopeId = null, limit
 
   for (const message of sorted) {
     const sameBot = !client.user?.id || message.author?.id === client.user.id;
-    if (!sameBot || !saleSelectComponentFromMessage(message) || seen.has(message.id)) continue;
+    const compatibleBot = Boolean(options.allowOtherBotAuthors && message.author?.bot);
+    if ((!sameBot && !compatibleBot) || !saleSelectComponentFromMessage(message) || seen.has(message.id)) continue;
     const select = saleSelectComponentFromMessage(message);
     const panelKey = panelIdFromComponentCustomId(componentCustomId(select)) || message.channelId;
-    if (seenPanelKeys.has(panelKey)) continue;
+    if (seenPanelKeys.has(panelKey) || options.skipPanelIds?.has(panelKey)) continue;
     seen.add(message.id);
     seenPanelKeys.add(panelKey);
     const panel = await recoverPanelFromPublishedMessage(message, guildId, scopeId).catch(() => null);
-    if (panel) recovered.push(panel);
+    if (panel) {
+      options.skipPanelIds?.add(panel.id || panelKey);
+      recovered.push(panel);
+    }
   }
 
   return recovered;
@@ -4045,16 +4049,16 @@ function isScannablePublicChannel(channel) {
     [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)
   );
 }
-async function scanGuildForPublishedSalePanels(guild, guildId, force = false) {
-  if (process.env.PUBLIC_STORE_SCAN_CHANNELS === "false") return [];
+async function scanGuildForPublishedSalePanels(guild, guildId, force = false, options = {}) {
+  if (process.env.PUBLIC_STORE_SCAN_CHANNELS === "false" && !options.ignoreDisabled) return [];
   if (!force && publicPanelScanFresh(guildId)) return [];
   publicPanelScanCache.set(guildId, Date.now());
 
   const channels = await guild.channels.fetch().catch(() => null);
   if (!channels?.size) return [];
 
-  const maxChannels = Math.max(1, Number(process.env.PUBLIC_STORE_SCAN_CHANNEL_LIMIT || 80) || 80);
-  const messageLimit = Math.min(100, Math.max(10, Number(process.env.PUBLIC_STORE_SCAN_MESSAGE_LIMIT || 75) || 75));
+  const maxChannels = Math.max(1, Number(options.maxChannels || process.env.PUBLIC_STORE_SCAN_CHANNEL_LIMIT || 80) || 80);
+  const messageLimit = Math.min(100, Math.max(10, Number(options.messageLimit || process.env.PUBLIC_STORE_SCAN_MESSAGE_LIMIT || 75) || 75));
   const candidates = [...channels.values()]
     .filter(isScannablePublicChannel)
     .sort((a, b) => (a.rawPosition ?? 9999) - (b.rawPosition ?? 9999))
@@ -4062,7 +4066,7 @@ async function scanGuildForPublishedSalePanels(guild, guildId, force = false) {
   const recovered = [];
 
   for (const channel of candidates) {
-    const panels = await findRecoverableSalePanels(channel, guildId, null, messageLimit).catch(() => []);
+    const panels = await findRecoverableSalePanels(channel, guildId, null, messageLimit, options).catch(() => []);
     recovered.push(...panels);
   }
 
@@ -4526,6 +4530,25 @@ function storeServerBackupSnapshot(guildId) {
     assetWarnings: []
   };
 }
+async function recoverStorePanelsForBackup(guild) {
+  const store = readPanels();
+  const guildStore = ensurePanelStore(store, guild.id);
+  const skipPanelIds = new Set(
+    allPublicPanels(guildStore)
+      .filter(panel => (panel.products || []).length)
+      .map(panel => String(panel.id || ""))
+      .filter(Boolean)
+  );
+  const recovered = await scanGuildForPublishedSalePanels(guild, guild.id, true, {
+    ignoreDisabled: true,
+    allowOtherBotAuthors: true,
+    skipPanelIds,
+    maxChannels: 250,
+    messageLimit: 100
+  });
+  if (recovered.length) await flushPersistentFile(PANELS_FILE);
+  return recovered;
+}
 function backupAssetExtension(contentType) {
   if (/gif/i.test(contentType)) return "gif";
   if (/webp/i.test(contentType)) return "webp";
@@ -4589,6 +4612,7 @@ async function createFullServerBackupCommand(context) {
   if (context.isRepliable?.()) await context.deferReply({ ephemeral: true });
   else progressMessage = await context.reply("Preparando backup completo do servidor...").catch(() => null);
   try {
+    const recoveredPanels = await recoverStorePanelsForBackup(context.guild);
     const store = await embedStoreBackupAssets(storeServerBackupSnapshot(context.guild.id));
     const user = actionUser(context);
     const transientChannels = transientStoreChannelIds(context.guild.id);
@@ -4608,6 +4632,8 @@ async function createFullServerBackupCommand(context) {
       content: [
         `Backup completo de **${context.guild.name}** criado.`,
         `Incluidos: ${payload.roles.length} cargos, ${payload.channels.length} canais, ${payload.emojis.length} emojis, ${payload.stickers.length} stickers e ${(store.panels || []).length} paineis.`,
+        recoveredPanels.length ? `${recoveredPanels.length} painel(is) foram recuperados das mensagens publicadas antes do backup.` : "Catalogo lido do armazenamento e das mensagens publicadas.",
+        store.panels.length ? "Os produtos desses paineis estao incluidos no arquivo." : "Atencao: nenhum painel de produtos foi encontrado; este arquivo nao contem catalogo.",
         store.assetWarnings.length ? `${store.assetWarnings.length} imagem(ns) ficaram apenas como link por limite/tamanho.` : "Imagens dos paineis foram incorporadas ao arquivo.",
         "Pix, pedidos, vendas, clientes, membros e historico de mensagens nao foram copiados."
       ].join("\n"),
