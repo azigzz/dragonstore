@@ -5,11 +5,6 @@ const token = process.env.DISCORD_TOKEN?.trim();
 const clientId = process.env.CLIENT_ID?.trim();
 const guildId = process.env.GUILD_ID?.trim();
 
-if (!token || !clientId || !guildId) {
-  console.error("Preencha DISCORD_TOKEN, CLIENT_ID e GUILD_ID.");
-  process.exit(1);
-}
-
 const commands = [
   new SlashCommandBuilder()
     .setName("help")
@@ -20,6 +15,18 @@ const commands = [
   new SlashCommandBuilder()
     .setName("configserver")
     .setDescription("Abre as configuracoes gerais do servidor."),
+  new SlashCommandBuilder()
+    .setName("backup")
+    .setDescription("Gera um backup completo da estrutura e da loja."),
+  new SlashCommandBuilder()
+    .setName("restaurar")
+    .setDescription("Restaura um backup completo neste servidor.")
+    .addAttachmentOption(option =>
+      option
+        .setName("arquivo")
+        .setDescription("Arquivo JSON criado pelo comando backup.")
+        .setRequired(true)
+    ),
   new SlashCommandBuilder()
     .setName("exportarloja")
     .setDescription("Exporta paineis e produtos sem dados privados."),
@@ -224,9 +231,11 @@ const commands = [
     )
 ].map(command => command.toJSON());
 
-const rest = new REST({ version: "10" }).setToken(token);
-
-(async () => {
+async function deployCommands() {
+  if (!token || !clientId || !guildId) {
+    throw new Error("Preencha DISCORD_TOKEN, CLIENT_ID e GUILD_ID.");
+  }
+  const rest = new REST({ version: "10" }).setToken(token);
   try {
     console.log("Limpando comandos globais antigos...");
     await rest.put(Routes.applicationCommands(clientId), { body: [] });
@@ -238,4 +247,8 @@ const rest = new REST({ version: "10" }).setToken(token);
     console.error(err);
     process.exit(1);
   }
-})();
+}
+
+if (require.main === module) deployCommands();
+
+module.exports = { commands, deployCommands };

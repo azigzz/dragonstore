@@ -8,6 +8,7 @@ const oauthConfig = require("./config");
 const instanceConfig = require("./instanceConfig");
 const { countVerifiedUsers } = require("./verifiedStore");
 const { createOAuthServer, pullVerifiedUsersToBackup } = require("./oauthServer");
+const { createServerBackup, restoreServerBackup, validateServerBackup } = require("./serverBackup");
 const {
   entersState,
   getVoiceConnection,
@@ -97,10 +98,13 @@ const cartDeleteTimers = new Map();
 const publicPanelScanCache = new Map();
 const orderActionLocks = new Set();
 const statusVoiceReconnectTimers = new Map();
+const serverRestoreSessions = new Map();
 const IMAGE_UPLOAD_TTL_MS = 3 * 60 * 1000;
 const PROOF_UPLOAD_TTL_MS = 2 * 60 * 1000;
 const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
 const ADD_CART_SESSION_TTL_MS = 10 * 60 * 1000;
+const SERVER_RESTORE_SESSION_TTL_MS = 15 * 60 * 1000;
+const MAX_SERVER_BACKUP_BYTES = 8 * 1024 * 1024;
 
 function cloneJson(data) {
   return JSON.parse(JSON.stringify(data));
@@ -4410,6 +4414,388 @@ async function importStoreCatalog(context, attachment, selector = "") {
     return actionReply(context, { content: `Nao consegui importar: ${error.message}`, ephemeral: true });
   }
 }
+function serverBackupManager(context) {
+  const user = actionUser(context);
+  if (!user?.id || !context.guild) return false;
+  const configuredCeoId = String(process.env.CEO_USER_ID || "").trim();
+  return context.guild.ownerId === user.id || configuredCeoId === user.id;
+}
+function transientStoreChannelIds(guildId) {
+  const db = readOrders();
+  return new Set([
+    ...Object.values(db.orders || {}).filter(item => item.guildId === guildId).map(item => item.channelId),
+    ...Object.values(db.tickets || {}).filter(item => !item.guildId || item.guildId === guildId).map(item => item.channelId)
+  ].filter(Boolean));
+}
+function storeServerBackupSnapshot(guildId) {
+  const panelStore = readPanels();
+  const guildStore = ensurePanelStore(panelStore, guildId);
+  const staff = getStaffGuild(guildId);
+  return {
+    serverConfig: {
+      ...cloneJson(serverConfig(guildId)),
+      adminRoleId: adminRoleId(guildId),
+      customerRoleId: configuredCustomerRoleId(guildId),
+      resellerRoleId: resellerRoleId(guildId),
+      resellerDiscountPercent: resellerDiscountPercent(guildId),
+      completionChannelId: completionChannelId(guildId),
+      cancellationChannelId: cancellationChannelId(guildId),
+      reviewChannelId: reviewConfig({ guildId }).channelId,
+      ticketPanelChannelId: ticketPanelChannelId(guildId),
+      statusVoiceChannelId: statusVoiceChannelId(guildId),
+      statusVoiceEnabled: statusVoiceEnabled(guildId),
+      cartOpenCategoryId: categoryId(guildId, "cartOpen"),
+      closedCategoryId: categoryId(guildId, "closed"),
+      ticketOpenCategoryId: categoryId(guildId, "ticketOpen")
+    },
+    staff: {
+      panelChannelId: staff.panelChannelId || "",
+      successChannelId: staff.successChannelId || "",
+      successMessageEnabled: Boolean(staff.successMessageEnabled),
+      customerRoleId: staff.customerRoleId || ""
+    },
+    panels: allPublicPanels(guildStore).map(panel => {
+      const quick = quickOrderConfig(panel);
+      return {
+        ...catalogPanelSnapshot(panel),
+        binding: {
+          scopeId: panel.scopeId || "",
+          channelId: panel.channelId || "",
+          publishedChannelId: panel.publishedChannelId || "",
+          publishPanel: Boolean(panel.publishedChannelId && panel.publishedMessageId),
+          quickPublishedChannelId: quick.publishedChannelId || "",
+          publishQuickOrder: Boolean(quick.publishedChannelId && quick.publishedMessageId)
+        }
+      };
+    }),
+    assets: {},
+    assetWarnings: []
+  };
+}
+function backupAssetExtension(contentType) {
+  if (/gif/i.test(contentType)) return "gif";
+  if (/webp/i.test(contentType)) return "webp";
+  if (/jpe?g/i.test(contentType)) return "jpg";
+  return "png";
+}
+function trustedBackupAssetUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:" && ["discordapp.com", "discordapp.net", "discord.com"].some(domain =>
+      url.hostname === domain || url.hostname.endsWith(`.${domain}`)
+    );
+  } catch {
+    return false;
+  }
+}
+async function embedStoreBackupAssets(store) {
+  const state = { totalBytes: 0, cache: new Map() };
+  async function capture(url) {
+    const raw = String(url || "").trim();
+    if (!raw || !trustedBackupAssetUrl(raw)) return raw;
+    if (state.cache.has(raw)) return state.cache.get(raw);
+    try {
+      const response = await fetch(raw, { signal: AbortSignal.timeout(15000) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const contentType = response.headers.get("content-type") || "image/png";
+      if (!contentType.startsWith("image/")) throw new Error("conteudo nao e imagem");
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length > 2 * 1024 * 1024 || state.totalBytes + bytes.length > 5 * 1024 * 1024) {
+        throw new Error("limite de imagens do arquivo atingido");
+      }
+      const key = crypto.createHash("sha256").update(bytes).digest("hex").slice(0, 20);
+      store.assets[key] = {
+        contentType,
+        name: `asset-${key}.${backupAssetExtension(contentType)}`,
+        data: bytes.toString("base64")
+      };
+      state.totalBytes += bytes.length;
+      const reference = `asset://${key}`;
+      state.cache.set(raw, reference);
+      return reference;
+    } catch (error) {
+      store.assetWarnings.push(`${raw.slice(0, 120)}: ${error.message}`);
+      state.cache.set(raw, raw);
+      return raw;
+    }
+  }
+
+  for (const panel of store.panels || []) {
+    panel.imageUrl = await capture(panel.imageUrl);
+    panel.thumbnailUrl = await capture(panel.thumbnailUrl);
+    for (const productItem of panel.products || []) productItem.imageUrl = await capture(productItem.imageUrl);
+  }
+  return store;
+}
+async function createFullServerBackupCommand(context) {
+  if (!serverBackupManager(context)) {
+    return actionReply(context, { content: "So o dono do servidor ou o CEO configurado pode gerar backup completo.", ephemeral: true });
+  }
+  let progressMessage = null;
+  if (context.isRepliable?.()) await context.deferReply({ ephemeral: true });
+  else progressMessage = await context.reply("Preparando backup completo do servidor...").catch(() => null);
+  try {
+    const store = await embedStoreBackupAssets(storeServerBackupSnapshot(context.guild.id));
+    const user = actionUser(context);
+    const transientChannels = transientStoreChannelIds(context.guild.id);
+    for (const channel of context.guild.channels.cache.values()) {
+      if (/^(carrinho|ticket)-/i.test(channel.name || "")) transientChannels.add(channel.id);
+    }
+    const payload = await createServerBackup(context.guild, {
+      excludedChannelIds: [...transientChannels],
+      allowedMemberIds: [user.id],
+      store
+    });
+    payload.ceoHint = { userId: user.id };
+    const bytes = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
+    if (bytes.length > MAX_SERVER_BACKUP_BYTES) throw new Error("O backup passou de 8 MB. Remova imagens muito grandes e tente novamente.");
+    const file = new AttachmentBuilder(bytes, { name: `backup-${safeName(context.guild.name)}-${Date.now()}.json` });
+    const successPayload = {
+      content: [
+        `Backup completo de **${context.guild.name}** criado.`,
+        `Incluidos: ${payload.roles.length} cargos, ${payload.channels.length} canais, ${payload.emojis.length} emojis, ${payload.stickers.length} stickers e ${(store.panels || []).length} paineis.`,
+        store.assetWarnings.length ? `${store.assetWarnings.length} imagem(ns) ficaram apenas como link por limite/tamanho.` : "Imagens dos paineis foram incorporadas ao arquivo.",
+        "Pix, pedidos, vendas, clientes, membros e historico de mensagens nao foram copiados."
+      ].join("\n"),
+      files: [file],
+      ephemeral: true
+    };
+    if (!context.isRepliable?.()) {
+      const sent = await sendSafeDM(user.id, stripEphemeral(successPayload));
+      return progressMessage?.edit(sent
+        ? "Backup completo enviado no seu privado."
+        : "Nao consegui abrir sua DM. Ative mensagens privadas ou use `/backup`, que entrega o arquivo de forma privada.");
+    }
+    return actionReply(context, successPayload);
+  } catch (error) {
+    await progressMessage?.delete().catch(() => null);
+    return actionReply(context, { content: `Falha ao criar backup: ${error.message}`, ephemeral: true });
+  }
+}
+async function readFullServerBackupAttachment(attachment) {
+  if (!attachment?.url) throw new Error("Anexe o arquivo criado por !backup.");
+  if (Number(attachment.size) > MAX_SERVER_BACKUP_BYTES) throw new Error("O arquivo passa de 8 MB.");
+  const response = await fetch(attachment.url, { signal: AbortSignal.timeout(20000) });
+  if (!response.ok) throw new Error(`Nao consegui baixar o backup (HTTP ${response.status}).`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > MAX_SERVER_BACKUP_BYTES) throw new Error("O arquivo passa de 8 MB.");
+  const payload = JSON.parse(bytes.toString("utf8"));
+  return validateServerBackup(payload);
+}
+function restoreConfirmationRows(sessionId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`serverrestore:confirm:${sessionId}`).setLabel("Restaurar servidor").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`serverrestore:cancel:${sessionId}`).setLabel("Cancelar").setStyle(ButtonStyle.Secondary)
+  )];
+}
+async function startFullServerRestoreCommand(context, attachment) {
+  if (!serverBackupManager(context)) {
+    return actionReply(context, { content: "So o dono do servidor ou o CEO configurado pode restaurar backup.", ephemeral: true });
+  }
+  const botMember = context.guild.members.me || await context.guild.members.fetchMe().catch(() => null);
+  if (!botMember?.permissions?.has(PermissionFlagsBits.Administrator)) {
+    return actionReply(context, { content: "Para restaurar o servidor inteiro, coloque o cargo do bot com permissao Administrador e acima dos cargos que ele vai gerenciar.", ephemeral: true });
+  }
+  if (context.isRepliable?.()) await context.deferReply({ ephemeral: true });
+  try {
+    const payload = await readFullServerBackupAttachment(attachment);
+    if (!context.isRepliable?.()) await context.delete().catch(() => null);
+    const sessionId = sid();
+    const user = actionUser(context);
+    serverRestoreSessions.set(sessionId, {
+      payload,
+      guildId: context.guild.id,
+      channelId: context.channel.id,
+      userId: user.id,
+      expiresAt: Date.now() + SERVER_RESTORE_SESSION_TTL_MS
+    });
+    setTimeout(() => serverRestoreSessions.delete(sessionId), SERVER_RESTORE_SESSION_TTL_MS + 1000);
+    return actionReply(context, {
+      content: [
+        `Backup de **${payload.sourceGuildName || payload.guild?.name || "servidor"}** carregado.`,
+        `Serao processados **${payload.roles.length} cargos**, **${payload.channels.length} canais**, **${payload.emojis.length} emojis**, **${payload.stickers.length} stickers** e **${payload.store?.panels?.length || 0} paineis**.`,
+        "Nada sera apagado. Estruturas iguais serao reaproveitadas; o restante sera criado.",
+        "Confirme somente dentro do servidor novo."
+      ].join("\n"),
+      components: restoreConfirmationRows(sessionId),
+      ephemeral: true
+    });
+  } catch (error) {
+    return actionReply(context, { content: `Backup invalido: ${error.message}`, ephemeral: true });
+  }
+}
+function mappedBackupId(map, value) {
+  return value ? (map.get(String(value)) || "") : "";
+}
+async function restoreEmbeddedStoreAssets(guild, store, ceoUserId) {
+  const assets = store?.assets && typeof store.assets === "object" ? store.assets : {};
+  const entries = Object.entries(assets);
+  if (!entries.length) return store;
+  let channel = guild.channels.cache.find(item => item.type === ChannelType.GuildText && item.name === "dragon-assets") || null;
+  if (!channel) {
+    channel = await guild.channels.create({
+      name: "dragon-assets",
+      type: ChannelType.GuildText,
+      permissionOverwrites: [
+        { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ReadMessageHistory] },
+        ...(ceoUserId ? [{ id: ceoUserId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory] }] : [])
+      ],
+      reason: "Arquivos tecnicos restaurados da Dragon Store"
+    });
+  }
+  const urlMap = new Map();
+  for (const [key, asset] of entries) {
+    try {
+      const file = new AttachmentBuilder(Buffer.from(String(asset.data || ""), "base64"), { name: clampText(asset.name, 100, `asset-${key}.png`) });
+      const sent = await channel.send({ content: `Asset tecnico \`${key}\`.`, files: [file] });
+      const url = sent.attachments.first()?.url;
+      if (url) urlMap.set(`asset://${key}`, url);
+    } catch (error) {
+      console.log(`Falha ao restaurar asset ${key}: ${error.message}`);
+    }
+  }
+  const restored = cloneJson(store);
+  for (const panel of restored.panels || []) {
+    panel.imageUrl = urlMap.get(panel.imageUrl) || panel.imageUrl;
+    panel.thumbnailUrl = urlMap.get(panel.thumbnailUrl) || panel.thumbnailUrl;
+    for (const productItem of panel.products || []) productItem.imageUrl = urlMap.get(productItem.imageUrl) || productItem.imageUrl;
+  }
+  return restored;
+}
+async function restoreStoreFromServerBackup(guild, result, ceoUserId) {
+  const roleMap = result.roleMap;
+  const channelMap = result.channelMap;
+  const rawStore = result.payload.store || {};
+  const store = await restoreEmbeddedStoreAssets(guild, rawStore, ceoUserId);
+  const sourceConfig = store.serverConfig || {};
+  const mappedConfig = {
+    adminRoleId: result.ceoRoleId || "",
+    customerRoleId: mappedBackupId(roleMap, sourceConfig.customerRoleId || store.staff?.customerRoleId),
+    resellerRoleId: mappedBackupId(roleMap, sourceConfig.resellerRoleId),
+    resellerDiscountPercent: Number(sourceConfig.resellerDiscountPercent ?? 10),
+    completionChannelId: mappedBackupId(channelMap, sourceConfig.completionChannelId),
+    cancellationChannelId: mappedBackupId(channelMap, sourceConfig.cancellationChannelId),
+    reviewChannelId: mappedBackupId(channelMap, sourceConfig.reviewChannelId),
+    ticketPanelChannelId: mappedBackupId(channelMap, sourceConfig.ticketPanelChannelId),
+    statusVoiceChannelId: mappedBackupId(channelMap, sourceConfig.statusVoiceChannelId),
+    statusVoiceEnabled: Boolean(sourceConfig.statusVoiceEnabled),
+    cartOpenCategoryId: mappedBackupId(channelMap, sourceConfig.cartOpenCategoryId),
+    closedCategoryId: mappedBackupId(channelMap, sourceConfig.closedCategoryId),
+    ticketOpenCategoryId: mappedBackupId(channelMap, sourceConfig.ticketOpenCategoryId)
+  };
+  const staff = {
+    ...defaultStaffGuild(),
+    panelChannelId: mappedBackupId(channelMap, store.staff?.panelChannelId),
+    successChannelId: mappedBackupId(channelMap, store.staff?.successChannelId),
+    successMessageEnabled: Boolean(store.staff?.successMessageEnabled),
+    customerRoleId: mappedConfig.customerRoleId,
+    serverConfig: mappedConfig
+  };
+  saveStaffGuild(guild.id, staff);
+
+  let panelsPublished = 0;
+  let quickOrdersPublished = 0;
+  for (const source of store.panels || []) {
+    const binding = source.binding || {};
+    const configuredChannelId = mappedBackupId(channelMap, binding.channelId);
+    const scopeChannelId = mappedBackupId(channelMap, binding.scopeId);
+    const panelChannelId = mappedBackupId(channelMap, binding.publishedChannelId) || configuredChannelId || scopeChannelId;
+    const quickChannelId = mappedBackupId(channelMap, binding.quickPublishedChannelId) || configuredChannelId || panelChannelId || scopeChannelId;
+    const storageScopeId = scopeChannelId || configuredChannelId || panelChannelId || quickChannelId;
+    if (!storageScopeId) continue;
+    const panel = importedPanelForChannel(source, guild.id, storageScopeId);
+    panel.channelId = configuredChannelId || panelChannelId || quickChannelId;
+    if (binding.publishPanel) {
+      const channel = panelChannelId ? await guild.channels.fetch(panelChannelId).catch(() => null) : null;
+      if (channel?.isTextBased() && channel.type !== ChannelType.GuildForum) {
+        const message = await channel.send(saleMessage(panel));
+        panel.publishedChannelId = channel.id;
+        panel.publishedMessageId = message.id;
+        panelsPublished += 1;
+      }
+    }
+    if (binding.publishQuickOrder) {
+      const channel = quickChannelId ? await guild.channels.fetch(quickChannelId).catch(() => null) : null;
+      if (channel?.isTextBased() && channel.type !== ChannelType.GuildForum) {
+        const quickMessage = await channel.send(quickOrderMessage(panel));
+        panel.quickOrder = {
+          ...quickOrderConfig(panel),
+          publishedChannelId: channel.id,
+          publishedMessageId: quickMessage.id
+        };
+        quickOrdersPublished += 1;
+      }
+    }
+    savePanel(guild.id, panel, storageScopeId);
+  }
+
+  if (staff.panelChannelId) {
+    const channel = await guild.channels.fetch(staff.panelChannelId).catch(() => null);
+    if (channel?.isTextBased() && channel.type !== ChannelType.GuildForum) {
+      const message = await channel.send({ embeds: [buildStaffPanelEmbed(guild.id)], components: staffPanelRows() }).catch(() => null);
+      if (message) {
+        staff.panelMessageId = message.id;
+        saveStaffGuild(guild.id, staff);
+      }
+    }
+  }
+  if (mappedConfig.ticketPanelChannelId) {
+    const channel = await guild.channels.fetch(mappedConfig.ticketPanelChannelId).catch(() => null);
+    if (channel?.isTextBased() && channel.type !== ChannelType.GuildForum) {
+      const button = new ButtonBuilder().setCustomId("openticket").setLabel(config.ticketPanel.buttonLabel).setEmoji(config.ticketPanel.buttonEmoji).setStyle(ButtonStyle.Primary);
+      await channel.send({ embeds: [ticketPanelEmbed()], components: [new ActionRowBuilder().addComponents(button)] }).catch(() => null);
+    }
+  }
+  await flushPersistentFile(PANELS_FILE);
+  await flushPersistentFile(STAFF_FILE);
+  await saveStaffBackup(guild, staff.panelChannelId ? await guild.channels.fetch(staff.panelChannelId).catch(() => null) : null).catch(() => null);
+  return { panelsPublished, quickOrdersPublished };
+}
+async function handleServerRestoreButton(interaction) {
+  const [, action, sessionId] = interaction.customId.split(":");
+  const session = serverRestoreSessions.get(sessionId);
+  if (!session || session.expiresAt < Date.now()) {
+    serverRestoreSessions.delete(sessionId);
+    return interaction.reply({ content: "Essa restauracao expirou. Envie o arquivo novamente com !restaurar.", ephemeral: true });
+  }
+  if (session.userId !== interaction.user.id || session.guildId !== interaction.guildId || !serverBackupManager(interaction)) {
+    return interaction.reply({ content: "So quem iniciou a restauracao pode confirmar.", ephemeral: true });
+  }
+  if (action === "cancel") {
+    serverRestoreSessions.delete(sessionId);
+    return interaction.update({ content: "Restauracao cancelada. Nenhuma alteracao foi feita.", components: [] });
+  }
+  serverRestoreSessions.delete(sessionId);
+  await interaction.deferUpdate();
+  try {
+    const ceoUserId = String(process.env.CEO_USER_ID || interaction.user.id).trim();
+    const result = await restoreServerBackup(interaction.guild, session.payload, {
+      ceoUserId,
+      allowedMemberIds: [ceoUserId],
+      onProgress: text => interaction.editReply({ content: text, components: [] }).catch(() => null)
+    });
+    await interaction.editReply({ content: "Estrutura criada. Restaurando configuracoes, imagens e paineis...", components: [] });
+    const storeReport = await restoreStoreFromServerBackup(interaction.guild, result, ceoUserId);
+    await connectStatusVoiceChannel(interaction.guild).catch(() => null);
+    const report = result.report;
+    return interaction.editReply({
+      content: [
+        "Restauracao concluida.",
+        `Cargos: ${report.rolesCreated} criado(s), ${report.rolesReused} reaproveitado(s).`,
+        `Canais: ${report.channelsCreated} criado(s), ${report.channelsReused} reaproveitado(s).`,
+        `Emojis: ${report.emojisCreated} criado(s).`,
+        `Stickers: ${report.stickersCreated} criado(s).`,
+        `Loja: ${storeReport.panelsPublished} painel(is) e ${storeReport.quickOrdersPublished} mensagem(ns) de compra publicados.`,
+        `Falhas nao criticas: ${report.failures.length}.`,
+        "Configure seu Pix com /configpix e rode /diagnostico antes de abrir a loja."
+      ].join("\n"),
+      components: []
+    });
+  } catch (error) {
+    return interaction.editReply({ content: `A restauracao parou por erro: ${error.message}\nO que ja foi criado foi mantido; rode novamente para reaproveitar e continuar.`, components: [] });
+  }
+}
 async function sessionOrReply(interaction, sessionId) {
   const s = sessions.get(sessionId);
   if (!s) {
@@ -5328,6 +5714,8 @@ function commandHelpEmbed(member) {
   const setupCommands = [
     "`/configds`, `!configds`, `!painel`, `!loja` ou `!setup` - abre o configurador da loja no canal.",
     "`/configserver` ou `!configserver` - configura canais, cargos e call de status do servidor.",
+    "`/backup` ou `!backup` - gera um clone seguro da estrutura, interface e catalogo.",
+    "`/restaurar` ou `!restaurar` - recria o backup completo em outro servidor.",
     "`/exportarloja` ou `!exportarloja` - baixa paineis e produtos sem dados privados.",
     "`/importarloja` ou `!importarloja [painel]` - importa um painel exportado neste canal.",
     "`/setup-atendimento` ou `!atendimento` - cria/atualiza o painel ON/OFF dos ADMs.",
@@ -7516,6 +7904,14 @@ client.on("messageCreate", async message => {
     return pullBackupCommand(message);
   }
 
+  if (content === `${prefix}backup`) {
+    return createFullServerBackupCommand(message);
+  }
+
+  if (content === `${prefix}restaurar`) {
+    return startFullServerRestoreCommand(message, message.attachments.first());
+  }
+
   if (content === `${prefix}exportarloja`) {
     return exportStoreCatalog(message);
   }
@@ -7671,6 +8067,8 @@ async function handleInteraction(interaction) {
         return startConfig(interaction.channel, interaction.member, interaction.user);
       }
       if (interaction.commandName === "configserver") return showServerConfig(interaction);
+      if (interaction.commandName === "backup") return createFullServerBackupCommand(interaction);
+      if (interaction.commandName === "restaurar") return startFullServerRestoreCommand(interaction, interaction.options.getAttachment("arquivo"));
       if (interaction.commandName === "exportarloja") return exportStoreCatalog(interaction);
       if (interaction.commandName === "importarloja") {
         return importStoreCatalog(
@@ -7739,6 +8137,7 @@ async function handleInteraction(interaction) {
       if (interaction.commandName === "gastos-reset") return resetSpendCommand(interaction);
     }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith("serverrestore:")) return handleServerRestoreButton(interaction);
       if (interaction.customId.startsWith("rmconfirm:")) return handleRemoveConfirm(interaction);
       if (interaction.customId.startsWith("rmcancel:")) return handleRemoveCancel(interaction);
       if (interaction.customId.startsWith("cfg:")) return handleConfigButton(interaction);

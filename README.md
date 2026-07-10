@@ -20,6 +20,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - Atendimento ON/OFF por ADM.
 - Presenca em call de status enquanto o bot estiver ligado.
 - `/configserver` e `!configserver` para trocar call, canais, cargos e desconto pelo Discord.
+- `/backup` e `/restaurar` para clonar estrutura, permissoes, visual, paineis e catalogo em outra instalacao.
 - Pix, QR Code e mensagem extra por atendente.
 - Assumir compra, reenviar Pix e finalizar compra.
 - DM segura para cliente na abertura do carrinho e na finalizacao.
@@ -47,6 +48,7 @@ DISCORD_TOKEN=token_do_bot
 CLIENT_ID=id_da_aplicacao
 STORE_INSTANCE_ID=primary
 STRICT_GUILD_ISOLATION=true
+CEO_USER_ID=seu_id_do_discord
 CLIENT_SECRET=secret_da_aplicacao
 REDIRECT_URI=https://seu-bot.onrender.com/auth/discord/callback
 GUILD_ID=id_do_servidor
@@ -131,6 +133,10 @@ No Discord:
 !exportarloja
 /importarloja
 !importarloja 1
+/backup
+!backup
+/restaurar
+!restaurar
 ```
 
 Para `!configds`, `!atendimento` e `!status-loja`, ative no Discord Developer Portal:

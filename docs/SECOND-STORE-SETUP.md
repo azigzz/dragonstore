@@ -19,6 +19,7 @@ Usar outro banco e a opcao mais segura para separar dinheiro, pedidos e clientes
 ```env
 STORE_INSTANCE_ID=savio-store
 STRICT_GUILD_ISOLATION=true
+CEO_USER_ID=seu_id_do_discord
 DISCORD_TOKEN=token_do_bot_novo
 CLIENT_ID=client_id_do_bot_novo
 CLIENT_SECRET=secret_do_bot_novo
@@ -49,6 +50,20 @@ As variaveis de IDs de cargos/categorias podem ser preenchidas no Render ou pelo
 6. Abra `/configds` no canal, revise e publique.
 
 O arquivo leva apenas o visual do painel, perguntas de compra, produtos, precos, estoque, imagens e sorteios. Ele nao leva Pix, equipe, clientes, ranking, pedidos, carrinhos, vendas, tokens, IDs de canais ou mensagens publicadas.
+
+## Clonar o servidor inteiro
+
+Para copiar tambem cargos, categorias, canais, permissoes, emojis e paineis publicados:
+
+1. Na loja principal, use `/backup` ou `!backup`.
+2. Crie o servidor novo e convide a segunda instalacao do bot com `Administrador`.
+3. Configure no Render novo o `GUILD_ID` do servidor novo e rode `npm run deploy`.
+4. No servidor novo, envie o JSON usando `/restaurar` ou `!restaurar` e confirme no botao.
+5. O bot cria um cargo `CEO` com Administrador e entrega ao dono/`CEO_USER_ID` que confirmou.
+
+A restauracao nao apaga canais ou cargos existentes. Ela reaproveita itens compativeis e cria os ausentes, portanto pode ser executada novamente se uma falha de permissao interromper o processo.
+
+O clone completo inclui a interface e o catalogo, mas nao copia historico de mensagens, membros, carrinhos temporarios, tickets em andamento, Pix, pedidos, vendas, clientes, tokens ou credenciais. As imagens incorporadas ao arquivo sao restauradas no canal privado `dragon-assets`.
 
 ## Mercado Pago
 
