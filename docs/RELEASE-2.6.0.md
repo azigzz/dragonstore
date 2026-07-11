@@ -1,5 +1,7 @@
 # Dragon/Savio Store 2.6.0
 
+> Patch 2.6.1: a leitura do catalogo e publica; o token continua obrigatorio para pedidos e analytics.
+
 ## Faturamento
 
 - `/setupfaturamento` e `!setupfaturamento` publicam um painel persistente em um canal privado.

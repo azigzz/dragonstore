@@ -2862,9 +2862,6 @@ async function handleHttpRequest(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/public-store") {
-    const auth = publicApiAuthorized(req);
-    if (!auth.ok) return sendHttpJson(res, auth.status, { error: auth.error });
-
     try {
       return sendHttpJson(res, 200, await publicStorePayload());
     } catch (error) {
@@ -6430,7 +6427,7 @@ async function buildDiagnosticsEmbed(guild) {
 
   if (!postgresEnabled()) warnings.push("DATABASE_URL ausente: finalizacao transacional, auditoria relacional e ranking em banco ficam limitados ao JSON/KV.");
   if (!kvEnabled() && !postgresEnabled()) warnings.push("KV/Postgres nao configurados: deploy pode perder JSON local em host read-only.");
-  if (!process.env.PUBLIC_STORE_API_TOKEN?.trim()) warnings.push("PUBLIC_STORE_API_TOKEN ausente: site nao consegue ler API publica do bot.");
+  if (!process.env.PUBLIC_STORE_API_TOKEN?.trim()) warnings.push("PUBLIC_STORE_API_TOKEN ausente: pedidos e analytics do site ficam bloqueados.");
   if (!productsCount) warnings.push("Nenhum produto salvo nos paineis do bot.");
   if (!publishedCount) warnings.push("Nenhum painel publicado salvo/vinculado.");
   if (!staffWithPix) warnings.push("Nenhum ADM com Pix configurado.");
@@ -6465,7 +6462,7 @@ async function buildDiagnosticsEmbed(guild) {
         value: `${temporary.configSessions} config | ${temporary.addCartSessions} addcar | ${temporary.imageUploads + temporary.paymentProofUploads} upload(s) | ${temporary.actionLocks} trava(s)`,
         inline: true
       },
-      { name: "Site/API", value: `Token publico: ${process.env.PUBLIC_STORE_API_TOKEN?.trim() ? "configurado" : "faltando"}\nScan paineis: ${process.env.PUBLIC_STORE_SCAN_CHANNELS === "false" ? "manual" : "ativo"}\nInvite: ${publicDiscordInviteUrl(process.env.DISCORD_INVITE_URL)}`, inline: false },
+      { name: "Site/API", value: `Token de escrita: ${process.env.PUBLIC_STORE_API_TOKEN?.trim() ? "configurado" : "faltando"}\nCatalogo publico: ativo\nScan paineis: ${process.env.PUBLIC_STORE_SCAN_CHANNELS === "false" ? "manual" : "ativo"}\nInvite: ${publicDiscordInviteUrl(process.env.DISCORD_INVITE_URL)}`, inline: false },
       { name: "Alertas", value: warningLine.slice(0, 1024), inline: false }
     )
     .setFooter({ text: "Use !salvarpix depois de configurar Pix/painel e publique/vincule paineis pelo !configds." })

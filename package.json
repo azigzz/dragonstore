@@ -1,6 +1,6 @@
 {
   "name": "discord-sales-bot-config-discord",
-  "version": "2.6.0",
+  "version": "2.6.1",
   "description": "Bot de vendas Discord com configurador dentro do Discord.",
   "main": "src/index.js",
   "scripts": {
