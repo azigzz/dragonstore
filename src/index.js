@@ -121,7 +121,7 @@ const MAX_SAVED_IMAGE_BYTES = 8 * 1024 * 1024;
 const ADD_CART_SESSION_TTL_MS = 10 * 60 * 1000;
 const SERVER_RESTORE_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SERVER_BACKUP_BYTES = 8 * 1024 * 1024;
-const CONFIG_SESSION_TTL_MS = 60 * 60 * 1000;
+const CONFIG_SESSION_TTL_MS = 14 * 60 * 1000;
 const EPHEMERAL_CLEANUP_INTERVAL_MS = 60 * 1000;
 
 function sweepExpiredEntries(map, now = Date.now()) {
@@ -4637,48 +4637,77 @@ function configRows(sessionId) {
 async function refreshConfig(sessionId) {
   const s = sessions.get(sessionId);
   if (!s) return;
+  const panel = getPanel(s.guildId, s.scopeId);
+  const payload = { embeds: [configEmbed(panel, s.ownerId)], components: configRows(sessionId) };
+
+  if (s.ephemeral && s.webhook && s.messageId) {
+    try {
+      await s.webhook.editMessage(s.messageId, payload);
+    } catch (e) {
+      console.error("refreshConfig ephemeral:", e.message);
+    }
+    return;
+  }
+
   try {
     const guild = await client.guilds.fetch(s.guildId);
     const ch = await guild.channels.fetch(s.channelId);
     const msg = await ch.messages.fetch(s.messageId);
-    const panel = getPanel(s.guildId, s.scopeId);
-    await msg.edit({ embeds: [configEmbed(panel, s.ownerId)], components: configRows(sessionId) });
+    await msg.edit(payload);
   } catch (e) { console.error("refreshConfig:", e.message); }
 }
-async function startConfig(channel, member, user) {
-  if (!isAdmin(member)) return channel.send(`<@${user.id}> você precisa ser admin ou ter o cargo ADM configurado.`);
+async function removeLegacyPublicConfig(panel, guild) {
+  if (!panel.configMessageChannelId || !panel.configMessageId) return;
+  const channel = await guild.channels.fetch(panel.configMessageChannelId).catch(() => null);
+  const message = channel?.isTextBased()
+    ? await channel.messages.fetch(panel.configMessageId).catch(() => null)
+    : null;
+  if (message?.author?.id === client.user.id) await message.delete().catch(() => null);
+}
+async function startConfig(interaction) {
+  if (!isAdmin(interaction.member)) {
+    return interaction.reply({ content: "Você precisa ser ADM para abrir o configurador da loja.", ephemeral: true });
+  }
 
-  const guildId = channel.guild.id;
+  const channel = interaction.channel;
+  const user = interaction.user;
+  const guildId = interaction.guildId;
   let panel = getPanel(guildId, channel.id);
   if (shouldAutoRecoverPanel(panel)) {
     panel = await findRecoverableSalePanel(channel, guildId, channel.id) || panel;
   }
   const sessionId = sid();
-  let msg = null;
 
-  // Se já existe um !configds nesse mesmo canal, edita ele em vez de criar outro.
-  if (panel.configMessageChannelId === channel.id && panel.configMessageId) {
-    msg = await channel.messages.fetch(panel.configMessageId).catch(() => null);
-  }
+  await removeLegacyPublicConfig(panel, interaction.guild);
+  panel.configMessageChannelId = "";
+  panel.configMessageId = "";
+  savePanel(guildId, panel, channel.id);
 
-  if (msg) {
-    await msg.edit({ embeds: [configEmbed(panel, user.id)], components: configRows(sessionId) });
-  } else {
-    msg = await channel.send({ embeds: [configEmbed(panel, user.id)], components: configRows(sessionId) });
-    panel.configMessageChannelId = channel.id;
-    panel.configMessageId = msg.id;
-    savePanel(guildId, panel, channel.id);
-  }
-
-  sessions.set(sessionId, {
+  const session = {
     guildId,
     scopeId: channel.id,
     channelId: channel.id,
-    messageId: msg.id,
+    messageId: "",
     ownerId: user.id,
+    ephemeral: true,
+    webhook: interaction.webhook,
     createdAt: Date.now(),
     expiresAt: Date.now() + CONFIG_SESSION_TTL_MS
-  });
+  };
+  sessions.set(sessionId, session);
+
+  try {
+    await interaction.reply({
+      embeds: [configEmbed(panel, user.id)],
+      components: configRows(sessionId),
+      ephemeral: true
+    });
+    const message = await interaction.fetchReply();
+    session.messageId = message.id;
+  } catch (error) {
+    sessions.delete(sessionId);
+    throw error;
+  }
 }
 function catalogPanelSnapshot(panel) {
   const quick = quickOrderConfig(panel);
@@ -5232,9 +5261,13 @@ async function sessionOrReply(interaction, sessionId) {
     await interaction.reply({ content: "Sessão expirada. Use `!configds` ou `/configds` de novo.", ephemeral: true });
     return null;
   }
-  if (interaction.user.id !== s.ownerId && !isAdmin(interaction.member)) {
-    await interaction.reply({ content: "Só quem abriu ou um admin pode mexer nisso.", ephemeral: true });
+  if (interaction.user.id !== s.ownerId) {
+    await interaction.reply({ content: "Só quem abriu esta configuração pode usar os controles.", ephemeral: true });
     return null;
+  }
+  if (interaction.message?.id === s.messageId) {
+    s.expiresAt = Date.now() + CONFIG_SESSION_TTL_MS;
+    if (interaction.webhook) s.webhook = interaction.webhook;
   }
   return s;
 }
@@ -5666,8 +5699,6 @@ async function handleConfigButton(interaction) {
   }
   if (action === "reset") {
     const resetPanel = defaultPanel(s.guildId, s.scopeId);
-    resetPanel.configMessageChannelId = s.channelId;
-    resetPanel.configMessageId = s.messageId;
     savePanel(s.guildId, resetPanel, s.scopeId);
     writeAuditLog(interaction, "panel.reset", { scopeId: s.scopeId, panelId: resetPanel.id });
     await refreshConfig(sessionId);
@@ -5723,8 +5754,8 @@ async function handleModal(interaction) {
       return interaction.reply({ content: "Essa mensagem nao parece ser um painel de produtos publicado por este bot.", ephemeral: true });
     }
 
-    recovered.configMessageChannelId = s.channelId;
-    recovered.configMessageId = s.messageId;
+    recovered.configMessageChannelId = "";
+    recovered.configMessageId = "";
     savePanel(s.guildId, recovered, s.scopeId);
     writeAuditLog(interaction, "panel.linked", { scopeId: s.scopeId, panelId: recovered.id, productCount: recovered.products.length, sourceChannelId: ch.id, sourceMessageId: msg.id });
     await refreshConfig(sessionId);
@@ -6139,7 +6170,7 @@ function commandHelpEmbed(member) {
     "`/saldogasto` ou `!saldogasto` - mostra seu saldo gasto em modo privado."
   ];
   const setupCommands = [
-    "`/configds`, `!configds`, `!painel`, `!loja` ou `!setup` - abre o configurador da loja no canal.",
+    "`/configds` - abre o configurador privado, visível somente para você; os atalhos com `!` orientam a usar este comando.",
     "`/configserver` ou `!configserver` - configura canais, cargos e call de status do servidor.",
     "`/setup-loja` ou `!setup-loja` - completa o setup sem substituir o que ja existe.",
     "`/backup` ou `!backup` - gera um clone seguro da estrutura, interface e catalogo.",
@@ -8513,7 +8544,11 @@ client.on("messageCreate", async message => {
 
   if ([`${config.prefix || "!"}configds`, `${config.prefix || "!"}painel`, `${config.prefix || "!"}loja`, `${config.prefix || "!"}setup`].includes(content)) {
     await message.delete().catch(() => null);
-    return startConfig(message.channel, message.member, message.author);
+    const sent = await message.author.send("Use `/configds` no canal do painel. O configurador será privado e aparecerá somente para você.").catch(() => null);
+    if (sent) return sent;
+    const notice = await message.channel.send(`<@${message.author.id}> use \`/configds\`; o configurador privado não pode ser aberto por comando com \`!\`.`).catch(() => null);
+    if (notice) setTimeout(() => notice.delete().catch(() => null), 10_000);
+    return notice;
   }
 
   if (content === `${config.prefix || "!"}configserver`) {
@@ -8673,8 +8708,7 @@ async function handleInteraction(interaction) {
       if (interaction.commandName === "help") return sendHelpCommand(interaction);
       if (interaction.commandName === "configds") {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para abrir o configurador da loja.")) return;
-        await interaction.reply({ content: "Abri o configurador neste canal.", ephemeral: true });
-        return startConfig(interaction.channel, interaction.member, interaction.user);
+        return startConfig(interaction);
       }
       if (interaction.commandName === "configserver") return showServerConfig(interaction);
       if (interaction.commandName === "setup-loja") return showAutomaticSetup(interaction);

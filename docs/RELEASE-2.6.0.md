@@ -2,6 +2,8 @@
 
 > Patch 2.6.1: a leitura do catalogo e publica; o token continua obrigatorio para pedidos e analytics.
 
+> Patch 2.6.2: `/configds` usa um configurador efemero e privado; somente o painel publicado fica visivel no canal.
+
 ## Faturamento
 
 - `/setupfaturamento` e `!setupfaturamento` publicam um painel persistente em um canal privado.
