@@ -4662,7 +4662,13 @@ async function removeLegacyPublicConfig(panel, guild) {
   const message = channel?.isTextBased()
     ? await channel.messages.fetch(panel.configMessageId).catch(() => null)
     : null;
-  if (message?.author?.id === client.user.id) await message.delete().catch(() => null);
+  const hasConfigControls = message?.components?.some(row => row.components?.some(component =>
+    String(component.customId || component.data?.custom_id || "").startsWith("cfg:")
+  ));
+  const hasConfigTitle = message?.embeds?.some(embed => String(embed.title || "").includes("Configurador da Loja"));
+  if (message?.author?.id === client.user.id && (hasConfigControls || hasConfigTitle)) {
+    await message.delete().catch(() => null);
+  }
 }
 async function startConfig(interaction) {
   if (!isAdmin(interaction.member)) {
