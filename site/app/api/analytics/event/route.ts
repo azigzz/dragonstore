@@ -9,13 +9,14 @@ export async function POST(request: Request) {
 
   try {
     await recordAnalyticsEvent({
-      type: String(body.type || "") as "page_view" | "category_click" | "product_click",
+      type: String(body.type || "") as "page_view" | "category_click" | "product_click" | "order_created",
       visitorId: String(body.visitorId || ""),
       path: body.path ? String(body.path) : undefined,
       productId: body.productId ? String(body.productId) : undefined,
       productName: body.productName ? String(body.productName) : undefined,
       categoryId: body.categoryId ? String(body.categoryId) : undefined,
-      categoryTitle: body.categoryTitle ? String(body.categoryTitle) : undefined
+      categoryTitle: body.categoryTitle ? String(body.categoryTitle) : undefined,
+      orderId: body.orderId ? String(body.orderId) : undefined
     });
     return NextResponse.json({ ok: true });
   } catch (error) {

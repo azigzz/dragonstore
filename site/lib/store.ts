@@ -94,9 +94,9 @@ function categoryFromProducts(products: StoreProduct[], store: Pick<StoreData, "
   if (!products.length) return [];
   return [{
     id: slugify(store.title || "catalogo"),
-    title: store.title || "Catalogo Dragon Store",
+    title: store.title || "Catalogo Sávio Store",
     description: categoryDescription(store.description),
-    imageUrl: store.imageUrl || "/dragon-store-hero.png",
+    imageUrl: store.imageUrl || "/savio-store-logo.png",
     color: store.color,
     minPrice: minProductPrice(products),
     products
@@ -104,7 +104,7 @@ function categoryFromProducts(products: StoreProduct[], store: Pick<StoreData, "
 }
 
 function fallbackData(config: SiteConfig, message?: string): StoreData {
-  const image = config.heroImageUrl || fallbackStore.imageUrl || "/dragon-store-hero.png";
+  const image = config.heroImageUrl || fallbackStore.imageUrl || "/savio-store-logo.png";
   const fallbackCategories = (fallbackStore as { categories?: unknown }).categories;
   const categories = normalizeCategories(config.fallbackCategories || fallbackCategories, image, fallbackStore.title);
   const products = categories.length
@@ -136,7 +136,7 @@ function fallbackData(config: SiteConfig, message?: string): StoreData {
 }
 
 function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
-  const image = raw.imageUrl || config.heroImageUrl || "/dragon-store-hero.png";
+  const image = raw.imageUrl || config.heroImageUrl || "/savio-store-logo.png";
   const fallbackCategoriesSource = (fallbackStore as { categories?: unknown }).categories;
   const botProducts = normalizeProducts(raw.products, image);
   const botCategories = normalizeCategories(raw.categories, image, raw.title);
@@ -159,7 +159,7 @@ function mergeBotData(raw: StoreData, config: SiteConfig): StoreData {
         });
 
   return {
-    storeName: config.storeName || raw.storeName || "Dragon Store",
+    storeName: config.storeName || raw.storeName || "Sávio Store",
     title: raw.title || config.heroTitle,
     description: raw.description || config.heroText,
     imageUrl: image,

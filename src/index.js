@@ -47,6 +47,7 @@ const DATA_DIR = process.env.BOT_DATA_DIR || path.join(__dirname, "..", "data");
 const PANELS_FILE = path.join(DATA_DIR, `panels${INSTANCE_FILE_SUFFIX}.json`);
 const ORDERS_FILE = path.join(DATA_DIR, `orders${INSTANCE_FILE_SUFFIX}.json`);
 const STAFF_FILE = path.join(DATA_DIR, `staff${INSTANCE_FILE_SUFFIX}.json`);
+const SITE_ANALYTICS_FILE = path.join(DATA_DIR, `site-analytics${INSTANCE_FILE_SUFFIX}.json`);
 const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "";
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const BOT_KV_PREFIX = instanceConfig.isolatedStoragePrefix(process.env.BOT_KV_PREFIX);
@@ -55,12 +56,14 @@ const BOT_DB_PREFIX = instanceConfig.isolatedStoragePrefix(process.env.BOT_DB_PR
 const KV_FILE_KEYS = {
   [PANELS_FILE]: `${BOT_KV_PREFIX}:panels`,
   [ORDERS_FILE]: `${BOT_KV_PREFIX}:orders`,
-  [STAFF_FILE]: `${BOT_KV_PREFIX}:staff`
+  [STAFF_FILE]: `${BOT_KV_PREFIX}:staff`,
+  [SITE_ANALYTICS_FILE]: `${BOT_KV_PREFIX}:site-analytics`
 };
 const DB_FILE_KEYS = {
   [PANELS_FILE]: `${BOT_DB_PREFIX}:panels`,
   [ORDERS_FILE]: `${BOT_DB_PREFIX}:orders`,
-  [STAFF_FILE]: `${BOT_DB_PREFIX}:staff`
+  [STAFF_FILE]: `${BOT_DB_PREFIX}:staff`,
+  [SITE_ANALYTICS_FILE]: `${BOT_DB_PREFIX}:site-analytics`
 };
 const memoryJsonStore = new Map();
 const kvWriteQueues = new Map();
@@ -90,6 +93,7 @@ ensureDataDir();
 ensureJsonFile(PANELS_FILE, { guilds: {} });
 ensureJsonFile(ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {}, auditLogs: [] });
 ensureJsonFile(STAFF_FILE, { guilds: {} });
+ensureJsonFile(SITE_ANALYTICS_FILE, { events: [] });
 
 const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates];
 if (process.env.ENABLE_MESSAGE_CONTENT_INTENT !== "false") gatewayIntents.push(GatewayIntentBits.MessageContent);
@@ -237,6 +241,7 @@ async function writeJsonToKv(key, data) {
 function hasUsefulPersistedData(file, data) {
   if (!data || typeof data !== "object") return false;
   if (file === PANELS_FILE || file === STAFF_FILE) return Object.keys(data.guilds || {}).length > 0;
+  if (file === SITE_ANALYTICS_FILE) return Array.isArray(data.events) && data.events.length > 0;
   if (file === ORDERS_FILE) {
     return Object.keys(data.orders || {}).length > 0 ||
       Object.keys(data.tickets || {}).length > 0 ||
@@ -382,7 +387,8 @@ async function hydratePersistentFiles() {
   const files = [
     [PANELS_FILE, { guilds: {} }],
     [ORDERS_FILE, { orders: {}, tickets: {}, customers: {}, sellers: {}, auditLogs: [] }],
-    [STAFF_FILE, { guilds: {} }]
+    [STAFF_FILE, { guilds: {} }],
+    [SITE_ANALYTICS_FILE, { events: [] }]
   ];
   const hydrated = new Set();
 
@@ -960,6 +966,7 @@ function ensureOrdersStore(db) {
   const store = db && typeof db === "object" ? db : {};
   if (!store.orders || typeof store.orders !== "object" || Array.isArray(store.orders)) store.orders = {};
   if (!store.tickets || typeof store.tickets !== "object" || Array.isArray(store.tickets)) store.tickets = {};
+  if (!store.webOrders || typeof store.webOrders !== "object" || Array.isArray(store.webOrders)) store.webOrders = {};
   if (!store.customers || typeof store.customers !== "object" || Array.isArray(store.customers)) store.customers = {};
   if (!store.sellers || typeof store.sellers !== "object" || Array.isArray(store.sellers)) store.sellers = {};
   if (!Array.isArray(store.auditLogs)) store.auditLogs = [];
@@ -986,6 +993,17 @@ function ensureOrdersStore(db) {
     ticket.id = String(ticket.id || id);
     ticket.status = String(ticket.status || "open");
     ticket.createdAt = ticket.createdAt || new Date().toISOString();
+  }
+
+  for (const [id, webOrder] of Object.entries(store.webOrders)) {
+    if (!webOrder || typeof webOrder !== "object" || Array.isArray(webOrder)) {
+      delete store.webOrders[id];
+      continue;
+    }
+    webOrder.id = String(webOrder.id || id).toUpperCase();
+    webOrder.items = Array.isArray(webOrder.items) ? webOrder.items.filter(Boolean) : [];
+    webOrder.status = String(webOrder.status || "pending_discord");
+    webOrder.createdAt = webOrder.createdAt || new Date().toISOString();
   }
   return store;
 }
@@ -2676,9 +2694,160 @@ function sendHttpJson(res, statusCode, payload) {
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": process.env.PUBLIC_STORE_CORS_ORIGIN || "*",
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
-    "Access-Control-Allow-Methods": "GET, OPTIONS"
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
   });
   res.end(JSON.stringify(payload));
+}
+function publicApiAuthorized(req) {
+  const expectedToken = process.env.PUBLIC_STORE_API_TOKEN?.trim();
+  if (!expectedToken) return { ok: false, status: 503, error: "PUBLIC_STORE_API_TOKEN nao configurado no bot." };
+  if (String(req.headers.authorization || "") !== `Bearer ${expectedToken}`) {
+    return { ok: false, status: 401, error: "Nao autorizado." };
+  }
+  return { ok: true };
+}
+function readHttpJsonBody(req, maxBytes = 32 * 1024) {
+  if (req.body && typeof req.body === "object") return Promise.resolve(req.body);
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let tooLarge = false;
+    const chunks = [];
+    req.on("data", chunk => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        tooLarge = true;
+        reject(new Error("Payload muito grande."));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (tooLarge) return;
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+      } catch {
+        reject(new Error("JSON invalido."));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+function publicWebOrderCode(db) {
+  let code = "";
+  do {
+    const time = Date.now().toString(36).slice(-5).toUpperCase();
+    const random = crypto.randomBytes(2).toString("hex").toUpperCase();
+    code = `SS-${time}-${random}`;
+  } while (db.webOrders?.[code]);
+  return code;
+}
+function publicWebOrderResponse(order) {
+  return {
+    id: order.id,
+    status: order.status,
+    items: order.items,
+    totalCents: order.totalCents,
+    total: money(Number(order.totalCents || 0) / 100),
+    createdAt: order.createdAt,
+    expiresAt: order.expiresAt
+  };
+}
+async function createPublicWebOrder(input) {
+  const requestedItems = Array.isArray(input?.items) ? input.items.slice(0, 25) : [];
+  if (!requestedItems.length) throw new Error("Adicione pelo menos um produto ao pedido.");
+
+  const catalog = await publicStorePayload();
+  const products = new Map((catalog.categories || [])
+    .flatMap(category => (category.products || []).map(productItem => [String(productItem.id), { ...productItem, categoryId: category.id, categoryTitle: category.title }])));
+  for (const productItem of catalog.products || []) {
+    if (!products.has(String(productItem.id))) products.set(String(productItem.id), productItem);
+  }
+
+  const quantities = new Map();
+  for (const item of requestedItems) {
+    const productId = String(item?.productId || "").slice(0, 160);
+    const quantity = Math.min(100, Math.max(1, Number.parseInt(String(item?.quantity || 1), 10) || 1));
+    if (!products.has(productId)) throw new Error("Um dos produtos nao existe mais no catalogo. Atualize a pagina.");
+    quantities.set(productId, Math.min(100, (quantities.get(productId) || 0) + quantity));
+  }
+  const totalUnits = [...quantities.values()].reduce((sum, quantity) => sum + quantity, 0);
+  if (totalUnits > 100) throw new Error("O pedido pode ter no maximo 100 unidades.");
+
+  const items = [...quantities.entries()].map(([productId, quantity]) => {
+    const productItem = products.get(productId);
+    const hasStoredPrice = productItem.priceCents !== null && productItem.priceCents !== undefined && productItem.priceCents !== "";
+    const priceCents = hasStoredPrice && Number.isFinite(Number(productItem.priceCents))
+      ? Math.max(0, Math.round(Number(productItem.priceCents)))
+      : priceCentsFromValue(productItem.price);
+    if (!Number.isFinite(priceCents)) throw new Error(`${productItem.name} esta sem preco numerico.`);
+    return {
+      productId,
+      name: clampText(productItem.name, 100, "Produto"),
+      price: clampText(productItem.price, 40, money(priceCents / 100)),
+      priceCents,
+      quantity,
+      subtotalCents: priceCents * quantity,
+      categoryId: clampText(productItem.categoryId, 100),
+      categoryTitle: clampText(productItem.categoryTitle, 100)
+    };
+  });
+
+  const db = readOrders();
+  const now = Date.now();
+  for (const [id, order] of Object.entries(db.webOrders || {})) {
+    if (Date.parse(order.createdAt || "") < now - 7 * 24 * 60 * 60 * 1000) delete db.webOrders[id];
+  }
+  const requestKey = String(input?.requestKey || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+  const existing = requestKey
+    ? Object.values(db.webOrders).find(order => order.requestKey === requestKey && order.guildId === (process.env.PUBLIC_STORE_GUILD_ID?.trim() || process.env.GUILD_ID?.trim()))
+    : null;
+  if (existing) return publicWebOrderResponse(existing);
+
+  const id = publicWebOrderCode(db);
+  const createdAt = new Date(now).toISOString();
+  const order = {
+    id,
+    requestKey,
+    guildId: process.env.PUBLIC_STORE_GUILD_ID?.trim() || process.env.GUILD_ID?.trim() || "default",
+    status: "pending_discord",
+    source: "website",
+    items,
+    totalUnits,
+    totalCents: items.reduce((sum, item) => sum + item.subtotalCents, 0),
+    createdAt,
+    expiresAt: new Date(now + 48 * 60 * 60 * 1000).toISOString()
+  };
+  db.webOrders[id] = order;
+  writeOrders(db);
+  await flushPersistentFile(ORDERS_FILE);
+  return publicWebOrderResponse(order);
+}
+function readSiteAnalyticsStore() {
+  const data = readJson(SITE_ANALYTICS_FILE, { events: [] });
+  return { events: Array.isArray(data?.events) ? data.events.slice(-5000) : [] };
+}
+async function recordPublicAnalyticsEvent(input) {
+  const allowedTypes = new Set(["page_view", "category_click", "product_click", "order_created"]);
+  const type = String(input?.type || "");
+  if (!allowedTypes.has(type)) throw new Error("Tipo de evento invalido.");
+  const event = {
+    id: crypto.randomUUID(),
+    type,
+    visitorId: clampText(input?.visitorId, 120, "anonimo"),
+    path: clampText(input?.path, 300),
+    productId: clampText(input?.productId, 120),
+    productName: clampText(input?.productName, 160),
+    categoryId: clampText(input?.categoryId, 120),
+    categoryTitle: clampText(input?.categoryTitle, 160),
+    orderId: clampText(input?.orderId, 40),
+    createdAt: new Date().toISOString()
+  };
+  const store = readSiteAnalyticsStore();
+  store.events.push(event);
+  store.events = store.events.slice(-5000);
+  writeJson(SITE_ANALYTICS_FILE, store);
+  return event;
 }
 async function handleHttpRequest(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -2687,27 +2856,45 @@ async function handleHttpRequest(req, res) {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": process.env.PUBLIC_STORE_CORS_ORIGIN || "*",
       "Access-Control-Allow-Headers": "Authorization, Content-Type",
-      "Access-Control-Allow-Methods": "GET, OPTIONS"
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
     });
     return res.end();
   }
 
   if (req.method === "GET" && url.pathname === "/api/public-store") {
-    const expectedToken = process.env.PUBLIC_STORE_API_TOKEN?.trim();
-    const auth = String(req.headers.authorization || "");
-
-    if (!expectedToken) {
-      return sendHttpJson(res, 503, { error: "PUBLIC_STORE_API_TOKEN nao configurado no bot." });
-    }
-    if (auth !== `Bearer ${expectedToken}`) {
-      return sendHttpJson(res, 401, { error: "Nao autorizado." });
-    }
+    const auth = publicApiAuthorized(req);
+    if (!auth.ok) return sendHttpJson(res, auth.status, { error: auth.error });
 
     try {
       return sendHttpJson(res, 200, await publicStorePayload());
     } catch (error) {
       console.error("Erro na API publica da loja:", errorSummary(error));
       return sendHttpJson(res, 500, { error: "Nao foi possivel carregar a loja." });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/public-orders") {
+    const auth = publicApiAuthorized(req);
+    if (!auth.ok) return sendHttpJson(res, auth.status, { error: auth.error });
+    try {
+      const input = await readHttpJsonBody(req);
+      return sendHttpJson(res, 201, await createPublicWebOrder(input));
+    } catch (error) {
+      const message = clampText(error?.message, 300, "Nao foi possivel criar o pedido.");
+      return sendHttpJson(res, /nao existe|sem preco|pelo menos|maximo|invalido|grande/i.test(message) ? 400 : 500, { error: message });
+    }
+  }
+
+  if (url.pathname === "/api/public-analytics" && ["GET", "POST"].includes(req.method)) {
+    const auth = publicApiAuthorized(req);
+    if (!auth.ok) return sendHttpJson(res, auth.status, { error: auth.error });
+    try {
+      if (req.method === "GET") return sendHttpJson(res, 200, readSiteAnalyticsStore());
+      const input = await readHttpJsonBody(req, 16 * 1024);
+      const event = await recordPublicAnalyticsEvent(input);
+      return sendHttpJson(res, 201, { ok: true, id: event.id });
+    } catch (error) {
+      return sendHttpJson(res, 400, { error: clampText(error?.message, 200, "Evento invalido.") });
     }
   }
 
@@ -3549,6 +3736,161 @@ async function resetSellerSales(interaction) {
   else db.sellers[interaction.guildId] = {};
   writeOrders(db);
   return interaction.reply({ content: user ? `Vendas de <@${user.id}> resetadas.` : "Ranking de vendas dos ADMs resetado.", ephemeral: true });
+}
+function finalizedOrderAmount(order, guildId) {
+  if (order.spentAmount !== null && order.spentAmount !== undefined && order.spentAmount !== "" && Number.isFinite(Number(order.spentAmount))) {
+    return Math.max(0, Number(order.spentAmount));
+  }
+  if (order.paidAmount !== null && order.paidAmount !== undefined && order.paidAmount !== "" && Number.isFinite(Number(order.paidAmount))) {
+    return Math.max(0, Number(order.paidAmount));
+  }
+  return orderTotals(order, getOrderPanel(order, guildId)).amount;
+}
+function revenueDashboardData(guildId) {
+  const nowKeys = periodKeys(new Date());
+  const rows = Object.values(readOrders().orders || {})
+    .filter(order => order.guildId === guildId && order.status === ORDER_STATUS.CLOSED)
+    .map(order => {
+      const closedAt = new Date(order.closedAt || order.updatedAt || order.createdAt || Date.now());
+      return {
+        order,
+        amount: finalizedOrderAmount(order, guildId),
+        quantity: Math.max(0, Number(order.totalQuantity) || orderTotals(order, getOrderPanel(order, guildId)).quantity),
+        keys: periodKeys(closedAt),
+        timestamp: closedAt.getTime()
+      };
+    })
+    .filter(row => row.amount > 0 && Number.isFinite(row.timestamp))
+    .sort((a, b) => b.timestamp - a.timestamp);
+  const sum = predicate => roundCurrency(rows.filter(predicate).reduce((total, row) => total + row.amount, 0));
+  const total = sum(() => true);
+  return {
+    rows,
+    total,
+    today: sum(row => row.keys.day === nowKeys.day),
+    week: sum(row => row.keys.week === nowKeys.week),
+    month: sum(row => row.keys.month === nowKeys.month),
+    orders: rows.length,
+    items: rows.reduce((totalItems, row) => totalItems + row.quantity, 0),
+    average: rows.length ? roundCurrency(total / rows.length) : 0
+  };
+}
+function revenueDashboardEmbed(guildId) {
+  const data = revenueDashboardData(guildId);
+  const settings = serverConfig(guildId);
+  const storeName = process.env.PUBLIC_STORE_NAME?.trim() || "Loja";
+  const embed = new EmbedBuilder()
+    .setTitle(`Faturamento - ${storeName}`)
+    .setDescription("Valores confirmados em compras finalizadas. Descontos e quantidades ja estao aplicados.")
+    .setColor(0x28f6a1)
+    .addFields(
+      { name: "Total faturado", value: `**${money(data.total)}**`, inline: false },
+      { name: "Hoje", value: money(data.today), inline: true },
+      { name: "Semana", value: money(data.week), inline: true },
+      { name: "Mes", value: money(data.month), inline: true },
+      { name: "Vendas", value: String(data.orders), inline: true },
+      { name: "Itens", value: String(data.items), inline: true },
+      { name: "Ticket medio", value: money(data.average), inline: true }
+    )
+    .setFooter({ text: `Instancia isolada: ${instanceConfig.STORE_INSTANCE_ID}` })
+    .setTimestamp();
+
+  if (settings.revenueListEnabled) {
+    const lines = data.rows.slice(0, 10).map(row => {
+      const order = row.order;
+      const time = Math.floor(row.timestamp / 1000);
+      return `#${order.id} | ${maskCustomerName(order.username)} | **${money(row.amount)}** | ${row.quantity} item(ns) | <t:${time}:R>`;
+    });
+    embed.addFields({
+      name: "Ultimas vendas",
+      value: lines.join("\n").slice(0, 1024) || "Nenhuma venda finalizada ainda.",
+      inline: false
+    });
+  }
+  return embed;
+}
+function revenueDashboardRows(guildId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("revenue:refresh").setLabel("Atualizar").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("revenue:toggle")
+      .setLabel(serverConfig(guildId).revenueListEnabled ? "Ocultar lista" : "Mostrar lista")
+      .setStyle(ButtonStyle.Primary)
+  )];
+}
+async function updateRevenueDashboard(guild, options = {}) {
+  const settings = serverConfig(guild.id);
+  const channelId = String(settings.revenueChannelId || "").trim();
+  if (!channelId) return null;
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || channel.type === ChannelType.GuildForum) return null;
+  const payload = { embeds: [revenueDashboardEmbed(guild.id)], components: revenueDashboardRows(guild.id) };
+  let message = !options.forceNew && settings.revenueMessageId
+    ? await channel.messages.fetch(settings.revenueMessageId).catch(() => null)
+    : null;
+  if (message) await message.edit(payload);
+  else {
+    message = await channel.send(payload);
+    saveServerConfig(guild.id, { revenueMessageId: message.id });
+    await flushPersistentFile(STAFF_FILE).catch(() => null);
+  }
+  return message;
+}
+async function setupRevenueDashboard(context, options = {}) {
+  if (!isAdmin(context.member)) return actionReply(context, { content: "So ADM pode configurar o faturamento.", ephemeral: true });
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
+  }
+  const channel = options.channel || context.channel;
+  if (!channel?.isTextBased?.() || channel.type === ChannelType.GuildForum) {
+    return actionReply(context, { content: "Escolha um canal de texto valido.", ephemeral: true });
+  }
+  const current = serverConfig(actionGuildId(context));
+  saveServerConfig(actionGuildId(context), {
+    revenueChannelId: channel.id,
+    revenueMessageId: current.revenueChannelId === channel.id ? current.revenueMessageId || "" : "",
+    revenueListEnabled: options.listEnabled ?? Boolean(current.revenueListEnabled)
+  });
+  await flushPersistentFile(STAFF_FILE);
+  const message = await updateRevenueDashboard(context.guild);
+  const everyoneCanView = channel.permissionsFor?.(context.guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel);
+  return actionReply(context, {
+    content: `Painel de faturamento configurado em <#${channel.id}>.${everyoneCanView ? " Esse canal esta visivel para @everyone; torne-o privado para esconder os valores." : " O canal esta privado para @everyone."}${message ? "" : " Nao consegui publicar a mensagem."}`,
+    ephemeral: true
+  });
+}
+async function handleRevenueButton(interaction) {
+  if (!await requireAdminInteraction(interaction, "So ADM pode usar o painel de faturamento.")) return;
+  await interaction.deferUpdate();
+  const [, action] = interaction.customId.split(":");
+  if (action === "toggle") {
+    saveServerConfig(interaction.guildId, { revenueListEnabled: !Boolean(serverConfig(interaction.guildId).revenueListEnabled) });
+    await flushPersistentFile(STAFF_FILE).catch(() => null);
+  }
+  return interaction.editReply({ embeds: [revenueDashboardEmbed(interaction.guildId)], components: revenueDashboardRows(interaction.guildId) });
+}
+function webOrderEmbed(guildId, rawCode) {
+  const code = String(rawCode || "").trim().toUpperCase();
+  const order = readOrders().webOrders?.[code];
+  if (!order || order.guildId !== guildId) return null;
+  const expired = Date.parse(order.expiresAt || "") < Date.now();
+  const lines = (order.items || []).map(item => `- **${item.name}** ${item.quantity}x - ${money(Number(item.subtotalCents || 0) / 100)}`);
+  return new EmbedBuilder()
+    .setTitle(`Pedido do site ${order.id}`)
+    .setDescription(lines.join("\n").slice(0, 4096) || "Pedido sem itens.")
+    .setColor(expired ? 0xffb020 : 0x28f6a1)
+    .addFields(
+      { name: "Total", value: `**${money(Number(order.totalCents || 0) / 100)}**`, inline: true },
+      { name: "Status", value: expired ? "Expirado" : "Aguardando atendimento", inline: true },
+      { name: "Origem", value: "Site Sávio Store", inline: true }
+    )
+    .setFooter({ text: "Confira os itens antes de abrir ou preencher o carrinho do cliente." })
+    .setTimestamp(new Date(order.createdAt || Date.now()));
+}
+async function showWebOrder(context, code) {
+  const embed = webOrderEmbed(actionGuildId(context), code);
+  if (!embed) return actionReply(context, { content: "Pedido do site nao encontrado nesta loja.", ephemeral: true });
+  return actionReply(context, { embeds: [embed], ephemeral: true });
 }
 function orderId(type) {
   const db = readOrders();
@@ -4502,6 +4844,8 @@ function storeServerBackupSnapshot(guildId) {
       ticketPanelChannelId: ticketPanelChannelId(guildId),
       statusVoiceChannelId: statusVoiceChannelId(guildId),
       statusVoiceEnabled: statusVoiceEnabled(guildId),
+      revenueChannelId: serverConfig(guildId).revenueChannelId || "",
+      revenueListEnabled: Boolean(serverConfig(guildId).revenueListEnabled),
       cartOpenCategoryId: categoryId(guildId, "cartOpen"),
       closedCategoryId: categoryId(guildId, "closed"),
       ticketOpenCategoryId: categoryId(guildId, "ticketOpen")
@@ -4759,6 +5103,9 @@ async function restoreStoreFromServerBackup(guild, result, ceoUserId) {
     ticketPanelChannelId: mappedBackupId(channelMap, sourceConfig.ticketPanelChannelId),
     statusVoiceChannelId: mappedBackupId(channelMap, sourceConfig.statusVoiceChannelId),
     statusVoiceEnabled: Boolean(sourceConfig.statusVoiceEnabled),
+    revenueChannelId: mappedBackupId(channelMap, sourceConfig.revenueChannelId),
+    revenueMessageId: "",
+    revenueListEnabled: Boolean(sourceConfig.revenueListEnabled),
     cartOpenCategoryId: mappedBackupId(channelMap, sourceConfig.cartOpenCategoryId),
     closedCategoryId: mappedBackupId(channelMap, sourceConfig.closedCategoryId),
     ticketOpenCategoryId: mappedBackupId(channelMap, sourceConfig.ticketOpenCategoryId)
@@ -4828,6 +5175,7 @@ async function restoreStoreFromServerBackup(guild, result, ceoUserId) {
   }
   await flushPersistentFile(PANELS_FILE);
   await flushPersistentFile(STAFF_FILE);
+  await updateRevenueDashboard(guild).catch(() => null);
   await saveStaffBackup(guild, staff.panelChannelId ? await guild.channels.fetch(staff.panelChannelId).catch(() => null) : null).catch(() => null);
   return { panelsPublished, quickOrdersPublished };
 }
@@ -5806,6 +6154,7 @@ function commandHelpEmbed(member) {
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
     "`/setup-ticket` - envia o painel de ticket.",
     "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
+    "`/setupfaturamento` ou `!setupfaturamento [lista|resumo]` - configura o painel privado de faturamento.",
     "`!verificacao` - envia o painel OAuth2 com botao Verificar.",
     "`!verificados` - mostra quantas pessoas ja concluiram a verificacao.",
     "`!puxarbackup` - adiciona verificados ao servidor reserva usando OAuth2.",
@@ -5826,6 +6175,8 @@ function commandHelpEmbed(member) {
     "`/lock` e `/unlock` ou `!lock` e `!unlock` - trava/libera chat atual.",
     "`/ranking-gastos` ou `!ranking-gastos` - ranking admin paginado por periodo.",
     "`/vendas` ou `!vendas` - ranking privado de vendas por ADM.",
+    "`/faturamento` ou `!faturamento` - mostra os totais reais de vendas finalizadas.",
+    "`/pedido codigo` ou `!pedido codigo` - consulta um pedido gerado pelo site.",
     "`/vendasreset` - reseta vendas dos ADMs para testes.",
     "`/gastos-add` - adiciona saldo gasto manual para cliente.",
     "`/gastos-remover` - remove saldo gasto manual de cliente.",
@@ -6314,7 +6665,8 @@ function serverConfigEmbed(guild) {
           `Vendas concluidas: ${channelMentionOrId(completionId)}`,
           `Cancelamentos: ${channelMentionOrId(cancellationId)}`,
           `Avaliacoes: ${channelMentionOrId(review.channelId)}`,
-          `Painel de suporte: ${channelMentionOrId(ticketPanelChannelId(guildId))}`
+          `Painel de suporte: ${channelMentionOrId(ticketPanelChannelId(guildId))}`,
+          `Faturamento: ${channelMentionOrId(serverConfig(guildId).revenueChannelId)}`
         ].join("\n"),
         inline: false
       },
@@ -7755,6 +8107,7 @@ async function finishCart(interaction, id, options = {}) {
   const roleGranted = await grantCustomerRole(interaction.guild, order.userId);
   await sendCompletionReceipt(interaction.guild, order, panel, interaction.channel).catch(error => console.log(`Nao consegui enviar recibo da venda ${order.id}: ${error.message}`));
   await sendSuccessFeed(interaction.guild, order, panel).catch(error => console.log(`Nao consegui enviar feed da venda ${order.id}: ${error.message}`));
+  await updateRevenueDashboard(interaction.guild).catch(error => console.log(`Nao consegui atualizar faturamento da venda ${order.id}: ${error.message}`));
   scheduleCartDeletion(order);
   const thanks = config.messages.purchaseThanks.replaceAll("{id}", order.id);
   const extraEmbed = mysteryResultsEmbed(mysteryResults, panel);
@@ -8100,6 +8453,9 @@ client.once("clientReady", async () => {
       scheduleStatusVoiceReconnect(guild.id);
     });
     await refreshStaffPanel(guild.id).catch(() => null);
+    await updateRevenueDashboard(guild).catch(error => {
+      console.log(`Nao consegui atualizar painel de faturamento em ${guild.id}: ${error.message}`);
+    });
     const panelStore = readPanels();
     const guildStore = ensurePanelStore(panelStore, guild.id);
     const permissionWarnings = await discordPermissionWarnings(guild, allPublicPanels(guildStore), getStaffGuild(guild.id)).catch(error => [`Falha ao validar permissoes: ${error.message}`]);
@@ -8235,6 +8591,26 @@ client.on("messageCreate", async message => {
     return setupSuccessFeed(message, { enabled });
   }
 
+  if (content.startsWith(`${prefix}setupfaturamento`)) {
+    await message.delete().catch(() => null);
+    const listEnabled = /\b(lista|detalhes|on|sim)\b/i.test(rawContent)
+      ? true
+      : /\b(resumo|off|nao)\b/i.test(plainContent)
+        ? false
+        : undefined;
+    return setupRevenueDashboard(message, { listEnabled });
+  }
+
+  if (content === `${prefix}faturamento`) {
+    if (!isAdmin(message.member)) return message.reply("So ADM pode ver o faturamento.");
+    await message.delete().catch(() => null);
+    return message.channel.send({ embeds: [revenueDashboardEmbed(message.guild.id)], components: revenueDashboardRows(message.guild.id) });
+  }
+
+  if (content.startsWith(`${prefix}pedido `)) {
+    return showWebOrder(message, rawContent.slice(`${prefix}pedido`.length).trim());
+  }
+
   if (plainContent.startsWith(`${config.prefix || "!"}avaliacao`)) {
     if (!isAdmin(message.member)) return message.reply("So ADM pode finalizar compra com pedido de avaliacao.");
     const options = reviewOptionsFromText(rawContent);
@@ -8333,6 +8709,17 @@ async function handleInteraction(interaction) {
         const role = interaction.options.getRole("cargo-cliente");
         return setupSuccessFeed(interaction, { enabled, customerRoleId: role?.id || "" });
       }
+      if (interaction.commandName === "setupfaturamento") {
+        return setupRevenueDashboard(interaction, {
+          channel: interaction.options.getChannel("canal") || interaction.channel,
+          listEnabled: interaction.options.getBoolean("mostrar-lista") ?? undefined
+        });
+      }
+      if (interaction.commandName === "faturamento") {
+        if (!await requireAdminInteraction(interaction, "So ADM pode ver o faturamento.")) return;
+        return interaction.reply({ embeds: [revenueDashboardEmbed(interaction.guildId)], ephemeral: true });
+      }
+      if (interaction.commandName === "pedido") return showWebOrder(interaction, interaction.options.getString("codigo"));
       if (interaction.commandName === "avaliacao") {
         const reviewChannel = interaction.options.getChannel("canal");
         const reviewMessage = interaction.options.getString("mensagem") || "";
@@ -8388,6 +8775,7 @@ async function handleInteraction(interaction) {
         return showSpendRanking(interaction, period, Number(page) || 0);
       }
       if (interaction.customId.startsWith("orders:")) return handleOpenOrdersButton(interaction);
+      if (interaction.customId.startsWith("revenue:")) return handleRevenueButton(interaction);
       if (interaction.customId.startsWith("quickbuy:")) {
         const [, panelId] = interaction.customId.split(":");
         return handleQuickBuyButton(interaction, panelId);

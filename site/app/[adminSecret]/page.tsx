@@ -5,7 +5,7 @@ import { readSiteConfig, toAdminPayload } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
 export const metadata = {
-  title: "Painel Dragon Store"
+  title: "Painel Sávio Store"
 };
 
 type SecretAdminPageProps = {

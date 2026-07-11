@@ -1,18 +1,19 @@
 {
-  "storeName": "Dragon Store",
-  "subtitle": "Produtos digitais premium",
-  "heroTitle": "Produtos digitais com compra rapida pelo Discord",
-  "heroText": "Escolha seus produtos, monte seu carrinho e finalize a compra abrindo um ticket no nosso servidor.",
-  "discordInviteUrl": "https://discord.gg/ZyxwUekHWh",
+  "storeName": "Sávio Store",
+  "subtitle": "Produtos digitais, sem complicacao",
+  "heroTitle": "Sávio Store",
+  "heroText": "Escolha seus produtos, gere um pedido seguro e conclua o atendimento no nosso Discord.",
+  "discordInviteUrl": "https://discord.gg/fQQrUk7c98",
   "ticketChannelUrl": "",
-  "botApiUrl": "",
-  "primaryColor": "#28f6a1",
-  "heroImageUrl": "/dragon-store-hero.png",
+  "botApiUrl": "https://savio-store.onrender.com/api/public-store",
+  "primaryColor": "#55f28b",
+  "heroImageUrl": "/savio-store-logo.png",
   "trustBadges": [
-    "Pedido em poucos cliques",
-    "Atendimento humano",
+    "Precos validados pelo bot",
+    "Pedido identificado",
     "Pagamento via Pix",
-    "Entrega digital",
-    "Suporte dedicado"
-  ]
+    "Atendimento humano",
+    "Entrega digital"
+  ],
+  "manualCatalogEnabled": false
 }

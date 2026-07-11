@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { AnalyticsSummary } from "@/lib/types";
 
-type AnalyticsEventType = "page_view" | "category_click" | "product_click";
+type AnalyticsEventType = "page_view" | "category_click" | "product_click" | "order_created";
 
 type AnalyticsEvent = {
   id: string;
@@ -12,6 +12,7 @@ type AnalyticsEvent = {
   productName?: string;
   categoryId?: string;
   categoryTitle?: string;
+  orderId?: string;
   createdAt: string;
 };
 
@@ -21,9 +22,23 @@ type AnalyticsStore = {
 
 const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-const KV_ANALYTICS_KEY = process.env.SITE_ANALYTICS_KV_KEY || "dragon-store:site-analytics";
+const KV_ANALYTICS_KEY = process.env.SITE_ANALYTICS_KV_KEY || "savio-store:site-analytics";
 const ANALYTICS_FILE_NAME = "analytics.runtime.json";
 const MAX_EVENTS = 20000;
+const BOT_API_URL = process.env.BOT_PUBLIC_STORE_API_URL || "";
+const BOT_API_TOKEN = process.env.BOT_PUBLIC_STORE_API_TOKEN || "";
+
+function botAnalyticsUrl() {
+  if (!BOT_API_URL || !BOT_API_TOKEN) return "";
+  try {
+    const url = new URL(BOT_API_URL);
+    url.pathname = "/api/public-analytics";
+    url.search = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
 
 function emptyStore(): AnalyticsStore {
   return { events: [] };
@@ -47,9 +62,10 @@ function normalizeStore(data: Partial<AnalyticsStore> | null): AnalyticsStore {
         productName: event.productName ? String(event.productName).slice(0, 160) : undefined,
         categoryId: event.categoryId ? String(event.categoryId).slice(0, 120) : undefined,
         categoryTitle: event.categoryTitle ? String(event.categoryTitle).slice(0, 160) : undefined,
+        orderId: event.orderId ? String(event.orderId).slice(0, 40) : undefined,
         createdAt: event.createdAt ? String(event.createdAt) : new Date().toISOString()
       }))
-      .filter(event => ["page_view", "category_click", "product_click"].includes(event.type))
+      .filter(event => ["page_view", "category_click", "product_click", "order_created"].includes(event.type))
       .slice(-MAX_EVENTS)
   };
 }
@@ -74,7 +90,7 @@ async function localAnalyticsPaths() {
   const path = await import("node:path");
   return [
     process.env.ANALYTICS_FILE_PATH || path.join(process.cwd(), "data", ANALYTICS_FILE_NAME),
-    path.join("/tmp", "dragon-store-analytics.json")
+    path.join("/tmp", "savio-store-analytics.json")
   ];
 }
 
@@ -96,6 +112,35 @@ async function readKvAnalytics() {
   }
 }
 
+async function readBotAnalytics() {
+  const url = botAnalyticsUrl();
+  if (!url) return null;
+  try {
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${BOT_API_TOKEN}` }, cache: "no-store", signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) return null;
+    return await response.json() as Partial<AnalyticsStore>;
+  } catch {
+    return null;
+  }
+}
+
+async function writeBotAnalytics(event: Partial<AnalyticsEvent>) {
+  const url = botAnalyticsUrl();
+  if (!url) return false;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${BOT_API_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000)
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function writeKvAnalytics(store: AnalyticsStore) {
   if (!KV_REST_API_URL || !KV_REST_API_TOKEN) return false;
   const response = await fetch(`${KV_REST_API_URL.replace(/\/$/, "")}/set/${encodeURIComponent(KV_ANALYTICS_KEY)}`, {
@@ -110,6 +155,8 @@ async function writeKvAnalytics(store: AnalyticsStore) {
 }
 
 export async function readAnalyticsStore(): Promise<AnalyticsStore> {
+  const botData = await readBotAnalytics();
+  if (botData) return normalizeStore(botData);
   const kvData = await readKvAnalytics();
   if (kvData) return normalizeStore(kvData);
   if (isProductionRuntime()) return emptyStore();
@@ -140,9 +187,17 @@ async function writeAnalyticsStore(store: AnalyticsStore) {
 
 export async function recordAnalyticsEvent(input: Partial<AnalyticsEvent>) {
   const type = input.type;
-  if (!type || !["page_view", "category_click", "product_click"].includes(type)) {
+  if (!type || !["page_view", "category_click", "product_click", "order_created"].includes(type)) {
     throw new Error("Tipo de evento invalido.");
   }
+
+  const normalizedEvent = {
+    ...input,
+    type,
+    visitorId: String(input.visitorId || "anonimo").slice(0, 120),
+    createdAt: new Date().toISOString()
+  };
+  if (await writeBotAnalytics(normalizedEvent)) return;
 
   const store = await readAnalyticsStore();
   store.events.push({
@@ -154,6 +209,7 @@ export async function recordAnalyticsEvent(input: Partial<AnalyticsEvent>) {
     productName: input.productName ? String(input.productName).slice(0, 160) : undefined,
     categoryId: input.categoryId ? String(input.categoryId).slice(0, 120) : undefined,
     categoryTitle: input.categoryTitle ? String(input.categoryTitle).slice(0, 160) : undefined,
+    orderId: input.orderId ? String(input.orderId).slice(0, 40) : undefined,
     createdAt: new Date().toISOString()
   });
   await writeAnalyticsStore(store);
@@ -205,6 +261,9 @@ export async function analyticsSummary(): Promise<AnalyticsSummary> {
   let weekPageViews = 0;
   let totalPageViews = 0;
   let totalProductClicks = 0;
+  let todayOrders = 0;
+  let weekOrders = 0;
+  let totalOrders = 0;
 
   for (const event of store.events) {
     const created = new Date(event.createdAt);
@@ -245,6 +304,11 @@ export async function analyticsSummary(): Promise<AnalyticsSummary> {
       row.lastClickedAt = event.createdAt;
       productMap.set(key, row);
     }
+    if (event.type === "order_created") {
+      totalOrders += 1;
+      if (eventDay === today) todayOrders += 1;
+      if (eventWeek === week) weekOrders += 1;
+    }
   }
 
   return {
@@ -255,7 +319,10 @@ export async function analyticsSummary(): Promise<AnalyticsSummary> {
       todayPageViews,
       weekPageViews,
       totalPageViews,
-      totalProductClicks
+      totalProductClicks,
+      todayOrders,
+      weekOrders,
+      totalOrders
     },
     topProducts: [...productMap.values()]
       .sort((a, b) => b.totalClicks - a.totalClicks || b.weekClicks - a.weekClicks || a.productName.localeCompare(b.productName))

@@ -71,6 +71,35 @@ const commands = [
         .setRequired(false)
     ),
   new SlashCommandBuilder()
+    .setName("setupfaturamento")
+    .setDescription("Configura o painel privado de faturamento real da loja.")
+    .addChannelOption(option =>
+      option
+        .setName("canal")
+        .setDescription("Canal privado que recebera o painel.")
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+        .setRequired(false)
+    )
+    .addBooleanOption(option =>
+      option
+        .setName("mostrar-lista")
+        .setDescription("Mostra as 10 vendas mais recentes no painel.")
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("faturamento")
+    .setDescription("Mostra um resumo privado do faturamento da loja."),
+  new SlashCommandBuilder()
+    .setName("pedido")
+    .setDescription("Consulta um pedido criado no site da loja.")
+    .addStringOption(option =>
+      option
+        .setName("codigo")
+        .setDescription("Codigo no formato SS-XXXXX-XXXX.")
+        .setMaxLength(40)
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
     .setName("avaliacao")
     .setDescription("Finaliza o carrinho e pede avaliacao ao cliente.")
     .addChannelOption(option =>

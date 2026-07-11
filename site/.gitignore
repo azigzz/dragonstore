@@ -8,4 +8,8 @@ data/site-config.runtime.json
 data/analytics.runtime.json
 dev-server.log
 dev-server-codex.log
+dev-server-codex-error.log
 tsconfig.tsbuildinfo
+
+.vercel
+.env*

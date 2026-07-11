@@ -1,15 +1,15 @@
 import crypto from "node:crypto";
 import { cookies } from "next/headers";
 
-const COOKIE_NAME = "dragon_store_admin";
-const CSRF_COOKIE_NAME = "dragon_store_admin_csrf";
+const COOKIE_NAME = "savio_store_admin";
+const CSRF_COOKIE_NAME = "savio_store_admin_csrf";
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 12;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 8;
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 
 export function adminRouteSecret() {
-  return process.env.ADMIN_ROUTE_SECRET || process.env.NEXT_PUBLIC_ADMIN_ROUTE_SECRET || "jpo33i48j";
+  return process.env.ADMIN_ROUTE_SECRET || "painel-indisponivel";
 }
 
 function adminPassword() {
@@ -28,7 +28,7 @@ function cookieOptions(maxAge = SESSION_MAX_AGE_SECONDS) {
 function sessionValue() {
   return crypto
     .createHmac("sha256", adminPassword())
-    .update(`dragon-store:${adminRouteSecret()}`)
+    .update(`savio-store:${adminRouteSecret()}`)
     .digest("base64url");
 }
 

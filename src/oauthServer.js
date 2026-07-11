@@ -182,7 +182,7 @@ function createOAuthServer(client, publicStoreHandler) {
   app.disable("x-powered-by");
 
   app.use((req, res, next) => {
-    if (req.path === "/api/public-store" || req.method === "OPTIONS") {
+    if (["/api/public-store", "/api/public-orders", "/api/public-analytics"].includes(req.path) || req.method === "OPTIONS") {
       return Promise.resolve(publicStoreHandler(req, res)).catch(next);
     }
     return next();

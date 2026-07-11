@@ -1,5 +1,7 @@
 # Dragon Store - Bot de vendas para Discord
 
+Versao atual: **2.6.0**. Esta versao adiciona painel privado de faturamento real, pedidos identificados vindos do site e a vitrine separada da Sávio Store. Consulte `docs/RELEASE-2.6.0.md`.
+
 Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pelo Discord, carrinho privado, atendimento manual por ADM, Pix individual por atendente, tickets e caixa surpresa de brindes digitais.
 
 ## Recursos

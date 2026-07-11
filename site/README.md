@@ -1,165 +1,59 @@
-# Dragon Store Site
+# Sávio Store Site
 
-Site profissional em Next.js para divulgar as categorias e produtos digitais da Dragon Store e finalizar pedidos pelo Discord.
+Vitrine em Next.js sincronizada com os painéis de produtos do bot da Sávio Store.
 
-O site tenta buscar produtos do bot em `GET /api/public-store`. Se o bot estiver offline ou sem token correto, usa um catalogo estatico seguro sem mostrar mensagens tecnicas para o cliente.
+## Fluxo
 
-## Instalar localmente
+- Cada painel publicado pelo `!configds` vira uma categoria.
+- A home mostra imagem, descrição, quantidade de opções e menor preço.
+- A página da categoria lista os produtos e permite montar o pedido.
+- `POST /api/orders` envia IDs e quantidades ao bot; o bot valida preços e devolve um ID `SS-...` persistido.
+- A equipe consulta o ID com `/pedido codigo` ou `!pedido codigo`.
+- O token da API nunca é enviado ao navegador.
+
+## Desenvolvimento
 
 ```bash
 cd site
 npm install
-```
-
-## Criar `.env.local`
-
-Copie `.env.example` para `.env.local`:
-
-```bash
-cp .env.example .env.local
-```
-
-No Windows PowerShell:
-
-```powershell
-Copy-Item .env.example .env.local
-```
-
-## Variaveis de ambiente
-
-```env
-ADMIN_ROUTE_SECRET=troque-por-uma-rota-grande-aleatoria
-ADMIN_PASSWORD=troque-por-uma-senha-forte
-
-BOT_PUBLIC_STORE_API_URL=https://seu-bot.onrender.com/api/public-store
-BOT_PUBLIC_STORE_API_TOKEN=mesmo-token-do-bot
-
-NEXT_PUBLIC_SITE_URL=https://sua-loja.vercel.app
-DRAGON_STORE_NAME=Dragon Store
-STORE_SUBTITLE=Loja digital pelo Discord
-STORE_HERO_TITLE=Produtos digitais com compra rapida pelo Discord
-STORE_HERO_TEXT=Escolha seus produtos, monte seu carrinho e finalize a compra abrindo um ticket no nosso servidor.
-DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
-PRIMARY_COLOR=#28f6a1
-```
-
-Nunca use `NEXT_PUBLIC_` no token da API do bot.
-
-## Gerar segredo e senha forte
-
-Rode:
-
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
-```
-
-Use um valor para `ADMIN_ROUTE_SECRET` e outro para `ADMIN_PASSWORD`.
-
-## Rodar local
-
-```bash
 npm run dev
 ```
 
-Abra:
+Crie `site/.env.local` com base em `.env.example`. Esse arquivo não deve ser enviado ao Git.
 
-```txt
-http://localhost:3000
-```
+## Vercel
 
-O painel admin fica em:
+Configure o projeto com **Root Directory** `site` e adicione as variáveis de `.env.example`.
 
-```txt
-http://localhost:3000/SEU_ADMIN_ROUTE_SECRET
-```
-
-Nao existe rota `/admin`.
-
-## Deploy na Vercel
-
-1. Crie um projeto na Vercel apontando para a pasta `site`.
-2. Framework preset: Next.js.
-3. Build command: `npm run build`.
-4. Output: padrao da Vercel.
-5. Configure todas as variaveis do `.env.example`.
-
-## Conectar com o bot
-
-No Render do bot, configure:
+As variáveis essenciais são:
 
 ```env
-PUBLIC_STORE_API_TOKEN=o-mesmo-token-usado-no-site
-DISCORD_INVITE_URL=https://discord.gg/ZyxwUekHWh
-PUBLIC_STORE_NAME=Dragon Store
-PUBLIC_STORE_PANEL_SCOPE=id_do_canal_do_configds
-PUBLIC_STORE_CHANNEL_ID=id_do_canal_do_painel_publicado
-PUBLIC_STORE_MESSAGE_ID=id_da_mensagem_do_painel_publicado
+BOT_PUBLIC_STORE_API_URL=https://savio-store.onrender.com/api/public-store
+BOT_PUBLIC_STORE_API_TOKEN=mesmo-token-do-PUBLIC_STORE_API_TOKEN-no-Render
+NEXT_PUBLIC_SITE_URL=https://seu-projeto.vercel.app
+SAVIO_STORE_NAME=Sávio Store
+DISCORD_INVITE_URL=https://discord.gg/fQQrUk7c98
 ```
 
-Depois redeploye o bot.
-
-O endpoint do bot junta os produtos dos paineis salvos e devolve cada painel como uma categoria do site. Se o bot perdeu `data/panels.json` no redeploy, mas o painel antigo ainda esta publicado no Discord, preencha `PUBLIC_STORE_CHANNEL_ID` e `PUBLIC_STORE_MESSAGE_ID` para recuperar os produtos existentes a partir da mensagem.
-
-No site/Vercel, configure:
+No Render do bot:
 
 ```env
-BOT_PUBLIC_STORE_API_URL=https://seu-bot.onrender.com/api/public-store
-BOT_PUBLIC_STORE_API_TOKEN=o-mesmo-token-usado-no-bot
+PUBLIC_STORE_API_TOKEN=um-token-aleatorio-forte
+PUBLIC_STORE_NAME=Sávio Store
+PUBLIC_STORE_GUILD_ID=ID_DO_SERVIDOR_DA_SAVIO_STORE
+DISCORD_INVITE_URL=https://discord.gg/fQQrUk7c98
+PUBLIC_STORE_SCAN_CHANNELS=true
 ```
 
-## Testar API do bot
+O valor de `BOT_PUBLIC_STORE_API_TOKEN` na Vercel deve ser idêntico ao `PUBLIC_STORE_API_TOKEN` no Render.
 
-```bash
-curl -H "Authorization: Bearer SEU_TOKEN" https://seu-bot.onrender.com/api/public-store
-```
+## Painel administrativo
 
-Resposta esperada:
+O painel fica em `https://seu-site/ADMIN_ROUTE_SECRET`. Em produção, alterações feitas por ele precisam de storage externo compatível com Upstash REST. Use chaves KV exclusivas da Sávio Store para não misturar configuração e analytics com a Dragon Store.
 
-```json
-{
-  "storeName": "Dragon Store",
-  "title": "Titulo do painel",
-  "categories": [],
-  "products": []
-}
-```
+## Segurança
 
-## Usar painel admin
-
-1. Acesse `https://site.vercel.app/ADMIN_ROUTE_SECRET`.
-2. Entre com `ADMIN_PASSWORD`.
-3. Configure textos, links, API do bot, cor, imagem e fallback.
-4. Clique em **Testar bot** para validar a conexao.
-5. Clique em **Sincronizar** para salvar categorias e produtos do bot no fallback administrativo.
-6. Clique em **Salvar** para persistir a config.
-
-Em producao na Vercel, o painel admin so salva alteracoes quando houver storage externo configurado, como Upstash KV (`KV_REST_API_URL`/`KV_REST_API_TOKEN` ou `UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN`). Sem storage externo, use variaveis de ambiente para configuracao permanente.
-
-## Atualizar produtos
-
-O fluxo principal continua no Discord:
-
-1. Use `!configds` ou `/configds`.
-2. Edite produtos, preco, estoque e imagens no bot.
-3. Publique/atualize o painel.
-4. O site mostra cada painel como uma categoria clicavel, com imagem, descricao e menor preco.
-5. A pagina da categoria lista todos os produtos daquela secao.
-
-Se o bot estiver offline, o site mostra um catalogo local com textos comerciais e imagens por tipo de categoria.
-
-## Limitacoes atuais
-
-- Sem pagamento automatico.
-- O carrinho finaliza pelo Discord.
-- O resumo do pedido e copiado para o cliente enviar no ticket.
-- A Vercel nao permite escrita persistente em arquivo local em producao.
-- O painel admin salva em arquivo local apenas em desenvolvimento. Em producao, configure KV externo ou use variaveis de ambiente.
-
-## Seguranca
-
-- Nao coloque `DISCORD_TOKEN` no site.
-- Nao exponha `BOT_PUBLIC_STORE_API_TOKEN` no frontend.
-- `ADMIN_PASSWORD` fica apenas em variavel de ambiente.
-- `ADMIN_ROUTE_SECRET` fica apenas em variavel de ambiente.
-- Login admin usa cookie httpOnly.
-- `.env.local` nao deve ser commitado.
+- Nunca coloque `DISCORD_TOKEN` ou credenciais do banco na Vercel.
+- Nunca prefixe o token da API com `NEXT_PUBLIC_`.
+- O bot recalcula preços; valores enviados pelo navegador não são aceitos como fonte de verdade.
+- Pedidos do site expiram para atendimento após 48 horas e não contam como faturamento até a compra ser finalizada no Discord.

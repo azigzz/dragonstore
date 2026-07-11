@@ -12,7 +12,7 @@ export default function NotFound() {
           </p>
           <div className="mt-6 flex flex-col justify-center gap-3 sm:flex-row">
             <Link
-              href="/#categorias"
+              href="/#catalogo"
               className="inline-flex h-11 items-center justify-center rounded-md bg-white px-5 text-sm font-black text-black transition hover:bg-emerald-200"
             >
               Ver produtos

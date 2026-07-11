@@ -2,16 +2,18 @@
 
 /* eslint-disable @next/next/no-img-element */
 
-import { ArrowLeft, ExternalLink, Search, ShoppingCart } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Layers3, Search, ShoppingBag } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import Link from "next/link";
+import type { CSSProperties } from "react";
 import { useEffect, useMemo, useState } from "react";
-import CartDrawer, { type CartItem } from "@/components/CartDrawer";
+import CartDrawer from "@/components/CartDrawer";
 import Header from "@/components/Header";
 import ProductCard from "@/components/ProductCard";
 import { categoryDescription, categoryImage, categoryPriceLabel, publicDiscordInvite } from "@/lib/catalog";
 import { trackEvent } from "@/lib/client-analytics";
-import type { SiteConfig, StoreCategory, StoreData, StoreProduct } from "@/lib/types";
+import type { SiteConfig, StoreCategory, StoreData } from "@/lib/types";
+import { useStoreCart } from "@/lib/use-store-cart";
 
 type CategoryStorefrontProps = {
   store: StoreData;
@@ -19,215 +21,92 @@ type CategoryStorefrontProps = {
   category: StoreCategory;
 };
 
-const CART_STORAGE_KEY = "dragon-store-cart";
-
 export default function CategoryStorefront({ store, config, category }: CategoryStorefrontProps) {
   const [cartOpen, setCartOpen] = useState(false);
-  const [cart, setCart] = useState<CartItem[]>([]);
   const [query, setQuery] = useState("");
-  const [notice, setNotice] = useState("");
-  const heroImage = categoryImage(category, store.imageUrl || config.heroImageUrl || "/dragon-store-hero.png");
+  const cart = useStoreCart();
+  const heroImage = categoryImage(category, store.imageUrl || config.heroImageUrl || "/savio-store-logo.png");
   const description = categoryDescription(category.description);
   const discordUrl = publicDiscordInvite(config.discordInviteUrl || store.discordInviteUrl);
-  const cartCount = cart.reduce((total, item) => total + item.quantity, 0);
+  const style = { "--brand": config.primaryColor || "#55f28b" } as CSSProperties;
   const filteredProducts = useMemo(() => {
     const term = query.trim().toLowerCase();
-    if (!term) return category.products;
-    return category.products.filter(product => {
-      return [product.name, product.description, product.price, product.stock]
-        .join(" ")
-        .toLowerCase()
-        .includes(term);
-    });
+    return term
+      ? category.products.filter(product => `${product.name} ${product.description} ${product.price} ${product.stock}`.toLowerCase().includes(term))
+      : category.products;
   }, [category.products, query]);
 
   useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem(CART_STORAGE_KEY);
-      if (saved) setCart(JSON.parse(saved));
-    } catch {
-      setCart([]);
-    }
-  }, []);
-
-  useEffect(() => {
-    trackEvent({
-      type: "page_view",
-      path: `/categoria/${category.id}`,
-      categoryId: category.id,
-      categoryTitle: category.title
-    });
+    trackEvent({ type: "page_view", path: `/categoria/${category.id}`, categoryId: category.id, categoryTitle: category.title });
   }, [category.id, category.title]);
 
-  useEffect(() => {
-    window.localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(cart));
-  }, [cart]);
-
-  useEffect(() => {
-    if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(""), 2200);
-    return () => window.clearTimeout(timer);
-  }, [notice]);
-
-  function addProduct(product: StoreProduct) {
-    setCart(current => {
-      const existing = current.find(item => item.product.id === product.id);
-      if (existing) {
-        return current.map(item => item.product.id === product.id ? { ...item, quantity: item.quantity + 1 } : item);
-      }
-      return [...current, { product, quantity: 1 }];
-    });
-    setNotice(`${product.name} adicionado ao carrinho.`);
-  }
-
-  function decreaseProduct(productId: string) {
-    setCart(current => current
-      .map(item => item.product.id === productId ? { ...item, quantity: item.quantity - 1 } : item)
-      .filter(item => item.quantity > 0));
-  }
-
-  function removeProduct(productId: string) {
-    setCart(current => current.filter(item => item.product.id !== productId));
-  }
-
   return (
-    <main>
-      <Header config={config} cartCount={cartCount} onCartClick={() => setCartOpen(true)} />
+    <main className="brand-root" style={style}>
+      <Header config={config} cartCount={cart.cartCount} onCartClick={() => setCartOpen(true)} />
 
-      <section className="relative overflow-hidden border-b border-white/10 bg-[#07090f] pt-20">
-        <div
-          className="absolute inset-y-0 right-0 hidden w-1/2 bg-cover bg-center opacity-35 lg:block"
-          style={{ backgroundImage: `url(${heroImage})` }}
-        />
-        <div className="absolute inset-0 bg-[linear-gradient(90deg,#07090f_0%,rgba(7,9,15,.94)_54%,rgba(7,9,15,.72)_100%)]" />
-        <div className="grid-texture pointer-events-none absolute inset-0 opacity-30" />
-        <div className="dragon-container relative grid gap-6 py-8 sm:py-10 lg:grid-cols-[1fr_360px] lg:items-center">
-          <motion.div
-            initial={{ opacity: 0, y: 16 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.38 }}
-            className="max-w-3xl"
-          >
-            <Link href="/#categorias" className="mb-5 inline-flex items-center gap-2 rounded-md border border-white/15 bg-black/35 px-3 py-2 text-sm font-bold text-slate-100 transition hover:border-emerald-300/40 hover:text-white">
-              <ArrowLeft className="h-4 w-4" />
-              Voltar ao catalogo
-            </Link>
-            <p className="text-sm font-bold uppercase text-emerald-200">{categoryPriceLabel(category)}</p>
-            <h1 className="mt-3 text-4xl font-black leading-[1.05] text-white sm:text-5xl">{category.title}</h1>
-            <p className="mt-4 max-w-2xl text-base leading-7 text-slate-200">
-              {description}
-            </p>
-            <div className="mt-5 flex flex-wrap gap-2">
-              <span className="rounded-md border border-white/10 bg-white/[.06] px-3 py-2 text-xs font-bold uppercase text-slate-200">
-                {category.products.length} {category.products.length === 1 ? "opcao disponivel" : "opcoes disponiveis"}
-              </span>
-              <span className="rounded-md border border-emerald-300/25 bg-emerald-300/10 px-3 py-2 text-xs font-bold uppercase text-emerald-100">
-                Atendimento pelo Discord
-              </span>
+      <section className="category-hero">
+        <img src={heroImage} alt="" className="category-hero-image" />
+        <div className="category-hero-veil" />
+        <div className="cinematic-lines" />
+        <div className="store-container relative flex min-h-[540px] items-end pb-14 pt-28 sm:items-center sm:pb-12">
+          <div className="hero-content max-w-3xl">
+            <Link href="/#catalogo" className="back-link"><ArrowLeft className="h-4 w-4" /> Voltar ao catalogo</Link>
+            <div className="mt-7"><p className="section-kicker">{categoryPriceLabel(category)}</p></div>
+            <h1 className="mt-3 text-5xl font-black leading-none text-white sm:text-6xl">{category.title}</h1>
+            <p className="mt-5 max-w-2xl text-base leading-7 text-zinc-300 sm:text-lg">{description}</p>
+            <div className="mt-7 flex flex-wrap gap-3">
+              <a href="#produtos" className="primary-command"><ShoppingBag className="h-4 w-4" /> Ver produtos</a>
+              <span className="hero-count"><Layers3 className="h-4 w-4" /> {category.products.length} opcoes disponiveis</span>
             </div>
-            <div className="mt-6 flex flex-col gap-3 sm:flex-row">
-              <a
-                href="#produtos"
-                className="inline-flex h-12 items-center justify-center gap-2 rounded-md bg-emerald-300 px-5 text-sm font-black text-black transition hover:bg-cyan-200"
-              >
-                Ver produtos
-                <ShoppingCart className="h-4 w-4" />
-              </a>
-              <a
-                href={discordUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex h-12 items-center justify-center gap-2 rounded-md border border-white/15 bg-white/[.06] px-5 text-sm font-black text-white transition hover:border-violet-300/40 hover:bg-violet-300/10"
-              >
-                Entrar no Discord
-                <ExternalLink className="h-4 w-4" />
-              </a>
-            </div>
-          </motion.div>
-          <motion.div
-            initial={{ opacity: 0, scale: 0.98 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.38, delay: 0.08 }}
-            className="hidden overflow-hidden rounded-lg border border-white/10 bg-white/[.04] shadow-neon lg:block"
-          >
-            <img src={heroImage} alt={category.title} className="aspect-[4/3] w-full object-cover" />
-          </motion.div>
+          </div>
         </div>
       </section>
 
-      <section id="produtos" className="bg-[#07090f] py-10 sm:py-14">
-        <div className="dragon-container">
-          <div className="mb-8 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
+      <section id="produtos" className="catalog-band">
+        <div className="store-container py-14 sm:py-20">
+          <div className="section-heading">
             <div>
-              <p className="text-sm font-bold uppercase text-emerald-200">Produtos</p>
-              <h2 className="mt-2 text-3xl font-black text-white">{category.title}</h2>
-              <p className="mt-2 text-xs font-semibold uppercase text-slate-500">
-                {category.products.length} {category.products.length === 1 ? "produto disponivel" : "produtos disponiveis"} nesta secao.
-              </p>
+              <p className="section-kicker">Escolha sua opcao</p>
+              <h2>{category.title}</h2>
+              <p>Precos e disponibilidade sincronizados com o painel do Discord.</p>
             </div>
-            <label className="relative w-full sm:max-w-sm">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
-              <input
-                value={query}
-                onChange={event => setQuery(event.target.value)}
-                placeholder="Buscar produto"
-                className="premium-surface h-11 w-full rounded-md border border-white/10 pl-10 pr-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-emerald-300/50 focus:shadow-neon"
-              />
+            <label className="search-field">
+              <Search className="h-4 w-4" />
+              <input value={query} onChange={event => setQuery(event.target.value)} placeholder="Buscar nesta categoria" />
             </label>
           </div>
 
           {filteredProducts.length ? (
-            <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-              {filteredProducts.map((product, index) => (
-                <motion.div
-                  key={product.id}
-                  initial={{ opacity: 0, y: 12 }}
-                  whileInView={{ opacity: 1, y: 0 }}
-                  viewport={{ once: true, margin: "-80px" }}
-                  transition={{ duration: 0.25, delay: Math.min(index * 0.03, 0.18) }}
-                >
-                  <ProductCard
-                    product={product}
-                    fallbackImage={heroImage}
-                    categoryId={category.id}
-                    categoryTitle={category.title}
-                    discordUrl={discordUrl}
-                    onAdd={addProduct}
-                  />
-                </motion.div>
+            <div className="product-grid">
+              {filteredProducts.map(product => (
+                <div key={product.id}>
+                  <ProductCard product={product} fallbackImage={heroImage} categoryId={category.id} categoryTitle={category.title} discordUrl={discordUrl} onAdd={cart.addProduct} />
+                </div>
               ))}
             </div>
           ) : (
-            <div className="rounded-lg border border-dashed border-white/15 p-8 text-slate-300">
-              Nenhum produto disponivel nesta categoria no momento.
+            <div className="empty-state min-h-60">
+              <Search className="h-8 w-8 text-zinc-600" />
+              <h3 className="mt-4 text-lg font-black text-white">Nenhum produto encontrado</h3>
+              <button type="button" onClick={() => setQuery("")} className="secondary-command mt-5">Limpar busca</button>
             </div>
           )}
         </div>
       </section>
 
-      <CartDrawer
-        open={cartOpen}
-        items={cart}
-        store={store}
-        config={config}
-        onClose={() => setCartOpen(false)}
-        onAdd={addProduct}
-        onDecrease={decreaseProduct}
-        onRemove={removeProduct}
-        onClear={() => setCart([])}
-      />
+      <footer className="site-footer">
+        <div className="store-container flex flex-col gap-4 py-7 text-xs text-zinc-600 sm:flex-row sm:items-center sm:justify-between">
+          <span>Sávio Store | Produtos digitais</span>
+          <a href={discordUrl} target="_blank" rel="noreferrer" className="transition hover:text-white">Atendimento no Discord oficial</a>
+        </div>
+      </footer>
+
+      <CartDrawer open={cartOpen} items={cart.cart} store={store} config={config} onClose={() => setCartOpen(false)} onAdd={cart.addProduct} onDecrease={cart.decreaseProduct} onRemove={cart.removeProduct} onClear={cart.clearCart} />
 
       <AnimatePresence>
-        {notice ? (
-          <motion.button
-            type="button"
-            onClick={() => setCartOpen(true)}
-            initial={{ opacity: 0, y: 16, x: "-50%" }}
-            animate={{ opacity: 1, y: 0, x: "-50%" }}
-            exit={{ opacity: 0, y: 16, x: "-50%" }}
-            className="fixed bottom-4 left-1/2 z-40 w-[calc(100%-32px)] max-w-md rounded-lg border border-emerald-300/30 bg-[#10141f] px-4 py-3 text-left text-sm font-bold text-emerald-100 shadow-neon transition hover:bg-[#151b29]"
-          >
-            {notice} <span className="text-white">Ver carrinho</span>
+        {cart.notice ? (
+          <motion.button type="button" onClick={() => setCartOpen(true)} initial={{ opacity: 0, y: 18, x: "-50%" }} animate={{ opacity: 1, y: 0, x: "-50%" }} exit={{ opacity: 0, y: 18, x: "-50%" }} className="cart-toast">
+            <CheckCircle2 className="h-4 w-4" /> {cart.notice} <span>Ver pedido</span>
           </motion.button>
         ) : null}
       </AnimatePresence>

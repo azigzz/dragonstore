@@ -10,7 +10,7 @@ type AdminPanelProps = {
 };
 
 const emptyConfig: AdminConfigPayload = {
-  storeName: "Dragon Store",
+  storeName: "Sávio Store",
   subtitle: "Loja digital pelo Discord",
   heroTitle: "Produtos digitais com compra rapida pelo Discord",
   heroText: "Escolha seus produtos, monte seu carrinho e finalize pelo Discord.",
@@ -20,7 +20,7 @@ const emptyConfig: AdminConfigPayload = {
   botApiToken: "",
   botApiTokenConfigured: false,
   primaryColor: "#28f6a1",
-  heroImageUrl: "/dragon-store-hero.png",
+  heroImageUrl: "/savio-store-logo.png",
   trustBadges: ["Carrinho rapido", "Atendimento por ADM", "Pagamento via Pix", "Produtos digitais", "Suporte no Discord"],
   manualCatalogEnabled: false,
   fallbackCategories: [],
@@ -51,9 +51,9 @@ function newProduct(index: number): StoreProduct {
     name: "Novo produto",
     price: "R$ 0,00",
     priceCents: 0,
-    description: "Produto digital da Dragon Store",
+    description: "Produto digital da Sávio Store",
     stock: "sob consulta",
-    imageUrl: "/dragon-store-hero.png",
+    imageUrl: "/savio-store-logo.png",
     type: "normal"
   };
 }
@@ -63,8 +63,8 @@ function productsToCategory(products: StoreProduct[]): StoreCategory[] {
   return [{
     id: "catalogo",
     title: "Catalogo",
-    description: "Produtos digitais da Dragon Store",
-    imageUrl: "/dragon-store-hero.png",
+    description: "Produtos digitais da Sávio Store",
+    imageUrl: "/savio-store-logo.png",
     color: "#28f6a1",
     products
   }];
@@ -209,8 +209,8 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
     const category: StoreCategory = {
       id,
       title: "Nova categoria",
-      description: "Produtos digitais da Dragon Store",
-      imageUrl: "/dragon-store-hero.png",
+      description: "Produtos digitais da Sávio Store",
+      imageUrl: "/savio-store-logo.png",
       color: config.primaryColor || "#28f6a1",
       products: [newProduct(1)]
     };
@@ -351,7 +351,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
                 <ShieldCheck className="h-6 w-6" />
               </span>
               <div>
-                <h1 className="text-xl font-black">Painel Dragon Store</h1>
+                <h1 className="text-xl font-black">Painel Sávio Store</h1>
                 <p className="text-sm text-slate-400">Acesso protegido</p>
               </div>
             </div>
@@ -385,7 +385,7 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
       <section className="mx-auto w-full max-w-7xl">
         <header className="mb-6 flex flex-col justify-between gap-4 border-b border-white/10 pb-5 sm:flex-row sm:items-center">
           <div>
-            <p className="text-sm font-bold uppercase text-emerald-200">Dragon Store</p>
+            <p className="text-sm font-bold uppercase text-emerald-200">Sávio Store</p>
             <h1 className="text-3xl font-black">Painel do site</h1>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -553,6 +553,8 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
                 <Metric label="Visitantes semana" value={analytics?.totals.weekVisitors ?? 0} />
                 <Metric label="Views hoje" value={analytics?.totals.todayPageViews ?? 0} />
                 <Metric label="Views semana" value={analytics?.totals.weekPageViews ?? 0} />
+                <Metric label="Pedidos hoje" value={analytics?.totals.todayOrders ?? 0} />
+                <Metric label="Pedidos total" value={analytics?.totals.totalOrders ?? 0} />
               </div>
               <div className="mt-5 space-y-2">
                 <h3 className="text-sm font-black uppercase text-slate-300">Produtos mais clicados</h3>

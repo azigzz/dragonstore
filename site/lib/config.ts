@@ -7,11 +7,11 @@ import type { AdminConfigPayload, SiteConfig, StoreCategory, StoreProduct } from
 
 const CONFIG_PATH = path.join(process.cwd(), "data", "site-config.json");
 const RUNTIME_CONFIG_PATH = process.env.SITE_CONFIG_FILE_PATH || path.join(process.cwd(), "data", "site-config.runtime.json");
-const RUNTIME_CONFIG_TMP_PATH = path.join("/tmp", "dragon-store-site-config.runtime.json");
+const RUNTIME_CONFIG_TMP_PATH = path.join("/tmp", "savio-store-site-config.runtime.json");
 const RUNTIME_CONFIG_PATHS = [...new Set([RUNTIME_CONFIG_PATH, RUNTIME_CONFIG_TMP_PATH])];
 const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-const KV_CONFIG_KEY = process.env.SITE_CONFIG_KV_KEY || "dragon-store:site-config";
+const KV_CONFIG_KEY = process.env.SITE_CONFIG_KV_KEY || "savio-store:site-config";
 
 function asProducts(value: unknown): StoreProduct[] {
   if (!Array.isArray(value)) return [];
@@ -26,7 +26,7 @@ function asProducts(value: unknown): StoreProduct[] {
         priceCents: typeof product.priceCents === "number" ? product.priceCents : null,
         description: productDescription(product.description),
         stock: String(product.stock || "sob consulta"),
-        imageUrl: product.imageUrl ? String(product.imageUrl) : "/dragon-store-hero.png",
+        imageUrl: product.imageUrl ? String(product.imageUrl) : "/savio-store-logo.png",
         type: product.type ? String(product.type) : "normal"
       };
     })
@@ -179,7 +179,7 @@ export async function readSiteConfig(): Promise<SiteConfig> {
     ...(baseConfig as SiteConfig),
     ...fileConfig,
     ...runtimeConfig,
-    storeName: process.env.DRAGON_STORE_NAME || runtimeConfig.storeName || fileConfig.storeName || baseConfig.storeName,
+    storeName: process.env.SAVIO_STORE_NAME || process.env.DRAGON_STORE_NAME || runtimeConfig.storeName || fileConfig.storeName || baseConfig.storeName,
     subtitle: process.env.STORE_SUBTITLE || runtimeConfig.subtitle || fileConfig.subtitle || baseConfig.subtitle,
     heroTitle: process.env.STORE_HERO_TITLE || runtimeConfig.heroTitle || fileConfig.heroTitle || baseConfig.heroTitle,
     heroText: process.env.STORE_HERO_TEXT || runtimeConfig.heroText || fileConfig.heroText || baseConfig.heroText,
@@ -190,7 +190,7 @@ export async function readSiteConfig(): Promise<SiteConfig> {
   });
 
   return {
-    storeName: merged.storeName || "Dragon Store",
+    storeName: merged.storeName || "Sávio Store",
     subtitle: merged.subtitle || "Loja digital pelo Discord",
     heroTitle: merged.heroTitle || "Produtos digitais com compra rapida pelo Discord",
     heroText: merged.heroText || "Escolha seus produtos, monte seu carrinho e finalize pelo Discord.",
@@ -199,7 +199,7 @@ export async function readSiteConfig(): Promise<SiteConfig> {
     botApiUrl: merged.botApiUrl || "",
     botApiToken: merged.botApiToken || "",
     primaryColor: normalizeColor(merged.primaryColor),
-    heroImageUrl: merged.heroImageUrl || "/dragon-store-hero.png",
+    heroImageUrl: merged.heroImageUrl || "/savio-store-logo.png",
     trustBadges: merged.trustBadges?.length ? merged.trustBadges : baseConfig.trustBadges,
     manualCatalogEnabled: Boolean(merged.manualCatalogEnabled),
     fallbackCategories: merged.fallbackCategories?.length

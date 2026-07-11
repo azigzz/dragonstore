@@ -1,6 +1,6 @@
 const KV_REST_API_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-const KV_AUDIT_KEY = process.env.SITE_ADMIN_AUDIT_KV_KEY || "dragon-store:site-admin-audit";
+const KV_AUDIT_KEY = process.env.SITE_ADMIN_AUDIT_KV_KEY || "savio-store:site-admin-audit";
 const MAX_EVENTS = 300;
 
 type AdminAuditEvent = {

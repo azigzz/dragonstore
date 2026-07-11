@@ -38,6 +38,25 @@ export type StoreData = {
   sourceMessage?: string;
 };
 
+export type WebOrderReceipt = {
+  id: string;
+  status: string;
+  totalCents: number;
+  total: string;
+  createdAt: string;
+  expiresAt: string;
+  items: Array<{
+    productId: string;
+    name: string;
+    price: string;
+    priceCents: number;
+    quantity: number;
+    subtotalCents: number;
+    categoryId?: string;
+    categoryTitle?: string;
+  }>;
+};
+
 export type SiteConfig = {
   storeName: string;
   subtitle: string;
@@ -81,6 +100,9 @@ export type AnalyticsSummary = {
     weekPageViews: number;
     totalPageViews: number;
     totalProductClicks: number;
+    todayOrders: number;
+    weekOrders: number;
+    totalOrders: number;
   };
   topProducts: AnalyticsProductSummary[];
   recentEvents: Array<{
