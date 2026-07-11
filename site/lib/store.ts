@@ -1,5 +1,5 @@
 import fallbackStore from "@/data/fallback-store.json";
-import { categoryDescription, categoryImage, productDescription, productImage, publicDiscordInvite } from "@/lib/catalog";
+import { categoryDescription, categoryImage, productDescription, productImage, publicDiscordInvite, stripDiscordFormatting } from "@/lib/catalog";
 import { normalizeDiscordInvite, readSiteConfig, saveSiteConfig } from "@/lib/config";
 import { parsePrice } from "@/lib/money";
 import type { SiteConfig, StoreCategory, StoreData, StoreProduct } from "@/lib/types";
@@ -20,16 +20,17 @@ function normalizeProducts(products: unknown, defaultImage: string): StoreProduc
     .filter(Boolean)
     .map((item, index) => {
       const product = item as Partial<StoreProduct>;
+      const name = stripDiscordFormatting(product.name ? String(product.name) : "", "Produto");
       return {
         id: String(product.id || `product-${index + 1}`),
-        name: String(product.name || "Produto"),
+        name,
         price: String(product.price || "A combinar"),
         priceCents: typeof product.priceCents === "number" ? product.priceCents : null,
         description: productDescription(product.description),
         stock: String(product.stock || "sob consulta"),
         imageUrl: productImage({
           id: String(product.id || `product-${index + 1}`),
-          name: String(product.name || "Produto"),
+          name,
           price: String(product.price || "A combinar"),
           description: productDescription(product.description),
           stock: String(product.stock || "sob consulta"),
@@ -56,7 +57,7 @@ function normalizeCategories(categories: unknown, defaultImage: string, fallback
     .filter(Boolean)
     .map((item, index) => {
       const category = item as Partial<StoreCategory>;
-      const title = String(category.title || `${fallbackTitle} ${index + 1}`);
+      const title = stripDiscordFormatting(category.title ? String(category.title) : "", `${fallbackTitle} ${index + 1}`);
       const idBase = String(category.id || category.scopeId || category.panelId || title);
       let id = slugify(idBase);
       let suffix = 2;

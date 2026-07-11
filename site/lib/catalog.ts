@@ -54,12 +54,17 @@ export function publicDiscordInvite(value?: string) {
   return raw;
 }
 
-export function cleanPublicText(value: string | undefined, fallback: string) {
+export function stripDiscordFormatting(value: string | undefined, fallback = "") {
   const text = String(value || "")
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
+    .replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, "$1")
+    .replace(/[\*_~`]/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+  return text || fallback;
+}
+
+export function cleanPublicText(value: string | undefined, fallback: string) {
+  const text = stripDiscordFormatting(value);
 
   if (!text || hasBadPublicText(text)) return fallback;
   return text;
