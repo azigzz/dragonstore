@@ -74,6 +74,7 @@ async function createPixOrder(input, options = {}) {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.token}`,
+        Accept: "application/json",
         "Content-Type": "application/json",
         "x-idempotency-key": idempotencyKey
       },

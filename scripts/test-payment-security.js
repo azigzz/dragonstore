@@ -40,6 +40,7 @@ const created = await createPixOrder({
   }
 });
 assert.equal(created.pagBankOrderId, "ORDE_FAKE");
+assert.equal(request.options.headers.Accept, "application/json");
 assert.equal(request.options.headers["x-idempotency-key"], "idem-1");
 assert.equal(JSON.parse(request.options.body).qr_codes[0].amount.value, 100);
 
