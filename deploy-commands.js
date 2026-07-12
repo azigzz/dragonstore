@@ -180,6 +180,16 @@ const commands = [
         .setRequired(false)
     ),
   new SlashCommandBuilder()
+    .setName("addproduto")
+    .setDescription("Pesquisa e adiciona produtos ao seu carrinho de forma privada.")
+    .addStringOption(option =>
+      option
+        .setName("pesquisa")
+        .setDescription("Nome ou palavra-chave do produto, opcional.")
+        .setMaxLength(100)
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName("ranking-gastos")
     .setDescription("Mostra o ranking de clientes por valor gasto."),
   new SlashCommandBuilder()

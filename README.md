@@ -185,7 +185,7 @@ Comandos operacionais uteis:
 - `!verificados`: mostra a quantidade de usuarios verificados.
 - `!puxarbackup`: tenta adicionar verificados ao servidor reserva, renovando tokens expirados.
 - `/salvarpix` ou `!salvarpix`: salva o backup do Pix/painel de atendimento no Discord.
-- `/addcar` ou `!addcar [pesquisa]`: dentro de um carrinho, busca produtos de todos os paineis do servidor, deixa pesquisar e pergunta a quantidade antes de adicionar. Ex: `!addcar steam`.
+- `/addproduto [pesquisa]`: dentro do carrinho, abre uma busca privada em todos os paineis, pede a quantidade e atualiza a mesma mensagem do pedido. O botão **Adicionar produto** faz o mesmo. `/addcar` continua como alias.
 - `/diagnostico` ou `!diagnostico`: mostra KV, paineis, produtos, Pix, atendimento e alertas de configuracao.
 - `!pix`: no carrinho atual, assume a compra e envia o Pix do ADM.
 - `!concluircompra` e `!cancelarcompra`: finalizam ou cancelam o carrinho atual sem depender dos botoes.
@@ -319,7 +319,7 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 4. Use `/ranking-gastos` para ver o ranking por dia, semana, mes ou ano, com 10 clientes por pagina.
 5. Se o slash command ainda nao aparecer, use `!setupsucess` e `!ranking-gastos`.
 
-Carrinhos finalizados ou cancelados ficam visiveis para historico por 3 dias e depois sao apagados automaticamente. Para mudar o tempo, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
+Carrinhos finalizados ou cancelados ficam visiveis por 1h30 e depois sao apagados automaticamente. Antes disso, o cliente recebe o transcript por DM. Para mudar o tempo, altere `settings.deleteClosedCartAfterSeconds` no `config.json` ou use a variavel `CLOSED_CART_DELETE_SECONDS`.
 
 ## Pedido de avaliacao
 
@@ -383,7 +383,7 @@ Os IDs ficam em `config.json`:
     "channelId": "1515799363857809494"
   },
   "settings": {
-    "deleteClosedCartAfterSeconds": 259200
+    "deleteClosedCartAfterSeconds": 5400
   }
 }
 ```
