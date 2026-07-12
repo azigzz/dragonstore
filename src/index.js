@@ -1348,6 +1348,12 @@ function saveServerConfig(guildId, patch) {
   saveStaffGuild(guildId, staff);
   return staff.serverConfig;
 }
+function pagBankAutomaticEnabled(guildId) {
+  return serverConfig(guildId).pagBankAutomaticEnabled !== false;
+}
+function storePaymentMethod(guildId, amountCents) {
+  return pagBankAutomaticEnabled(guildId) ? resolvePaymentMethod(amountCents) : PAYMENT_METHOD.MANUAL_PIX;
+}
 function getStaffProfile(guildId, userId) {
   const staff = getStaffGuild(guildId);
   return staff.users[userId] || null;
@@ -3352,7 +3358,7 @@ async function startOrderPayment(context, id, customerInput = null) {
   const panel = getOrderPanel(order, order.guildId);
   let customer = null;
   const needsPagBankCustomer = (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX && !order.pagBankPixCopyPaste) ||
-    (!paymentStarted(order) && resolvePaymentMethod(serverOrderSnapshot(order).totalCents) === PAYMENT_METHOD.PAGBANK_PIX);
+    (!paymentStarted(order) && storePaymentMethod(order.guildId, serverOrderSnapshot(order).totalCents) === PAYMENT_METHOD.PAGBANK_PIX);
   if (needsPagBankCustomer) {
     if (actor.id !== order.userId) return actionReply(context, { content: "O cliente precisa clicar em Gerar pagamento e informar os dados exigidos pelo PagBank.", ephemeral: true });
     if (!customerInput) {
@@ -3410,7 +3416,7 @@ async function startOrderPayment(context, id, customerInput = null) {
   if (!claimOrderActionLock(order)) return actionReply(context, { content: "O pagamento deste pedido ja esta sendo gerado.", ephemeral: true });
   try {
     const snapshot = serverOrderSnapshot(order);
-    const method = resolvePaymentMethod(snapshot.totalCents);
+    const method = storePaymentMethod(order.guildId, snapshot.totalCents);
     if (method === PAYMENT_METHOD.PAGBANK_PIX && (!postgresEnabled() || !pagBankReady())) {
       return actionReply(context, { content: "Pix PagBank ainda nao esta configurado com Postgres, PAGBANK_TOKEN e PAGBANK_WEBHOOK_URL.", ephemeral: true });
     }
@@ -7042,6 +7048,7 @@ function commandHelpEmbed(member) {
     "`/importarloja` ou `!importarloja [painel]` - importa um painel exportado neste canal.",
     "`/setup-atendimento` ou `!atendimento` - cria/atualiza o painel ON/OFF dos ADMs.",
     "`/configpix` ou `!configpix` - BOT_OWNER_IDS configura o Pix manual da loja.",
+    "`/togglepagbank` ou `!togglepagbank` - alterna entre PagBank automatico e Pix manual antigo.",
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
     "`/setup-ticket` - envia o painel de ticket.",
     "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
@@ -7355,7 +7362,7 @@ async function buildDiagnosticsEmbed(guild) {
       { name: "Carrinhos", value: `${openOrders.length} aberto(s)\n${processingOrders.length} processando\n${closedOrders.length} fechado(s)\n${cancelledOrders.length} cancelado(s)`, inline: true },
       { name: "Atendimento", value: `${staffWithPix} ADM(s) com Pix\n${onlineStaff} ADM(s) ON\nPainel: ${staffPanelLine}`, inline: false },
       { name: "Auditoria", value: `${auditCount} evento(s) recentes salvos`, inline: true },
-      { name: "Pagamentos", value: `PagBank: ${pagBankReady() ? "pronto" : "incompleto"}\nOwners: ${botOwnerIds().size}\nEstoque automatico: ${automaticStockProducts} produto(s)`, inline: true },
+      { name: "Pagamentos", value: `Modo PagBank: ${pagBankAutomaticEnabled(guildId) ? "ligado" : "desligado (Pix manual)"}\nPagBank: ${pagBankReady() ? "pronto" : "incompleto"}\nOwners: ${botOwnerIds().size}\nEstoque automatico: ${automaticStockProducts} produto(s)`, inline: true },
       {
         name: "Estado temporario",
         value: `${temporary.configSessions} config | ${temporary.addCartSessions} addcar | ${temporary.imageUploads + temporary.paymentProofUploads} upload(s) | ${temporary.actionLocks} trava(s)`,
@@ -7409,6 +7416,18 @@ async function sendDiagnosticsCommand(context) {
     });
   }
   return actionReply(context, { embeds: [embed], ephemeral: true });
+}
+async function togglePagBankCommand(context) {
+  if (!await requireBotOwner(context, "Somente BOT_OWNER_IDS pode alterar o modo de pagamento.")) return;
+  const guildId = actionGuildId(context);
+  await ensureStaffState(context.guild, context.channel).catch(() => null);
+  const enabled = !pagBankAutomaticEnabled(guildId);
+  saveServerConfig(guildId, { pagBankAutomaticEnabled: enabled });
+  writeAuditLog(context, "server.pagbank_toggled", { enabled });
+  const description = enabled
+    ? "Pix automatico PagBank **ligado**. Pedidos de R$ 1,00 ou mais pedirao os dados obrigatorios e gerarao QR Code automatico."
+    : "Pix automatico PagBank **desligado**. Todos os pedidos usarao o Pix manual antigo do ADM, sem formulario PagBank.";
+  return actionReply(context, { content: description, ephemeral: true });
 }
 function automaticSetupCurrent(guildId) {
   const staff = getStaffGuild(guildId);
@@ -9904,6 +9923,11 @@ client.on("messageCreate", async message => {
     return;
   }
 
+  if (content === `${config.prefix || "!"}togglepagbank`) {
+    await message.delete().catch(() => null);
+    return togglePagBankCommand(message);
+  }
+
   if (content === `${config.prefix || "!"}status-loja`) {
     if (!isAdmin(message.member)) return message.reply("Só ADM pode ver o status da loja.");
     await message.delete().catch(() => null);
@@ -10011,6 +10035,7 @@ async function handleInteraction(interaction) {
         await ensureStaffState(interaction.guild, interaction.channel);
         return interaction.showModal(pixConfigModal(interaction.guildId, interaction.user));
       }
+      if (interaction.commandName === "togglepagbank") return togglePagBankCommand(interaction);
       if (interaction.commandName === "status-loja") {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para ver o status da loja.")) return;
         return interaction.reply({ embeds: [buildStoreStatusEmbed(interaction.guildId, interaction.channelId)], ephemeral: true });

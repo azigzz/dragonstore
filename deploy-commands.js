@@ -123,6 +123,9 @@ const commands = [
     .setName("configpix")
     .setDescription("Configura seu nome, chave Pix e QR Code para assumir compras."),
   new SlashCommandBuilder()
+    .setName("togglepagbank")
+    .setDescription("Alterna entre Pix automatico PagBank e Pix manual antigo."),
+  new SlashCommandBuilder()
     .setName("salvarpix")
     .setDescription("Salva/atualiza o backup do Pix e painel de atendimento no Discord."),
   new SlashCommandBuilder()
