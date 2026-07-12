@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("../src/paymentPolicy");
-const { createPixOrder, paidPixCharge, validatePaidPixNotification, verifyWebhookSignature } = require("../src/pagBank");
+const { createPixOrder, normalizeCustomer, pagBankConfig, pagBankErrorDetails, paidPixCharge, qrCodeData, validatePaidPixNotification, validCnpj, validCpf, verifyWebhookSignature } = require("../src/pagBank");
 const { canApproveManualPayment, isAuthorizedOwner } = require("../src/securityPolicy");
 
 (async () => {
@@ -26,11 +26,13 @@ await assert.rejects(() => createPixOrder({ referenceId: "x", amountCents: 99, i
 assert.equal(fetchCalls, 0, "Pix manual nunca deve chamar o PagBank");
 
 let request;
+const customer = { name: "Maria da Silva", email: "MARIA@example.com", taxId: "529.982.247-25" };
 const created = await createPixOrder({
   referenceId: "order-1",
   idempotencyKey: "idem-1",
   amountCents: 100,
-  items: [{ productId: "p1", name: "Produto", priceCents: 100, quantity: 1 }]
+  items: [{ productId: "p1", name: "Produto", priceCents: 100, quantity: 1 }],
+  customer
 }, {
   env: { PAGBANK_TOKEN: "fake-token", PAGBANK_ENV: "sandbox", PAGBANK_WEBHOOK_URL: "https://example.com/webhooks/pagbank" },
   fetchImpl: async (url, options) => {
@@ -42,7 +44,65 @@ const created = await createPixOrder({
 assert.equal(created.pagBankOrderId, "ORDE_FAKE");
 assert.equal(request.options.headers.Accept, "application/json");
 assert.equal(request.options.headers["x-idempotency-key"], "idem-1");
-assert.equal(JSON.parse(request.options.body).qr_codes[0].amount.value, 100);
+const requestBody = JSON.parse(request.options.body);
+assert.deepEqual(requestBody.customer, { name: "Maria da Silva", email: "maria@example.com", tax_id: "52998224725" });
+assert.equal(requestBody.qr_codes[0].amount.value, 100);
+assert.equal(requestBody.items.reduce((sum, item) => sum + item.quantity * item.unit_amount, 0), 100);
+assert.equal("charges" in requestBody, false);
+assert.deepEqual(requestBody.notification_urls, ["https://example.com/webhooks/pagbank"]);
+const expirationDelay = Date.parse(requestBody.qr_codes[0].expiration_date) - Date.now();
+assert.ok(expirationDelay > 14 * 60_000 && expirationDelay <= 15 * 60_000);
+assert.equal(Number.isInteger(requestBody.items[0].unit_amount), true);
+
+assert.equal(validCpf("529.982.247-25"), true);
+assert.equal(validCpf("529.982.247-24"), false);
+assert.equal(validCpf("11111111111"), false);
+assert.equal(validCnpj("11.222.333/0001-81"), true);
+assert.equal(normalizeCustomer(customer).tax_id, "52998224725");
+assert.throws(() => normalizeCustomer({ ...customer, name: "   " }), /nome completo/i);
+assert.throws(() => normalizeCustomer({ ...customer, email: "invalido" }), /e-mail/i);
+assert.throws(() => normalizeCustomer({ ...customer, taxId: "" }), /CPF ou CNPJ/i);
+assert.throws(() => normalizeCustomer({ ...customer, taxId: "123.456.789-00" }), /CPF ou CNPJ/i);
+assert.equal(pagBankConfig({ PAGBANK_ENV: "sandbox", PAGBANK_TOKEN: " Bearer secret-token ", PAGBANK_WEBHOOK_URL: "https://example.com/hook" }).token, "secret-token");
+
+let discountedBody;
+await createPixOrder({
+  referenceId: "order-discount",
+  amountCents: 180,
+  items: [{ productId: "p1", name: "Produto", priceCents: 100, quantity: 2 }],
+  customer
+}, {
+  env: { PAGBANK_TOKEN: "fake", PAGBANK_ENV: "sandbox", PAGBANK_WEBHOOK_URL: "https://example.com/webhooks/pagbank" },
+  fetchImpl: async (_url, options) => {
+    discountedBody = JSON.parse(options.body);
+    return { ok: true, status: 201, json: async () => ({ id: "ORDE_DISCOUNT", qr_codes: [{ text: "PIX-DISCOUNT", links: [] }] }) };
+  }
+});
+assert.equal(discountedBody.items.reduce((sum, item) => sum + item.quantity * item.unit_amount, 0), 180);
+assert.equal(discountedBody.qr_codes[0].amount.value, 180);
+
+const parsedErrors = pagBankErrorDetails(400, { error_messages: [
+  { code: "40001", description: "parametro obrigatorio nao informado", parameter_name: "customer.tax_id" },
+  { code: "40002", description: "email invalido", parameter_name: "customer.email" }
+] });
+assert.equal(parsedErrors.errors.length, 2);
+assert.deepEqual(parsedErrors.errors[0], { code: "40001", description: "parametro obrigatorio nao informado", parameterName: "customer.tax_id" });
+
+const linkedQr = qrCodeData({ id: "ORDE_LINK", qr_codes: [{ expiration_date: "2030-01-01T00:00:00Z", links: [
+  { rel: "QRCODE.PNG", media: "image/png", href: "https://example.com/qr.png" },
+  { rel: "PIX", media: "text/plain", href: "PIX-FROM-LINK" }
+] }] });
+assert.equal(linkedQr.copyPaste, "PIX-FROM-LINK");
+assert.equal(linkedQr.qrCodeImageUrl, "https://example.com/qr.png");
+
+let rejectedRequest;
+await assert.rejects(() => createPixOrder({ referenceId: "bad", amountCents: 100, items: [{ productId: "p1", name: "Produto", priceCents: 100, quantity: 1 }], customer }, {
+  env: { PAGBANK_TOKEN: "never-log-this-token", PAGBANK_ENV: "sandbox", PAGBANK_WEBHOOK_URL: "https://example.com/webhooks/pagbank" },
+  fetchImpl: async () => ({ ok: false, status: 400, json: async () => ({ error_messages: [{ code: "40001", description: "tax id obrigatorio", parameter_name: "customer.tax_id" }] }) })
+}).catch(error => { rejectedRequest = error; throw error; }), /PagBank HTTP 400 \(40001\)/);
+assert.equal(rejectedRequest.message.includes("52998224725"), false);
+assert.equal(rejectedRequest.message.includes("never-log-this-token"), false);
+assert.equal(rejectedRequest.pagBank.errors[0].parameterName, "customer.tax_id");
 
 const raw = Buffer.from('{"status":"PAID"}', "utf8");
 const token = "fake-token";

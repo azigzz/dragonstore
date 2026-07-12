@@ -9,11 +9,83 @@ function pagBankConfig(env = process.env) {
   const environment = String(env.PAGBANK_ENV || "sandbox").trim().toLowerCase();
   if (!PAGBANK_BASE_URLS[environment]) throw new Error("PAGBANK_ENV deve ser sandbox ou production.");
   return {
-    token: String(env.PAGBANK_TOKEN || "").trim(),
+    token: String(env.PAGBANK_TOKEN || "").trim().replace(/^Bearer\s+/i, "").trim(),
     environment,
     baseUrl: PAGBANK_BASE_URLS[environment],
     webhookUrl: String(env.PAGBANK_WEBHOOK_URL || "").trim()
   };
+}
+
+function digitsOnly(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function validCpf(value) {
+  const digits = digitsOnly(value);
+  if (!/^\d{11}$/.test(digits) || /^(\d)\1+$/.test(digits)) return false;
+  const check = length => {
+    let sum = 0;
+    for (let index = 0; index < length; index += 1) sum += Number(digits[index]) * (length + 1 - index);
+    const remainder = (sum * 10) % 11;
+    return Number(digits[length]) === (remainder === 10 ? 0 : remainder);
+  };
+  return check(9) && check(10);
+}
+
+function validCnpj(value) {
+  const digits = digitsOnly(value);
+  if (!/^\d{14}$/.test(digits) || /^(\d)\1+$/.test(digits)) return false;
+  const digitAt = length => {
+    const weights = length === 12 ? [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2] : [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+    const sum = weights.reduce((total, weight, index) => total + Number(digits[index]) * weight, 0);
+    const remainder = sum % 11;
+    return remainder < 2 ? 0 : 11 - remainder;
+  };
+  return Number(digits[12]) === digitAt(12) && Number(digits[13]) === digitAt(13);
+}
+
+function normalizeCustomer(customer = {}) {
+  const name = String(customer.name || "").trim().replace(/\s+/g, " ");
+  const email = String(customer.email || "").trim().toLowerCase();
+  const taxId = digitsOnly(customer.taxId || customer.tax_id);
+  if (name.length < 5 || name.length > 100 || !/[a-zA-ZÀ-ÿ]/.test(name) || !/\s/.test(name)) throw new Error("Informe seu nome completo valido.");
+  if (email.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new Error("Informe um e-mail valido.");
+  if (!(validCpf(taxId) || validCnpj(taxId))) throw new Error("Informe um CPF ou CNPJ valido.");
+  return { name, email, tax_id: taxId };
+}
+
+function pagBankItems(items, amountCents) {
+  if (!Array.isArray(items) || !items.length) throw new Error("O pedido precisa ter pelo menos um item.");
+  const normalized = items.slice(0, 100).map((item, index) => {
+    const quantity = Number(item.quantity);
+    const unitAmount = Number(item.priceCents);
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new Error(`Quantidade invalida no item ${index + 1}.`);
+    if (!Number.isSafeInteger(unitAmount) || unitAmount <= 0) throw new Error(`Valor invalido no item ${index + 1}.`);
+    return {
+      reference_id: String(item.productId || `item-${index + 1}`).slice(0, 64),
+      name: String(item.name || "Produto digital").slice(0, 100),
+      quantity,
+      unit_amount: unitAmount
+    };
+  });
+  const sum = normalized.reduce((total, item) => total + item.quantity * item.unit_amount, 0);
+  if (sum === amountCents) return normalized;
+  return [{
+    reference_id: String(normalized[0].reference_id || "pedido").slice(0, 64),
+    name: String(normalized.length === 1 ? normalized[0].name : "Produtos do pedido").slice(0, 100),
+    quantity: 1,
+    unit_amount: amountCents
+  }];
+}
+
+function pagBankErrorDetails(status, payload) {
+  const source = Array.isArray(payload?.error_messages) ? payload.error_messages : [];
+  const errors = (source.length ? source : [payload || {}]).map(item => ({
+    code: String(item?.code || payload?.code || "").slice(0, 80),
+    description: String(item?.description || item?.message || payload?.message || "Requisicao recusada").slice(0, 300),
+    parameterName: String(item?.parameter_name || "").slice(0, 120)
+  }));
+  return { status: Number(status), errors };
 }
 
 function pagBankReady(env = process.env) {
@@ -25,9 +97,25 @@ function pagBankReady(env = process.env) {
   }
 }
 
-function safePagBankError(status, payload) {
-  const code = String(payload?.error_messages?.[0]?.code || payload?.code || "").slice(0, 80);
-  return new Error(`PagBank HTTP ${status}${code ? ` (${code})` : ""}`);
+function redactPagBankDetails(details, sensitiveValues = []) {
+  const secrets = sensitiveValues.map(value => String(value || "").trim()).filter(Boolean).sort((a, b) => b.length - a.length);
+  return {
+    ...details,
+    errors: details.errors.map(item => ({
+      ...item,
+      description: secrets.reduce((text, secret) => text.split(secret).join("[redacted]"), item.description)
+        .replace(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi, "[email-redacted]")
+        .replace(/\b\d{11,14}\b/g, "[document-redacted]")
+    }))
+  };
+}
+
+function safePagBankError(status, payload, sensitiveValues = []) {
+  const details = redactPagBankDetails(pagBankErrorDetails(status, payload), sensitiveValues);
+  const code = details.errors[0]?.code || "";
+  const error = new Error(`PagBank HTTP ${status}${code ? ` (${code})` : ""}`);
+  error.pagBank = details;
+  return error;
 }
 
 function qrCodeData(payload) {
@@ -36,7 +124,7 @@ function qrCodeData(payload) {
   const image = links.find(link => /png|image/i.test(`${link?.media || ""} ${link?.rel || ""}`));
   return {
     pagBankOrderId: String(payload?.id || ""),
-    copyPaste: String(qr?.text || ""),
+    copyPaste: String(qr?.text || links.find(link => /pix|text\/plain/i.test(`${link?.rel || ""} ${link?.media || ""}`))?.href || ""),
     qrCodeImageUrl: String(image?.href || ""),
     expiresAt: String(qr?.expiration_date || "")
   };
@@ -50,17 +138,15 @@ async function createPixOrder(input, options = {}) {
     throw new Error("O PagBank aceita neste bot apenas pedidos de pelo menos 100 centavos.");
   }
 
+  const customer = normalizeCustomer(input.customer);
   const expiresAt = input.expiresAt || new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  if (!Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.now()) throw new Error("Data de expiracao PagBank invalida.");
   const body = {
     reference_id: String(input.referenceId).slice(0, 64),
-    items: (input.items || []).slice(0, 100).map((item, index) => ({
-      reference_id: String(item.productId || `item-${index + 1}`).slice(0, 64),
-      name: String(item.name || "Produto digital").slice(0, 100),
-      quantity: Math.max(1, Math.trunc(Number(item.quantity) || 1)),
-      unit_amount: Math.max(1, Math.trunc(Number(item.priceCents) || 0))
-    })),
+    customer,
+    items: pagBankItems(input.items, input.amountCents),
     qr_codes: [{
-      amount: { value: input.amountCents, currency: "BRL" },
+      amount: { value: input.amountCents },
       expiration_date: expiresAt
     }],
     notification_urls: [config.webhookUrl]
@@ -86,7 +172,7 @@ async function createPixOrder(input, options = {}) {
     const retryAfter = Math.min(5000, Math.max(250, Number(response.headers?.get?.("retry-after") || payload?.retry_after || 1) * 1000));
     await new Promise(resolve => setTimeout(resolve, retryAfter));
   }
-  if (!response.ok) throw safePagBankError(response.status, payload);
+  if (!response.ok) throw safePagBankError(response.status, payload, [config.token, customer.name, customer.email, customer.tax_id]);
   const qr = qrCodeData(payload);
   if (!qr.pagBankOrderId || !qr.copyPaste) throw new Error("PagBank respondeu sem QR Code Pix.");
   return { ...qr, expiresAt: qr.expiresAt || expiresAt };
@@ -126,10 +212,15 @@ function validatePaidPixNotification(order, payload) {
 module.exports = {
   PAGBANK_BASE_URLS,
   createPixOrder,
+  normalizeCustomer,
   pagBankConfig,
+  pagBankErrorDetails,
+  pagBankItems,
   pagBankReady,
   paidPixCharge,
   qrCodeData,
   validatePaidPixNotification,
+  validCnpj,
+  validCpf,
   verifyWebhookSignature
 };

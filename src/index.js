@@ -14,7 +14,7 @@ const { currentSetupSummary, provisionStoreSetup } = require("./storeSetup");
 const { QUICK_PANEL_TEMPLATE, parseQuickPanelTemplate } = require("./quickPanelTemplate");
 const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("./paymentPolicy");
 const { canApproveManualPayment, isAuthorizedOwner, parseOwnerIds } = require("./securityPolicy");
-const { createPixOrder, pagBankReady, paidPixCharge, validatePaidPixNotification, verifyWebhookSignature } = require("./pagBank");
+const { createPixOrder, normalizeCustomer, pagBankConfig, pagBankReady, paidPixCharge, validatePaidPixNotification, verifyWebhookSignature } = require("./pagBank");
 const {
   STOCK_MODE,
   STOCK_STATUS,
@@ -3293,14 +3293,62 @@ function buildPagBankPaymentEmbed(order, panel) {
   if (validUrl(order.pagBankQrCodeImageUrl)) embed.setImage(order.pagBankQrCodeImageUrl);
   return embed;
 }
-async function startOrderPayment(context, id) {
-  if (context.isRepliable?.() && !context.deferred && !context.replied) await context.deferReply({ ephemeral: true });
+function pagBankCustomerModal(orderId) {
+  return new ModalBuilder()
+    .setCustomId(`paycustomer:${orderId}`)
+    .setTitle("Dados para o Pix PagBank")
+    .addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("name").setLabel("Nome completo").setPlaceholder("Ex: Maria da Silva").setStyle(TextInputStyle.Short).setMinLength(5).setMaxLength(100).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("email").setLabel("E-mail").setPlaceholder("seuemail@exemplo.com").setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("taxId").setLabel("CPF/CNPJ privado exigido pelo PagBank").setPlaceholder("Nao sera exibido no canal").setStyle(TextInputStyle.Short).setMinLength(11).setMaxLength(18).setRequired(true))
+    );
+}
+let lastPagBankDiagnostic = null;
+function safePagBankFailure(error, order) {
+  let config;
+  try {
+    config = pagBankConfig();
+  } catch {
+    config = { environment: String(process.env.PAGBANK_ENV || "sandbox").trim(), baseUrl: "https://invalid.local", token: "" };
+  }
+  const details = error?.pagBank || { status: 0, errors: [{ code: "", description: error?.message || "Falha desconhecida", parameterName: "" }] };
+  lastPagBankDiagnostic = {
+    at: new Date().toISOString(),
+    environment: config.environment,
+    host: new URL(config.baseUrl).host,
+    tokenPresent: Boolean(config.token),
+    tokenLength: config.token.length,
+    endpoint: `${config.baseUrl}/orders`,
+    status: details.status || 0,
+    errors: details.errors || [],
+    orderId: String(order?.id || "")
+  };
+  const lines = lastPagBankDiagnostic.errors.map(item => `codigo=${item.code || "n/a"} parametro=${item.parameterName || "n/a"} descricao=${item.description || "n/a"}`).join(" | ");
+  console.warn(`PagBank request recusada: HTTP=${lastPagBankDiagnostic.status || "n/a"} ambiente=${config.environment} pedido=${lastPagBankDiagnostic.orderId} ${lines}`);
+}
+async function startOrderPayment(context, id, customerInput = null) {
   const db = readOrders();
   const order = orderForAction(db, id, context, false);
   if (!order || order.status !== ORDER_STATUS.OPEN) return actionReply(context, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
   const actor = actionUser(context);
   if (actor.id !== order.userId && !isAdmin(context.member)) return actionReply(context, { content: "Voce nao pode gerar pagamento para este carrinho.", ephemeral: true });
   const panel = getOrderPanel(order, order.guildId);
+  let customer = null;
+  const needsPagBankCustomer = (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX && !order.pagBankPixCopyPaste) ||
+    (!paymentStarted(order) && resolvePaymentMethod(serverOrderSnapshot(order).totalCents) === PAYMENT_METHOD.PAGBANK_PIX);
+  if (needsPagBankCustomer) {
+    if (actor.id !== order.userId) return actionReply(context, { content: "O cliente precisa clicar em Gerar pagamento e informar os dados exigidos pelo PagBank.", ephemeral: true });
+    if (!customerInput) {
+      if (typeof context.showModal === "function") return context.showModal(pagBankCustomerModal(order.id));
+      return actionReply(context, { content: "Clique no botao Gerar pagamento do carrinho para preencher seus dados em privado.", ephemeral: true });
+    }
+    try {
+      customer = normalizeCustomer(customerInput);
+    } catch (error) {
+      return actionReply(context, { content: error.message, ephemeral: true });
+    }
+  }
+  if (context.isRepliable?.() && !context.deferred && !context.replied) await context.deferReply({ ephemeral: true });
   if (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX && order.pagBankPixCopyPaste) {
     await context.channel.send({ content: `<@${order.userId}> cobrança Pix do pedido #${order.id}:`, embeds: [buildPagBankPaymentEmbed(order, panel)], allowedMentions: { users: [order.userId] } });
     return actionReply(context, { content: "Cobranca PagBank reenviada no carrinho.", ephemeral: true });
@@ -3313,7 +3361,8 @@ async function startOrderPayment(context, id) {
         idempotencyKey: order.pagBankIdempotencyKey,
         amountCents: order.totalCentsSnapshot,
         expiresAt: order.paymentExpiresAt,
-        items: order.paymentSnapshot?.items || []
+        items: order.paymentSnapshot?.items || [],
+        customer
       });
       order.pagBankOrderId = charge.pagBankOrderId;
       order.pagBankPixCopyPaste = charge.copyPaste;
@@ -3326,7 +3375,8 @@ async function startOrderPayment(context, id) {
       await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, embeds: [embed], allowedMentions: { users: [order.userId] } });
       return actionReply(context, { content: "Cobranca PagBank recuperada com a mesma chave de idempotencia.", ephemeral: true });
     } catch (error) {
-      return actionReply(context, { content: `Nao consegui recuperar a cobranca PagBank: ${error.message}`, ephemeral: true });
+      safePagBankFailure(error, order);
+      return actionReply(context, { content: "Nao foi possivel gerar o Pix. Verifique os dados informados e tente novamente.", ephemeral: true });
     } finally {
       releaseOrderActionLock(order);
     }
@@ -3379,7 +3429,8 @@ async function startOrderPayment(context, id) {
         idempotencyKey: order.pagBankIdempotencyKey,
         amountCents: snapshot.totalCents,
         expiresAt: order.paymentExpiresAt,
-        items: snapshot.items
+        items: snapshot.items,
+        customer
       });
       order.pagBankOrderId = charge.pagBankOrderId;
       order.pagBankPixCopyPaste = charge.copyPaste;
@@ -3389,6 +3440,7 @@ async function startOrderPayment(context, id) {
       appendAuditLog(db, context, "order.pagbank_qr_created", { order, amountCents: snapshot.totalCents, pagBankOrderId: order.pagBankOrderId });
       await persistPaymentOrder(db, order, panel);
     } catch (error) {
+      safePagBankFailure(error, order);
       if (order.stockReservedAt) await releaseOrderStock(getPostgresPool(), order.id).catch(() => null);
       delete order.paymentMethod;
       delete order.paymentState;
@@ -3399,9 +3451,9 @@ async function startOrderPayment(context, id) {
       delete order.pagBankReferenceId;
       delete order.pagBankIdempotencyKey;
       touchOrder(order);
-      appendAuditLog(db, context, "order.pagbank_create_failed", { order, failure: error.message });
+      appendAuditLog(db, context, "order.pagbank_create_failed", { order, httpStatus: error?.pagBank?.status || 0, errorCodes: (error?.pagBank?.errors || []).map(item => item.code) });
       await persistPaymentOrder(db, order, panel);
-      return actionReply(context, { content: `Nao consegui gerar o Pix PagBank: ${error.message}`, ephemeral: true });
+      return actionReply(context, { content: "Nao foi possivel gerar o Pix. Verifique os dados informados e tente novamente.", ephemeral: true });
     }
     const embed = buildPagBankPaymentEmbed(order, panel);
     await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, embeds: [embed], allowedMentions: { users: [order.userId] } });
@@ -3411,6 +3463,14 @@ async function startOrderPayment(context, id) {
   } finally {
     releaseOrderActionLock(order);
   }
+}
+async function handlePagBankCustomerSubmit(interaction) {
+  const [, orderId] = interaction.customId.split(":");
+  return startOrderPayment(interaction, orderId, {
+    name: interaction.fields.getTextInputValue("name"),
+    email: interaction.fields.getTextInputValue("email"),
+    taxId: interaction.fields.getTextInputValue("taxId")
+  });
 }
 function legacyTotalLine(order, panel) {
   const totals = orderTotals(order, panel);
@@ -7293,7 +7353,44 @@ async function sendDiagnosticsCommand(context) {
   if (!isAdmin(context.member)) {
     return actionReply(context, { content: "So ADM pode ver diagnostico do bot.", ephemeral: true });
   }
-  return actionReply(context, { embeds: [await buildDiagnosticsEmbed(context.guild)], ephemeral: true });
+  const embed = await buildDiagnosticsEmbed(context.guild);
+  if (isAuthorizedOwner(actionUser(context)?.id)) {
+    let currentConfig;
+    try {
+      currentConfig = pagBankConfig();
+    } catch {
+      currentConfig = { environment: String(process.env.PAGBANK_ENV || "invalido").trim(), baseUrl: "https://invalid.local", token: "" };
+    }
+    const diagnostic = lastPagBankDiagnostic || {
+      environment: currentConfig.environment,
+      host: new URL(currentConfig.baseUrl).host,
+      tokenPresent: Boolean(currentConfig.token),
+      tokenLength: currentConfig.token.length,
+      endpoint: `${currentConfig.baseUrl}/orders`,
+      status: 0,
+      errors: [],
+      orderId: ""
+    };
+    const errors = diagnostic.errors.map(item => [
+      `Codigo: ${item.code || "n/a"}`,
+      `Parametro: ${item.parameterName || "n/a"}`,
+      `Descricao: ${item.description || "n/a"}`
+    ].join(" | ")).join("\n") || "Nenhuma resposta de erro registrada neste processo.";
+    embed.addFields({
+      name: "Ultima requisicao PagBank (somente owner)",
+      value: [
+        `Ambiente: ${diagnostic.environment}`,
+        `Host: ${diagnostic.host}`,
+        `Token presente: ${diagnostic.tokenPresent ? "sim" : "nao"} (${diagnostic.tokenLength} caracteres)`,
+        `Endpoint: ${diagnostic.endpoint}`,
+        `HTTP: ${diagnostic.status || "n/a"}`,
+        `Pedido: ${diagnostic.orderId || "n/a"}`,
+        errors
+      ].filter(Boolean).join("\n").slice(0, 1024),
+      inline: false
+    });
+  }
+  return actionReply(context, { embeds: [embed], ephemeral: true });
 }
 function automaticSetupCurrent(guildId) {
   const staff = getStaffGuild(guildId);
@@ -8721,7 +8818,7 @@ async function retryAutomaticDelivery(context, id) {
 async function handlePagBankWebhook(req, res) {
   const rawBody = req.body;
   const signature = req.headers["x-authenticity-token"];
-  const token = String(process.env.PAGBANK_TOKEN || "").trim();
+  const token = pagBankConfig().token;
   if (!verifyWebhookSignature(rawBody, signature, token)) {
     console.warn("Webhook PagBank rejeitado: assinatura ausente ou invalida.");
     return res.status(401).json({ ok: false });
@@ -9964,6 +10061,7 @@ async function handleInteraction(interaction) {
       if (act === "tclose") return closeTicket(interaction, id);
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("stockmodal:")) return handleStockModal(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("paycustomer:")) return handlePagBankCustomerSubmit(interaction);
     if (interaction.isModalSubmit() && interaction.customId === "quickcfgmodal") return handleQuickPanelConfigModal(interaction);
     if (interaction.isModalSubmit() && interaction.customId === "pixmodal") return handlePixModal(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("cfgsrvmodal:")) return handleServerConfigModal(interaction);
