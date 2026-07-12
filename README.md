@@ -262,7 +262,7 @@ No site, configure `BOT_PUBLIC_STORE_API_URL` e `BOT_PUBLIC_STORE_API_TOKEN` na 
 
 ## Fluxo do dono da loja
 
-1. Use `/configds` ou `!configds` no canal que vai guardar aquela configuracao.
+1. Use `/configds` no canal que vai guardar aquela configuracao.
 2. Configure titulo, descricao, banner, thumbnail, cor e canal.
 3. Clique em **Adicionar produto** para cadastrar nome, preco, descricao, estoque e foto.
 4. Clique em **Editar produto** para trocar nome, preco, estoque, foto ou brindes.
@@ -277,7 +277,32 @@ No site, configure `BOT_PUBLIC_STORE_API_URL` e `BOT_PUBLIC_STORE_API_TOKEN` na 
 
 Ao enviar imagem por arquivo, o bot salva uma copia da imagem em uma mensagem dele no Discord e grava a URL dessa copia no JSON.
 
-Cada canal tem seu proprio painel. Exemplo: `!configds` no canal 1 nao altera os produtos/config do canal 2.
+Cada canal tem seu proprio painel. Exemplo: `/configds` no canal 1 nao altera os produtos/config do canal 2.
+
+### Cadastro rapido com `/configds2`
+
+Use `/configds2` no canal do painel para abrir um template privado ja preenchido. O formato recomendado e:
+
+```text
+&T XBOX GAMEPASS
+&D Uma conta Microsoft completa com assinatura Game Pass Ultimate ativa.
+&P Gamepass 30d privada | 42,90 | Conta privada | infinito
+&P Gamepass pelo menos 10d | 4,90 | Compartilhada | infinito
+&P Gamepass 1 ano privada | 259,90 | Conta privada | infinito
+&C #34eb67
+```
+
+Cada produto usa `nome | preco | descricao | estoque`. Descricao e estoque podem ser omitidos. O parser tambem aceita o formato curto:
+
+```text
+.XBOX GAMEPASS
+.Descricao do painel
+..Gamepass 30d privada - 42,90
+..Gamepass pelo menos 10d - 4,90 + compartilhada
+,#34eb67
+```
+
+O segundo campo escolhe o comportamento: `substituir` troca a lista atual, `adicionar` inclui novos itens e `mesclar` atualiza produtos com o mesmo nome. Depois de processar, o bot abre o configurador privado normal para revisar imagens, estoque e demais detalhes antes de publicar.
 
 ## Presets
 

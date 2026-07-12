@@ -13,6 +13,9 @@ const commands = [
     .setName("configds")
     .setDescription("Abre o configurador visual da loja."),
   new SlashCommandBuilder()
+    .setName("configds2")
+    .setDescription("Cria ou atualiza um painel rapidamente por template."),
+  new SlashCommandBuilder()
     .setName("configserver")
     .setDescription("Abre as configuracoes gerais do servidor."),
   new SlashCommandBuilder()

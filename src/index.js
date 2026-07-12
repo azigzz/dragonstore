@@ -11,6 +11,7 @@ const { countVerifiedUsers } = require("./verifiedStore");
 const { createOAuthServer, pullVerifiedUsersToBackup } = require("./oauthServer");
 const { createServerBackup, restoreServerBackup, validateServerBackup } = require("./serverBackup");
 const { currentSetupSummary, provisionStoreSetup } = require("./storeSetup");
+const { QUICK_PANEL_TEMPLATE, parseQuickPanelTemplate } = require("./quickPanelTemplate");
 const {
   entersState,
   getVoiceConnection,
@@ -4657,18 +4658,10 @@ async function removeLegacyPublicConfig(panel, guild) {
     await message.delete().catch(() => null);
   }
 }
-async function startConfig(interaction) {
-  if (!isAdmin(interaction.member)) {
-    return interaction.reply({ content: "Você precisa ser ADM para abrir o configurador da loja.", ephemeral: true });
-  }
-
+async function openPrivateConfigSession(interaction, panel, options = {}) {
   const channel = interaction.channel;
   const user = interaction.user;
   const guildId = interaction.guildId;
-  let panel = getPanel(guildId, channel.id);
-  if (shouldAutoRecoverPanel(panel)) {
-    panel = await findRecoverableSalePanel(channel, guildId, channel.id) || panel;
-  }
   const sessionId = sid();
 
   await removeLegacyPublicConfig(panel, interaction.guild);
@@ -4690,16 +4683,140 @@ async function startConfig(interaction) {
   sessions.set(sessionId, session);
 
   try {
-    await interaction.reply({
+    const payload = {
+      content: options.content || undefined,
       embeds: [configEmbed(panel, user.id)],
       components: configRows(sessionId),
       ephemeral: true
-    });
+    };
+    if (interaction.deferred || interaction.replied) await interaction.editReply(stripEphemeral(payload));
+    else await interaction.reply(payload);
     const message = await interaction.fetchReply();
     session.messageId = message.id;
+    return session;
   } catch (error) {
     sessions.delete(sessionId);
     throw error;
+  }
+}
+async function startConfig(interaction) {
+  if (!isAdmin(interaction.member)) {
+    return interaction.reply({ content: "Você precisa ser ADM para abrir o configurador da loja.", ephemeral: true });
+  }
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+
+  const channel = interaction.channel;
+  const guildId = interaction.guildId;
+  let panel = getPanel(guildId, channel.id);
+  if (shouldAutoRecoverPanel(panel)) {
+    panel = await findRecoverableSalePanel(channel, guildId, channel.id) || panel;
+  }
+  return openPrivateConfigSession(interaction, panel);
+}
+function quickPanelConfigModal() {
+  return new ModalBuilder()
+    .setCustomId("quickcfgmodal")
+    .setTitle("Criar painel rapido")
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("template")
+          .setLabel("Template do painel")
+          .setStyle(TextInputStyle.Paragraph)
+          .setMaxLength(4000)
+          .setRequired(true)
+          .setValue(QUICK_PANEL_TEMPLATE.slice(0, 4000))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("mode")
+          .setLabel("Modo: substituir, adicionar ou mesclar")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(20)
+          .setRequired(true)
+          .setValue("substituir")
+      )
+    );
+}
+function quickPanelMode(value) {
+  const mode = plainText(value).replace(/\s+/g, "");
+  if (["substituir", "substitui", "replace", "novo"].includes(mode)) return "replace";
+  if (["adicionar", "adiciona", "add", "somar"].includes(mode)) return "add";
+  if (["mesclar", "mescla", "merge", "atualizar"].includes(mode)) return "merge";
+  throw new Error("Modo invalido. Use substituir, adicionar ou mesclar.");
+}
+function quickPanelProduct(input) {
+  const rawPrice = clampText(input.price, 50, "R$ 0,00");
+  const cents = priceCentsFromValue(rawPrice);
+  const price = Number.isFinite(cents) ? money(cents / 100) : rawPrice;
+  return {
+    id: "p" + random7(),
+    ...normalizeProductInput({
+      name: input.name,
+      price,
+      description: input.description || "Produto da loja",
+      stock: input.stock || "infinito",
+      imageUrl: ""
+    })
+  };
+}
+function applyQuickPanelTemplate(panel, parsed, mode) {
+  const incoming = parsed.products.map(quickPanelProduct);
+  let products;
+
+  if (mode === "replace") {
+    products = incoming;
+  } else if (mode === "add") {
+    if ((panel.products || []).length + incoming.length > 25) {
+      throw new Error("Adicionar ultrapassaria o limite de 25 produtos deste painel.");
+    }
+    products = [...(panel.products || []), ...incoming];
+  } else {
+    products = (panel.products || []).map(item => ({ ...item }));
+    for (const next of incoming) {
+      const existing = products.find(item => plainText(item.name) === plainText(next.name));
+      if (existing) {
+        const preserved = { id: existing.id, imageUrl: existing.imageUrl || "", type: existing.type, rewards: existing.rewards };
+        Object.assign(existing, next, preserved);
+      } else {
+        products.push(next);
+      }
+    }
+    if (products.length > 25) throw new Error("Mesclar ultrapassaria o limite de 25 produtos deste painel.");
+  }
+  panel.title = clampText(parsed.title, 256, "Painel da loja");
+  panel.description = clampText(parsed.description, 4000, "Confira os produtos disponiveis.");
+  if (parsed.color) panel.color = normColor(parsed.color);
+  panel.products = products;
+  return panel;
+}
+async function handleQuickPanelConfigModal(interaction) {
+  if (!isAdmin(interaction.member)) {
+    return interaction.reply({ content: "Somente ADM pode criar painel rapido.", ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const parsed = parseQuickPanelTemplate(interaction.fields.getTextInputValue("template"));
+    const mode = quickPanelMode(interaction.fields.getTextInputValue("mode"));
+    const panel = getPanel(interaction.guildId, interaction.channelId);
+    applyQuickPanelTemplate(panel, parsed, mode);
+    savePanel(interaction.guildId, panel, interaction.channelId);
+    writeAuditLog(interaction, "panel.quick_template_applied", {
+      scopeId: interaction.channelId,
+      panelId: panel.id,
+      mode,
+      productCount: parsed.products.length,
+      totalProducts: panel.products.length
+    });
+    const modeLabel = mode === "replace" ? "substituido" : mode === "add" ? "adicionado" : "mesclado";
+    return openPrivateConfigSession(interaction, panel, {
+      content: `Template processado: **${parsed.products.length}** produto(s), painel ${modeLabel}. Revise abaixo e clique em **Publicar painel**.`
+    });
+  } catch (error) {
+    return actionReply(interaction, {
+      content: `Nao consegui processar o template: **${clampText(error.message, 500, "formato invalido")}**\nUse \`/configds2\` novamente e confira a linha indicada.`,
+      ephemeral: true
+    });
   }
 }
 function catalogPanelSnapshot(panel) {
@@ -6215,6 +6332,7 @@ function commandHelpEmbed(member) {
   ];
   const setupCommands = [
     "`/configds` - abre o configurador privado, visível somente para você; os atalhos com `!` orientam a usar este comando.",
+    "`/configds2` - cria ou atualiza rapidamente o painel deste canal usando um template privado.",
     "`/configserver` ou `!configserver` - configura canais, cargos e call de status do servidor.",
     "`/setup-loja` ou `!setup-loja` - completa o setup sem substituir o que ja existe.",
     "`/backup` ou `!backup` - gera um clone seguro da estrutura, interface e catalogo.",
@@ -8603,6 +8721,15 @@ client.on("messageCreate", async message => {
     return notice;
   }
 
+  if (content === `${config.prefix || "!"}configds2`) {
+    await message.delete().catch(() => null);
+    const sent = await message.author.send("Use `/configds2` no canal onde o painel será publicado. O Discord abrirá o template somente para você.").catch(() => null);
+    if (sent) return sent;
+    const notice = await message.channel.send(`<@${message.author.id}> use \`/configds2\` neste canal para abrir o criador rápido privado.`).catch(() => null);
+    if (notice) setTimeout(() => notice.delete().catch(() => null), 10_000);
+    return notice;
+  }
+
   if (content === `${config.prefix || "!"}configserver`) {
     await message.delete().catch(() => null);
     return showServerConfig(message);
@@ -8762,6 +8889,10 @@ async function handleInteraction(interaction) {
         if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para abrir o configurador da loja.")) return;
         return startConfig(interaction);
       }
+      if (interaction.commandName === "configds2") {
+        if (!await requireAdminInteraction(interaction, "Você precisa ser ADM para criar um painel rápido.")) return;
+        return interaction.showModal(quickPanelConfigModal());
+      }
       if (interaction.commandName === "configserver") return showServerConfig(interaction);
       if (interaction.commandName === "setup-loja") return showAutomaticSetup(interaction);
       if (interaction.commandName === "backup") return createFullServerBackupCommand(interaction);
@@ -8878,6 +9009,7 @@ async function handleInteraction(interaction) {
       if (act === "tcall") return callAdmin(interaction, id, "ticket");
       if (act === "tclose") return closeTicket(interaction, id);
     }
+    if (interaction.isModalSubmit() && interaction.customId === "quickcfgmodal") return handleQuickPanelConfigModal(interaction);
     if (interaction.isModalSubmit() && interaction.customId === "pixmodal") return handlePixModal(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("cfgsrvmodal:")) return handleServerConfigModal(interaction);
     if (interaction.isModalSubmit() && interaction.customId.startsWith("addcarsearch:")) return handleAddCartSearchSubmit(interaction);
