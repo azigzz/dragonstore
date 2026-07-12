@@ -177,9 +177,15 @@ async function pullVerifiedUsersToBackup() {
   return { ...summary, total: users.length, failures };
 }
 
-function createOAuthServer(client, publicStoreHandler) {
+function createOAuthServer(client, publicStoreHandler, pagBankWebhookHandler = null) {
   const app = express();
   app.disable("x-powered-by");
+
+  if (pagBankWebhookHandler) {
+    app.post("/webhooks/pagbank", express.raw({ type: "application/json", limit: "256kb" }), (req, res, next) => {
+      Promise.resolve(pagBankWebhookHandler(req, res)).catch(next);
+    });
+  }
 
   app.use((req, res, next) => {
     if (["/api/public-store", "/api/public-orders", "/api/public-analytics"].includes(req.path) || req.method === "OPTIONS") {

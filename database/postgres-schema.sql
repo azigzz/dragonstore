@@ -46,6 +46,7 @@ create table if not exists products (
   type text not null default 'product',
   image_url text not null default '',
   rewards jsonb not null default '[]'::jsonb,
+  stock_mode text not null default 'MANUAL' check (stock_mode in ('MANUAL', 'AUTOMATIC')),
   active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -79,6 +80,13 @@ create table if not exists orders (
   delivered_at timestamptz,
   closed_at timestamptz,
   cancelled_at timestamptz,
+  payment_method text,
+  payment_state text,
+  total_cents_snapshot integer,
+  pagbank_order_id text,
+  pagbank_reference_id text,
+  pagbank_charge_id text,
+  payment_expires_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -93,6 +101,15 @@ alter table if exists orders add column if not exists delivered_by_admin_name te
 alter table if exists orders add column if not exists delivery_message text;
 alter table if exists orders add column if not exists delivered_at timestamptz;
 alter table if exists products add column if not exists stock_quantity integer;
+alter table if exists products add column if not exists stock_mode text not null default 'MANUAL';
+alter table if exists orders add column if not exists payment_method text;
+alter table if exists orders add column if not exists payment_state text;
+alter table if exists orders add column if not exists total_cents_snapshot integer;
+alter table if exists orders add column if not exists pagbank_order_id text;
+alter table if exists orders add column if not exists pagbank_reference_id text;
+alter table if exists orders add column if not exists pagbank_charge_id text;
+alter table if exists orders add column if not exists payment_expires_at timestamptz;
+create index if not exists idx_orders_pagbank_reference on orders(pagbank_reference_id) where pagbank_reference_id is not null;
 
 create table if not exists order_items (
   id bigserial primary key,
@@ -116,6 +133,8 @@ create table if not exists staff (
   user_id text not null,
   display_name text not null default '',
   pix_key_encrypted text,
+  pix_key_type text not null default '',
+  pix_city text not null default '',
   qr_code_url text not null default '',
   note text not null default '',
   online boolean not null default false,
@@ -123,6 +142,9 @@ create table if not exists staff (
   updated_at timestamptz not null default now(),
   primary key (guild_id, user_id)
 );
+
+alter table if exists staff add column if not exists pix_key_type text not null default '';
+alter table if exists staff add column if not exists pix_city text not null default '';
 
 create table if not exists payments (
   id bigserial primary key,
@@ -164,14 +186,43 @@ create table if not exists stock_items (
   id bigserial primary key,
   product_id text not null references products(id) on delete cascade,
   guild_id text not null references guilds(id) on delete cascade,
-  payload_encrypted text,
-  status text not null default 'available'
-    check (status in ('available', 'reserved', 'delivered', 'void')),
-  order_id text references orders(id) on delete set null,
+  encrypted_value text,
+  encryption_iv text,
+  encryption_auth_tag text,
+  value_fingerprint text,
+  status text not null default 'AVAILABLE'
+    check (status in ('AVAILABLE', 'RESERVED', 'SOLD', 'DISABLED')),
+  reserved_by_order_id text references orders(id) on delete set null,
+  sold_by_order_id text references orders(id) on delete set null,
+  sold_to_discord_user_id text,
+  created_by_user_id text,
   reserved_at timestamptz,
-  delivered_at timestamptz,
-  created_at timestamptz not null default now()
+  sold_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
+
+alter table if exists stock_items add column if not exists encrypted_value text;
+alter table if exists stock_items add column if not exists encryption_iv text;
+alter table if exists stock_items add column if not exists encryption_auth_tag text;
+alter table if exists stock_items add column if not exists value_fingerprint text;
+alter table if exists stock_items add column if not exists reserved_by_order_id text;
+alter table if exists stock_items add column if not exists sold_by_order_id text;
+alter table if exists stock_items add column if not exists sold_to_discord_user_id text;
+alter table if exists stock_items add column if not exists created_by_user_id text;
+alter table if exists stock_items add column if not exists sold_at timestamptz;
+alter table if exists stock_items add column if not exists updated_at timestamptz not null default now();
+alter table if exists stock_items drop constraint if exists stock_items_status_check;
+update stock_items set status = case status
+  when 'available' then 'AVAILABLE'
+  when 'reserved' then 'RESERVED'
+  when 'delivered' then 'SOLD'
+  when 'void' then 'DISABLED'
+  else status end;
+update stock_items set status = 'DISABLED' where encrypted_value is null;
+alter table if exists stock_items add constraint stock_items_status_check check (status in ('AVAILABLE', 'RESERVED', 'SOLD', 'DISABLED'));
+create unique index if not exists uq_stock_items_product_fingerprint on stock_items(product_id, value_fingerprint) where value_fingerprint is not null;
+create index if not exists idx_stock_items_available on stock_items(guild_id, product_id, status, id);
 
 create table if not exists audit_logs (
   id bigserial primary key,

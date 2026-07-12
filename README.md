@@ -329,12 +329,45 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 ## Fluxo de atendimento
 
 1. Um ADM usa `/setup-atendimento` no canal da equipe.
-2. Cada ADM usa `!configpix`, `/configpix` ou o botao **Configurar meu Pix**.
-3. O ADM salva nome de exibicao, chave Pix, QR Code opcional e mensagem extra.
+2. Um usuario listado em `BOT_OWNER_IDS` usa `!configpix`, `/configpix` ou **Configurar meu Pix**.
+3. O proprietario salva recebedor, chave, tipo, cidade, QR Code opcional e mensagem extra.
 4. O ADM clica em **Ficar ON** quando puder receber vendas.
 5. Se houver um unico ADM ON, o bot assume a compra automaticamente para ele.
 6. Se houver dois ou mais ADMs ON, o primeiro que clicar em **Assumir compra** fica responsavel.
-7. Depois de assumida, o bot libera **Reenviar Pix**.
+7. O cliente ou ADM usa **Gerar pagamento**. O Pix sempre aparece no ticket privado; a DM e apenas uma copia adicional.
+
+## Pagamentos Pix
+
+O total e recalculado usando os produtos salvos no servidor e congelado no momento em que **Gerar pagamento** e usado. IDs, precos ou metodo enviados pelo cliente nao sao aceitos como fonte do valor.
+
+- De `R$ 0,01` a `R$ 0,99`: Pix manual existente. O comprovante fica em analise ate um usuario de `BOT_OWNER_IDS` aprovar ou recusar.
+- A partir de `R$ 1,00`: QR Code Pix da API Order do PagBank, com validade de 15 minutos.
+- A criacao do QR Code nao marca pagamento. Somente `POST /webhooks/pagbank`, com assinatura valida e cobranca `PAID` via `PIX`, confirma o pedido.
+- Pagamentos e reservas expirados sao recuperados por varredura persistente; o fluxo nao depende apenas de `setTimeout`.
+
+No Render, configure `PAGBANK_TOKEN`, `PAGBANK_ENV`, `PAGBANK_WEBHOOK_URL`, `BOT_OWNER_IDS`, `DATABASE_URL` e `STOCK_ENCRYPTION_KEY`. Em sandbox, use `PAGBANK_ENV=sandbox`; em producao, use `production`.
+
+## Estoque secreto
+
+1. Abra `/configds` ou crie o painel por `/configds2`.
+2. Clique em **Estoque secreto** e escolha o produto.
+3. Use **Adicionar itens** ou **Substituir disponiveis**. Cada linha nao vazia e uma unidade; virgulas e espacos internos nao dividem a key.
+4. Confira a quantidade e ative **Estoque automatico**.
+5. Produtos antigos e novos continuam `MANUAL` ate essa ativacao explicita.
+
+O estoque automatico exige Postgres e `STOCK_ENCRYPTION_KEY`. Cada item e criptografado individualmente com AES-256-GCM e possui fingerprint HMAC para bloquear duplicatas. Reservas usam transacao com `FOR UPDATE SKIP LOCKED`; duas compras simultaneas nao recebem a mesma unidade. Keys nunca entram no JSON/KV, catalogo publico, URL ou `custom_id`.
+
+Gere a chave uma unica vez e mantenha o mesmo valor em todos os deploys da mesma loja:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+Para mais de um proprietario:
+
+```env
+BOT_OWNER_IDS=123456789012345678,987654321098765432
+```
 
 ## Vendas concluidas e ranking
 
