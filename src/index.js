@@ -3,6 +3,7 @@ require("dotenv").config();
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const QRCode = require("qrcode");
 const { Pool } = require("pg");
 const { buildPostgresPoolOptions, postgresTargetSummary } = require("./postgresConfig");
 const oauthConfig = require("./config");
@@ -2073,10 +2074,11 @@ async function resendPix(interaction, id) {
 
   const panel = getOrderPanel(order, actionGuildId(interaction));
   if (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX && order.pagBankPixCopyPaste) {
+    const paymentPayload = await buildPagBankPaymentPayload(order, panel);
     appendAuditLog(db, interaction, "order.pix_resent", { order, paymentMethod: PAYMENT_METHOD.PAGBANK_PIX });
     writeOrders(db);
-    await interaction.channel.send({ content: `<@${order.userId}> Pix PagBank reenviado no carrinho.`, embeds: [buildPagBankPaymentEmbed(order, panel)], allowedMentions: { users: [order.userId] } });
-    await sendSafeDM(order.userId, { embeds: [buildPagBankPaymentEmbed(order, panel)] });
+    await interaction.channel.send({ content: `<@${order.userId}> Pix PagBank reenviado no carrinho.`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
+    await sendSafeDM(order.userId, paymentPayload);
     return actionReply(interaction, { content: "Pix PagBank reenviado no carrinho.", ephemeral: true });
   }
 
@@ -3293,6 +3295,21 @@ function buildPagBankPaymentEmbed(order, panel) {
   if (validUrl(order.pagBankQrCodeImageUrl)) embed.setImage(order.pagBankQrCodeImageUrl);
   return embed;
 }
+async function buildPagBankPaymentPayload(order, panel) {
+  const embed = buildPagBankPaymentEmbed(order, panel);
+  try {
+    const attachment = await QRCode.toBuffer(String(order.pagBankPixCopyPaste || ""), {
+      type: "png",
+      width: 512,
+      margin: 2,
+      errorCorrectionLevel: "M"
+    });
+    embed.setImage("attachment://pagbank-pix.png");
+    return { embeds: [embed], files: [{ attachment, name: "pagbank-pix.png" }] };
+  } catch {
+    return { embeds: [embed] };
+  }
+}
 function pagBankCustomerModal(orderId) {
   return new ModalBuilder()
     .setCustomId(`paycustomer:${orderId}`)
@@ -3350,7 +3367,8 @@ async function startOrderPayment(context, id, customerInput = null) {
   }
   if (context.isRepliable?.() && !context.deferred && !context.replied) await context.deferReply({ ephemeral: true });
   if (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX && order.pagBankPixCopyPaste) {
-    await context.channel.send({ content: `<@${order.userId}> cobrança Pix do pedido #${order.id}:`, embeds: [buildPagBankPaymentEmbed(order, panel)], allowedMentions: { users: [order.userId] } });
+    const paymentPayload = await buildPagBankPaymentPayload(order, panel);
+    await context.channel.send({ content: `<@${order.userId}> cobrança Pix do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
     return actionReply(context, { content: "Cobranca PagBank reenviada no carrinho.", ephemeral: true });
   }
   if (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX && order.paymentState === PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT && order.pagBankReferenceId && order.pagBankIdempotencyKey) {
@@ -3371,8 +3389,8 @@ async function startOrderPayment(context, id, customerInput = null) {
       touchOrder(order);
       appendAuditLog(db, context, "order.pagbank_qr_recovered", { order, pagBankOrderId: order.pagBankOrderId });
       await persistPaymentOrder(db, order, panel);
-      const embed = buildPagBankPaymentEmbed(order, panel);
-      await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, embeds: [embed], allowedMentions: { users: [order.userId] } });
+      const paymentPayload = await buildPagBankPaymentPayload(order, panel);
+      await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
       return actionReply(context, { content: "Cobranca PagBank recuperada com a mesma chave de idempotencia.", ephemeral: true });
     } catch (error) {
       safePagBankFailure(error, order);
@@ -3455,9 +3473,9 @@ async function startOrderPayment(context, id, customerInput = null) {
       await persistPaymentOrder(db, order, panel);
       return actionReply(context, { content: "Nao foi possivel gerar o Pix. Verifique os dados informados e tente novamente.", ephemeral: true });
     }
-    const embed = buildPagBankPaymentEmbed(order, panel);
-    await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, embeds: [embed], allowedMentions: { users: [order.userId] } });
-    await sendSafeDM(order.userId, { embeds: [embed] });
+    const paymentPayload = await buildPagBankPaymentPayload(order, panel);
+    await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
+    await sendSafeDM(order.userId, paymentPayload);
     await refreshCartMessage(context.guild, order, panel, context.channel);
     return actionReply(context, { content: "Pix PagBank gerado e enviado no carrinho.", ephemeral: true });
   } finally {
