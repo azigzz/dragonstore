@@ -93,7 +93,16 @@ function pagBankErrorDetails(status, payload) {
 function pagBankReady(env = process.env) {
   try {
     const config = pagBankConfig(env);
-    return Boolean(config.token && /^https:\/\//i.test(config.webhookUrl));
+    return Boolean(config.token && validPagBankWebhookUrl(config.webhookUrl));
+  } catch {
+    return false;
+  }
+}
+
+function validPagBankWebhookUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    return url.protocol === "https:" && !url.username && !url.password && url.pathname === "/webhooks/pagbank";
   } catch {
     return false;
   }
@@ -198,7 +207,7 @@ function qrCodeData(payload) {
 async function createPixOrder(input, options = {}) {
   const config = pagBankConfig(options.env || process.env);
   if (!config.token) throw new Error("PAGBANK_TOKEN nao configurado.");
-  if (!/^https:\/\//i.test(config.webhookUrl)) throw new Error("PAGBANK_WEBHOOK_URL invalida.");
+  if (!validPagBankWebhookUrl(config.webhookUrl)) throw new Error("PAGBANK_WEBHOOK_URL vazia ou invalida; use uma URL HTTPS terminada em /webhooks/pagbank.");
   if (!Number.isSafeInteger(input.amountCents) || input.amountCents < 100) {
     throw new Error("O PagBank aceita neste bot apenas pedidos de pelo menos 100 centavos.");
   }
@@ -216,6 +225,7 @@ async function createPixOrder(input, options = {}) {
     }],
     notification_urls: [config.webhookUrl]
   };
+  console.log("[PagBank] notification_urls incluida: sim");
 
   const idempotencyKey = input.idempotencyKey || crypto.randomUUID();
   const endpoint = `${config.baseUrl}/orders`;
@@ -256,6 +266,25 @@ async function createPixOrder(input, options = {}) {
   return { ...qr, expiresAt: qr.expiresAt || expiresAt };
 }
 
+async function getPagBankOrder(orderId, options = {}) {
+  const config = pagBankConfig(options.env || process.env);
+  const id = String(orderId || "").trim();
+  if (!/^ORDE_[A-Z0-9-]{10,80}$/i.test(id)) throw new Error("ID de pedido PagBank invalido.");
+  if (!config.token) throw new Error("PAGBANK_TOKEN nao configurado.");
+  const response = await (options.fetchImpl || fetch)(`${config.baseUrl}/orders/${encodeURIComponent(id)}`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${config.token}`,
+      Accept: "application/json"
+    },
+    signal: AbortSignal.timeout(Number(options.timeoutMs) || 15_000)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw safePagBankError(response.status, payload, [config.token]);
+  if (String(payload?.id || "") !== id) throw new Error("PagBank respondeu com outro ID de pedido.");
+  return payload;
+}
+
 function verifyWebhookSignature(rawBody, signature, token) {
   if (!Buffer.isBuffer(rawBody) || !rawBody.length || !signature || !token) return false;
   const expected = crypto.createHash("sha256").update(Buffer.concat([
@@ -291,6 +320,7 @@ module.exports = {
   PAGBANK_BASE_URLS,
   buildHomologationReport,
   createPixOrder,
+  getPagBankOrder,
   normalizeCustomer,
   pagBankConfig,
   pagBankErrorDetails,
@@ -301,5 +331,6 @@ module.exports = {
   validatePaidPixNotification,
   validCnpj,
   validCpf,
+  validPagBankWebhookUrl,
   verifyWebhookSignature
 };

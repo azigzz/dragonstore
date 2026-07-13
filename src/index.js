@@ -15,7 +15,7 @@ const { currentSetupSummary, provisionStoreSetup } = require("./storeSetup");
 const { QUICK_PANEL_TEMPLATE, parseQuickPanelTemplate } = require("./quickPanelTemplate");
 const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("./paymentPolicy");
 const { canApproveManualPayment, isAuthorizedOwner, parseOwnerIds } = require("./securityPolicy");
-const { createPixOrder, normalizeCustomer, pagBankConfig, pagBankReady, paidPixCharge, validatePaidPixNotification, verifyWebhookSignature } = require("./pagBank");
+const { createPixOrder, getPagBankOrder, normalizeCustomer, pagBankConfig, pagBankReady, paidPixCharge, validatePaidPixNotification, verifyWebhookSignature } = require("./pagBank");
 const {
   STOCK_MODE,
   STOCK_STATUS,
@@ -7049,6 +7049,7 @@ function commandHelpEmbed(member) {
     "`/setup-atendimento` ou `!atendimento` - cria/atualiza o painel ON/OFF dos ADMs.",
     "`/configpix` ou `!configpix` - BOT_OWNER_IDS configura o Pix manual da loja.",
     "`/togglepagbank` ou `!togglepagbank` - alterna entre PagBank automatico e Pix manual antigo.",
+    "`/reconciliarpagbank order_id` - consulta e processa um pagamento PagBank confirmado.",
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
     "`/setup-ticket` - envia o painel de ticket.",
     "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
@@ -8852,78 +8853,143 @@ async function retryAutomaticDelivery(context, id) {
   const result = await deliverAutomaticOrderStock(order, panel, db, "manual_retry");
   return actionReply(context, { content: result.delivered ? "A mesma reserva foi reenviada com sucesso." : "A entrega continua pendente; nenhuma nova key foi consumida.", ephemeral: true });
 }
-async function handlePagBankWebhook(req, res) {
-  const rawBody = req.body;
-  const signature = req.headers["x-authenticity-token"];
-  const token = pagBankConfig().token;
-  if (!verifyWebhookSignature(rawBody, signature, token)) {
-    console.warn("Webhook PagBank rejeitado: assinatura ausente ou invalida.");
-    return res.status(401).json({ ok: false });
-  }
-  let payload;
-  try {
-    payload = JSON.parse(rawBody.toString("utf8"));
-  } catch {
-    return res.status(400).json({ ok: false });
-  }
+function validStoredPaymentSnapshot(order) {
+  if (!order.paymentSnapshot?.hash) return false;
+  const hash = crypto.createHash("sha256").update(JSON.stringify({
+    items: order.paymentSnapshot.items,
+    grossCents: order.paymentSnapshot.grossCents,
+    discountCents: order.paymentSnapshot.discountCents,
+    totalCents: order.paymentSnapshot.totalCents
+  })).digest("hex");
+  return hash === order.paymentSnapshot.hash;
+}
+async function processPaidPagBankOrder(payload, source = "pagbank_webhook") {
   const charge = paidPixCharge(payload);
-  if (!charge) return res.status(200).json({ ok: true, ignored: true });
+  if (!charge) return { ok: false, reason: "not_paid", orderFound: false };
   const referenceId = String(payload.reference_id || charge.reference_id || "");
+  const pagBankOrderId = String(payload.id || "");
   const db = readOrders();
-  const order = Object.values(db.orders || {}).find(item => item.pagBankReferenceId === referenceId);
+  const order = Object.values(db.orders || {}).find(item =>
+    item.pagBankOrderId === pagBankOrderId || (referenceId && item.pagBankReferenceId === referenceId)
+  );
   if (!order || order.paymentMethod !== PAYMENT_METHOD.PAGBANK_PIX) {
-    console.warn("Webhook PagBank ignorado: referencia nao corresponde a pedido automatico.");
-    return res.status(200).json({ ok: true, ignored: true });
+    console.warn(`PagBank ${source}: pedido interno nao encontrado para ${pagBankOrderId || "ID ausente"}.`);
+    return { ok: false, reason: "order_not_found", orderFound: false };
   }
   const validation = validatePaidPixNotification(order, payload);
-  const amountCents = validation.amountCents;
-  if (!validation.ok ||
-      !order.paymentSnapshot?.hash || order.paymentSnapshot.hash !== crypto.createHash("sha256").update(JSON.stringify({
-        items: order.paymentSnapshot.items,
-        grossCents: order.paymentSnapshot.grossCents,
-        discountCents: order.paymentSnapshot.discountCents,
-        totalCents: order.paymentSnapshot.totalCents
-      })).digest("hex")) {
-    console.warn(`Webhook PagBank rejeitado para pedido ${order.id}: validacao de referencia ou valor falhou.`);
-    return res.status(409).json({ ok: false });
+  if (!validation.ok || !validStoredPaymentSnapshot(order)) {
+    console.warn(`PagBank ${source}: validacao de referencia, valor ou snapshot falhou no pedido ${order.id}.`);
+    return { ok: false, reason: "validation_failed", orderFound: true, internalOrderId: order.id };
   }
-  if ([PAYMENT_STATE.PAID, PAYMENT_STATE.DELIVERING, PAYMENT_STATE.DELIVERED, PAYMENT_STATE.PAID_DELIVERY_PENDING].includes(order.paymentState)) {
-    return res.status(200).json({ ok: true, duplicate: true });
+  if (order.paymentState === PAYMENT_STATE.DELIVERED || order.automaticStockDeliveredAt) {
+    return { ok: true, duplicate: true, orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
   }
-  if (![PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED, PAYMENT_STATE.CANCELED].includes(order.paymentState)) return res.status(409).json({ ok: false });
-  if (!claimOrderActionLock(order)) return res.status(202).json({ ok: true, processing: true });
+  if (order.paymentState === PAYMENT_STATE.DELIVERING) {
+    return { ok: true, processing: true, orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
+  }
+  const alreadyPaid = [PAYMENT_STATE.PAID, PAYMENT_STATE.PAID_DELIVERY_PENDING].includes(order.paymentState);
+  if (alreadyPaid && Number(order.paymentSnapshot?.automaticUnits) <= 0) {
+    return { ok: true, duplicate: true, orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
+  }
+  if (!alreadyPaid && ![PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED, PAYMENT_STATE.CANCELED].includes(order.paymentState)) {
+    return { ok: false, reason: "invalid_state", orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
+  }
+  if (!claimOrderActionLock(order)) return { ok: true, processing: true, orderFound: true, internalOrderId: order.id };
   try {
-    if (postgresEnabled()) {
+    if (!alreadyPaid && postgresEnabled()) {
       const locked = await withPostgresTransaction(async dbClient => {
         const result = await dbClient.query(`
           update orders set payment_state = 'PAID', pagbank_charge_id = $2, updated_at = now()
           where id = $1 and payment_method = 'PAGBANK_PIX' and payment_state in ('AWAITING_PAGBANK_PAYMENT', 'EXPIRED', 'CANCELED')
             and total_cents_snapshot = $3 and pagbank_reference_id = $4 and user_id = $5
           returning id
-        `, [order.id, validation.chargeId || null, amountCents, referenceId, order.userId]);
+        `, [order.id, validation.chargeId || null, validation.amountCents, validation.referenceId, order.userId]);
         return result.rowCount === 1;
       });
-      if (!locked) return res.status(200).json({ ok: true, duplicate: true });
+      if (!locked) return { ok: true, duplicate: true, orderFound: true, internalOrderId: order.id };
     }
-    order.paymentState = PAYMENT_STATE.PAID;
-    order.paymentStatus = "marked_paid";
-    order.paidAt = String(charge.paid_at || new Date().toISOString());
-    order.paidAmount = amountCents / 100;
-    order.pagBankChargeId = validation.chargeId;
-    touchOrder(order);
-    appendAuditLog(db, { guildId: order.guildId, channelId: order.channelId, user: { id: "pagbank", username: "PagBank" } }, "order.pagbank_paid", { order, amountCents });
+    if (!alreadyPaid) {
+      order.paymentState = PAYMENT_STATE.PAID;
+      order.paymentStatus = "marked_paid";
+      order.paidAt = String(charge.paid_at || new Date().toISOString());
+      order.paidAmount = validation.amountCents / 100;
+      order.pagBankChargeId = validation.chargeId;
+      touchOrder(order);
+      appendAuditLog(db, { guildId: order.guildId, channelId: order.channelId, user: { id: "pagbank", username: "PagBank" } }, "order.pagbank_paid", { order, amountCents: validation.amountCents, source });
+      await persistPaymentOrder(db, order, getOrderPanel(order, order.guildId));
+    }
     const panel = getOrderPanel(order, order.guildId);
-    await persistPaymentOrder(db, order, panel);
-    await deliverAutomaticOrderStock(order, panel, db, "pagbank_webhook");
-    const guild = client.guilds.cache.get(order.guildId);
+    const delivery = await deliverAutomaticOrderStock(order, panel, db, source);
+    const guild = client.guilds.cache.get(order.guildId) || await client.guilds.fetch(order.guildId).catch(() => null);
     const channel = guild ? await guild.channels.fetch(order.channelId).catch(() => null) : null;
     if (channel?.isTextBased()) {
       await channel.send({ content: `<@${order.userId}> pagamento Pix confirmado pelo PagBank.`, allowedMentions: { users: [order.userId] } }).catch(() => null);
       await refreshCartMessage(guild, order, panel, channel);
     }
-    return res.status(200).json({ ok: true });
+    return { ok: true, orderFound: true, internalOrderId: order.id, paymentState: order.paymentState, delivery };
   } finally {
     releaseOrderActionLock(order);
+  }
+}
+async function handlePagBankWebhook(req, res) {
+  console.log("[PagBank webhook] recebido", {
+    method: req.method,
+    path: req.originalUrl,
+    contentType: req.headers["content-type"] || null,
+    hasAuthenticityToken: Boolean(req.headers["x-authenticity-token"]),
+    bodyIsBuffer: Buffer.isBuffer(req.body),
+    bodyLength: Buffer.isBuffer(req.body) ? req.body.length : 0
+  });
+  const rawBody = req.body;
+  let payload;
+  try {
+    if (!Buffer.isBuffer(rawBody)) throw new Error("body_not_buffer");
+    payload = JSON.parse(rawBody.toString("utf8"));
+  } catch {
+    return res.status(400).json({ ok: false });
+  }
+  const config = pagBankConfig();
+  const signature = req.headers["x-authenticity-token"];
+  const signatureValid = verifyWebhookSignature(rawBody, signature, config.token);
+  if (!signatureValid) {
+    if (config.environment !== "sandbox" || signature) {
+      console.warn("Webhook PagBank rejeitado: assinatura ausente ou invalida.");
+      return res.status(401).json({ ok: false });
+    }
+    const orderId = String(payload?.id || req.headers["x-product-id"] || "");
+    if (!/^ORDE_/i.test(orderId)) return res.status(401).json({ ok: false });
+    try {
+      payload = await getPagBankOrder(orderId);
+      console.log(`[PagBank webhook] Sandbox sem assinatura confirmado via GET /orders/${orderId}.`);
+    } catch (error) {
+      console.warn(`Webhook PagBank Sandbox nao confirmado via API: ${error.message}`);
+      return res.status(401).json({ ok: false });
+    }
+  }
+  const result = await processPaidPagBankOrder(payload, signatureValid ? "pagbank_webhook" : "pagbank_sandbox_fallback");
+  if (result.processing) return res.status(202).json({ ok: true, processing: true });
+  if (result.ok) return res.status(200).json({ ok: true, duplicate: Boolean(result.duplicate) });
+  if (["not_paid", "order_not_found"].includes(result.reason)) return res.status(200).json({ ok: true, ignored: true });
+  return res.status(409).json({ ok: false });
+}
+async function reconcilePagBankCommand(context, orderId) {
+  if (!await requireBotOwner(context, "Somente BOT_OWNER_IDS pode reconciliar pagamentos PagBank.")) return;
+  if (context.isRepliable?.() && !context.deferred && !context.replied) await context.deferReply({ ephemeral: true });
+  const id = String(orderId || "").trim();
+  if (!/^ORDE_[A-Z0-9-]{10,80}$/i.test(id)) return actionReply(context, { content: "Informe um order_id valido no formato ORDE_...", ephemeral: true });
+  try {
+    const payload = await getPagBankOrder(id);
+    const result = await processPaidPagBankOrder(payload, "pagbank_admin_reconciliation");
+    if (result.reason === "not_paid") return actionReply(context, { content: `O pedido ${id} existe, mas ainda nao possui cobranca PIX com status PAID.`, ephemeral: true });
+    if (result.reason === "order_not_found") return actionReply(context, { content: `O PagBank confirmou ${id}, mas nenhum pedido interno correspondente foi encontrado.`, ephemeral: true });
+    if (!result.ok) return actionReply(context, { content: `Reconciliação recusada por seguranca: ${result.reason || "validacao_falhou"}.`, ephemeral: true });
+    if (result.processing) return actionReply(context, { content: `O pedido interno #${result.internalOrderId} ja esta sendo processado.`, ephemeral: true });
+    if (result.duplicate) return actionReply(context, { content: `Pedido interno #${result.internalOrderId} ja estava confirmado; nenhuma entrega duplicada foi feita.`, ephemeral: true });
+    const delivered = Number(result.delivery?.count) || 0;
+    return actionReply(context, { content: `Pedido interno #${result.internalOrderId} reconciliado com sucesso.${delivered ? ` ${delivered} item(ns) automatico(s) processado(s).` : ""}`, ephemeral: true });
+  } catch (error) {
+    safePagBankFailure(error, { id: "reconciliation" });
+    return actionReply(context, { content: `Nao foi possivel consultar o pedido PagBank: ${error.message}`, ephemeral: true });
   }
 }
 async function markOrderPaid(context, id) {
@@ -9940,6 +10006,10 @@ client.on("messageCreate", async message => {
     await message.delete().catch(() => null);
     return sendDiagnosticsCommand(message);
   }
+  if (content.startsWith(`${config.prefix || "!"}reconciliarpagbank `)) {
+    await message.delete().catch(() => null);
+    return reconcilePagBankCommand(message, rawContent.split(/\s+/)[1]);
+  }
   if (content === `${config.prefix || "!"}pedidos`) {
     await message.delete().catch(() => null);
     return showOpenOrders(message);
@@ -10042,6 +10112,7 @@ async function handleInteraction(interaction) {
       }
       if (interaction.commandName === "pedidos") return showOpenOrders(interaction);
       if (interaction.commandName === "diagnostico") return sendDiagnosticsCommand(interaction);
+      if (interaction.commandName === "reconciliarpagbank") return reconcilePagBankCommand(interaction, interaction.options.getString("order_id"));
       if (interaction.commandName === "pago") {
         const order = findOrderInChannel(readOrders(), interaction, false);
         if (!order) return actionReply(interaction, { content: "Nao encontrei carrinho neste canal.", ephemeral: true });

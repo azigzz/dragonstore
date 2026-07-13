@@ -170,6 +170,17 @@ const commands = [
     .setName("diagnostico")
     .setDescription("Mostra saude do bot, KV, Pix, paineis e carrinhos."),
   new SlashCommandBuilder()
+    .setName("reconciliarpagbank")
+    .setDescription("Consulta e processa um pedido PagBank pago.")
+    .addStringOption(option =>
+      option
+        .setName("order_id")
+        .setDescription("ID PagBank no formato ORDE_...")
+        .setMinLength(15)
+        .setMaxLength(90)
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
     .setName("pago")
     .setDescription("Marca o pagamento manual do carrinho atual."),
   new SlashCommandBuilder()

@@ -187,6 +187,8 @@ function createOAuthServer(client, publicStoreHandler, pagBankWebhookHandler = n
     });
   }
 
+  app.use(express.json({ limit: "256kb" }));
+
   app.use((req, res, next) => {
     if (["/api/public-store", "/api/public-orders", "/api/public-analytics"].includes(req.path) || req.method === "OPTIONS") {
       return Promise.resolve(publicStoreHandler(req, res)).catch(next);

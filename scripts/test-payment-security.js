@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("../src/paymentPolicy");
-const { buildHomologationReport, createPixOrder, normalizeCustomer, pagBankConfig, pagBankErrorDetails, paidPixCharge, qrCodeData, validatePaidPixNotification, validCnpj, validCpf, verifyWebhookSignature } = require("../src/pagBank");
+const { buildHomologationReport, createPixOrder, getPagBankOrder, normalizeCustomer, pagBankConfig, pagBankErrorDetails, paidPixCharge, qrCodeData, validatePaidPixNotification, validCnpj, validCpf, validPagBankWebhookUrl, verifyWebhookSignature } = require("../src/pagBank");
 const { canApproveManualPayment, isAuthorizedOwner } = require("../src/securityPolicy");
 
 (async () => {
@@ -64,6 +64,10 @@ assert.throws(() => normalizeCustomer({ ...customer, email: "invalido" }), /e-ma
 assert.throws(() => normalizeCustomer({ ...customer, taxId: "" }), /CPF ou CNPJ/i);
 assert.throws(() => normalizeCustomer({ ...customer, taxId: "123.456.789-00" }), /CPF ou CNPJ/i);
 assert.equal(pagBankConfig({ PAGBANK_ENV: "sandbox", PAGBANK_TOKEN: " Bearer secret-token ", PAGBANK_WEBHOOK_URL: "https://example.com/hook" }).token, "secret-token");
+assert.equal(validPagBankWebhookUrl(" https://savio-store.onrender.com/webhooks/pagbank "), true);
+assert.equal(validPagBankWebhookUrl(""), false);
+assert.equal(validPagBankWebhookUrl("http://example.com/webhooks/pagbank"), false);
+assert.equal(validPagBankWebhookUrl("https://example.com/outro"), false);
 
 let discountedBody;
 await createPixOrder({
@@ -103,6 +107,19 @@ await assert.rejects(() => createPixOrder({ referenceId: "bad", amountCents: 100
 assert.equal(rejectedRequest.message.includes("52998224725"), false);
 assert.equal(rejectedRequest.message.includes("never-log-this-token"), false);
 assert.equal(rejectedRequest.pagBank.errors[0].parameterName, "customer.tax_id");
+
+let getRequest;
+const consultedOrder = await getPagBankOrder("ORDE_60E0D309-083D-4A2F-B907-C0F59073805F", {
+  env: { PAGBANK_TOKEN: "sandbox-token", PAGBANK_ENV: "sandbox", PAGBANK_WEBHOOK_URL: "https://example.com/webhooks/pagbank" },
+  fetchImpl: async (url, options) => {
+    getRequest = { url, options };
+    return { ok: true, status: 200, json: async () => ({ id: "ORDE_60E0D309-083D-4A2F-B907-C0F59073805F", reference_id: "ref-7563831", charges: [{ status: "PAID", amount: { value: 100 }, payment_method: { type: "PIX" } }] }) };
+  }
+});
+assert.equal(getRequest.options.method, "GET");
+assert.equal(getRequest.options.headers.Authorization, "Bearer sandbox-token");
+assert.equal(consultedOrder.charges[0].status, "PAID");
+await assert.rejects(() => getPagBankOrder("invalid", { env: { PAGBANK_TOKEN: "x", PAGBANK_ENV: "sandbox" } }), /ID de pedido/i);
 
 const homologationReport = buildHomologationReport({
   at: "2030-01-01T00:00:00.000Z",
