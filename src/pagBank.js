@@ -1,4 +1,6 @@
 const crypto = require("node:crypto");
+const fs = require("node:fs/promises");
+const path = require("node:path");
 
 const PAGBANK_BASE_URLS = Object.freeze({
   sandbox: "https://sandbox.api.pagseguro.com",
@@ -110,6 +112,69 @@ function redactPagBankDetails(details, sensitiveValues = []) {
   };
 }
 
+function sanitizedHomologationResponse(payload, sensitiveValues = []) {
+  const details = redactPagBankDetails(pagBankErrorDetails(0, payload), sensitiveValues);
+  return {
+    id: String(payload?.id || ""),
+    reference_id: String(payload?.reference_id || ""),
+    created_at: String(payload?.created_at || ""),
+    qr_codes: (Array.isArray(payload?.qr_codes) ? payload.qr_codes : []).map(qr => ({
+      expiration_date: String(qr?.expiration_date || ""),
+      links: (Array.isArray(qr?.links) ? qr.links : []).map(link => ({
+        rel: String(link?.rel || ""),
+        media: String(link?.media || ""),
+        type: String(link?.type || "")
+      }))
+    })),
+    error_messages: details.errors.filter(item => item.code || item.description !== "Requisicao recusada").map(item => ({
+      code: item.code,
+      description: item.description,
+      parameter_name: item.parameterName
+    }))
+  };
+}
+
+function buildHomologationReport({ at, endpoint, requestBody, status, responseBody, sensitiveValues = [] }) {
+  const sanitizedRequest = {
+    reference_id: String(requestBody?.reference_id || ""),
+    customer: { name: "[NOME REMOVIDO]", email: "[EMAIL REMOVIDO]", tax_id: "[DOCUMENTO REMOVIDO]" },
+    items: (Array.isArray(requestBody?.items) ? requestBody.items : []).map(item => ({
+      reference_id: String(item?.reference_id || ""),
+      name: "Produto digital",
+      quantity: Number(item?.quantity) || 0,
+      unit_amount: Number(item?.unit_amount) || 0
+    })),
+    qr_codes: (Array.isArray(requestBody?.qr_codes) ? requestBody.qr_codes : []).map(qr => ({
+      amount: { value: Number(qr?.amount?.value) || 0 },
+      expiration_date: String(qr?.expiration_date || "")
+    })),
+    notification_urls: (Array.isArray(requestBody?.notification_urls) ? requestBody.notification_urls : []).map(() => "[WEBHOOK REMOVIDO]")
+  };
+  const sanitizedResponse = sanitizedHomologationResponse(responseBody, sensitiveValues);
+  return [
+    "PAGBANK - EVIDENCIA DE HOMOLOGACAO",
+    `Data e hora: ${at}`,
+    "Metodo HTTP: POST",
+    `Endpoint: ${endpoint}`,
+    "Headers:",
+    JSON.stringify({ Authorization: "Bearer [TOKEN REMOVIDO]", Accept: "application/json", "Content-Type": "application/json", "x-idempotency-key": "[IDEMPOTENCY REMOVIDA]" }, null, 2),
+    "Request JSON:",
+    JSON.stringify(sanitizedRequest, null, 2),
+    `Status HTTP recebido: ${status}`,
+    "Response JSON:",
+    JSON.stringify(sanitizedResponse, null, 2),
+    "=".repeat(72),
+    ""
+  ].join("\n");
+}
+
+async function exportHomologationEvidence(input, options = {}) {
+  const report = buildHomologationReport(input);
+  const outputPath = path.resolve(options.path || process.env.PAGBANK_HOMOLOGATION_PATH || "pagbank-homologacao.txt");
+  await fs.appendFile(outputPath, report, { encoding: "utf8", mode: 0o600 });
+  return outputPath;
+}
+
 function safePagBankError(status, payload, sensitiveValues = []) {
   const details = redactPagBankDetails(pagBankErrorDetails(status, payload), sensitiveValues);
   const code = details.errors[0]?.code || "";
@@ -153,17 +218,19 @@ async function createPixOrder(input, options = {}) {
   };
 
   const idempotencyKey = input.idempotencyKey || crypto.randomUUID();
+  const endpoint = `${config.baseUrl}/orders`;
+  const headers = {
+    Authorization: `Bearer ${config.token}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    "x-idempotency-key": idempotencyKey
+  };
   let response;
   let payload;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    response = await (options.fetchImpl || fetch)(`${config.baseUrl}/orders`, {
+    response = await (options.fetchImpl || fetch)(endpoint, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.token}`,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "x-idempotency-key": idempotencyKey
-      },
+      headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(Number(options.timeoutMs) || 15_000)
     });
@@ -171,6 +238,17 @@ async function createPixOrder(input, options = {}) {
     if (response.status !== 429 || attempt === 2) break;
     const retryAfter = Math.min(5000, Math.max(250, Number(response.headers?.get?.("retry-after") || payload?.retry_after || 1) * 1000));
     await new Promise(resolve => setTimeout(resolve, retryAfter));
+  }
+  const exportEnabled = options.exportHomologation === true || String((options.env || process.env).PAGBANK_HOMOLOGATION_EXPORT || "").trim().toLowerCase() === "true";
+  if (config.environment === "sandbox" && exportEnabled) {
+    await exportHomologationEvidence({
+      at: new Date().toISOString(),
+      endpoint,
+      requestBody: body,
+      status: response.status,
+      responseBody: payload,
+      sensitiveValues: [config.token, customer.name, customer.email, customer.tax_id, qrCodeData(payload).copyPaste]
+    }, { path: options.homologationPath }).catch(() => null);
   }
   if (!response.ok) throw safePagBankError(response.status, payload, [config.token, customer.name, customer.email, customer.tax_id]);
   const qr = qrCodeData(payload);
@@ -211,6 +289,7 @@ function validatePaidPixNotification(order, payload) {
 
 module.exports = {
   PAGBANK_BASE_URLS,
+  buildHomologationReport,
   createPixOrder,
   normalizeCustomer,
   pagBankConfig,

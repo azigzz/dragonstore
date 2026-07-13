@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("../src/paymentPolicy");
-const { createPixOrder, normalizeCustomer, pagBankConfig, pagBankErrorDetails, paidPixCharge, qrCodeData, validatePaidPixNotification, validCnpj, validCpf, verifyWebhookSignature } = require("../src/pagBank");
+const { buildHomologationReport, createPixOrder, normalizeCustomer, pagBankConfig, pagBankErrorDetails, paidPixCharge, qrCodeData, validatePaidPixNotification, validCnpj, validCpf, verifyWebhookSignature } = require("../src/pagBank");
 const { canApproveManualPayment, isAuthorizedOwner } = require("../src/securityPolicy");
 
 (async () => {
@@ -103,6 +103,26 @@ await assert.rejects(() => createPixOrder({ referenceId: "bad", amountCents: 100
 assert.equal(rejectedRequest.message.includes("52998224725"), false);
 assert.equal(rejectedRequest.message.includes("never-log-this-token"), false);
 assert.equal(rejectedRequest.pagBank.errors[0].parameterName, "customer.tax_id");
+
+const homologationReport = buildHomologationReport({
+  at: "2030-01-01T00:00:00.000Z",
+  endpoint: "https://sandbox.api.pagseguro.com/orders",
+  requestBody,
+  status: 201,
+  responseBody: {
+    id: "ORDE_SAFE",
+    reference_id: "order-1",
+    customer: requestBody.customer,
+    qr_codes: [{ text: "PIX-SECRET", expiration_date: "2030-01-01T00:15:00Z", links: [{ rel: "QRCODE.PNG", media: "image/png", type: "GET", href: "https://secret.example/qr" }] }]
+  },
+  sensitiveValues: ["fake-token", "Maria da Silva", "maria@example.com", "52998224725", "PIX-SECRET"]
+});
+for (const secret of ["fake-token", "Maria da Silva", "maria@example.com", "52998224725", "PIX-SECRET", "https://secret.example/qr"]) {
+  assert.equal(homologationReport.includes(secret), false, `evidencia nao pode conter ${secret}`);
+}
+assert.match(homologationReport, /Bearer \[TOKEN REMOVIDO\]/);
+assert.match(homologationReport, /ORDE_SAFE/);
+assert.match(homologationReport, /QRCODE.PNG/);
 
 const raw = Buffer.from('{"status":"PAID"}', "utf8");
 const token = "fake-token";

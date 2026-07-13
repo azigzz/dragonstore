@@ -8,3 +8,4 @@ site/.next/
 site/dev-server.log
 site/*.tsbuildinfo
 site/data/*.runtime.json
+pagbank-homologacao.txt

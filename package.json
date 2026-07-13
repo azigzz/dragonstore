@@ -12,6 +12,7 @@
     "test:quick-panel": "node scripts/test-quick-panel-template.js",
     "test:payment-security": "node scripts/test-payment-security.js",
     "test:stock-security": "node scripts/test-stock-security.js",
+    "pagbank:homologacao": "node scripts/generate-pagbank-homologation.js",
     "deploy": "node deploy-commands.js",
     "db:init": "node scripts/init-postgres.js",
     "db:migrate-json": "node scripts/migrate-json-to-postgres.js",
