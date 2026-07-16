@@ -191,7 +191,10 @@ const commands = [
     .addStringOption(option => option.setName("payment_id").setDescription("ID numerico do pagamento.").setRequired(true).setMinLength(5).setMaxLength(30)),
   new SlashCommandBuilder()
     .setName("pago")
-    .setDescription("Marca o pagamento manual do carrinho atual."),
+    .setDescription("Aprova Pix manual ou consulta o provedor do carrinho atual."),
+  new SlashCommandBuilder()
+    .setName("verificarpagamento")
+    .setDescription("Consulta o status oficial do Pix automatico deste carrinho."),
   new SlashCommandBuilder()
     .setName("entregar")
     .setDescription("Entrega manualmente o produto no carrinho atual."),

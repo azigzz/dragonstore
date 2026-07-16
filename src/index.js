@@ -146,6 +146,12 @@ const SERVER_RESTORE_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SERVER_BACKUP_BYTES = 8 * 1024 * 1024;
 const CONFIG_SESSION_TTL_MS = 14 * 60 * 1000;
 const EPHEMERAL_CLEANUP_INTERVAL_MS = 60 * 1000;
+const MERCADOPAGO_RECONCILE_INTERVAL_MS = Math.max(10, Math.min(300, Number(process.env.MERCADOPAGO_RECONCILE_INTERVAL_SECONDS) || 20)) * 1000;
+const MERCADOPAGO_RECONCILE_BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.MERCADOPAGO_RECONCILE_BATCH_SIZE) || 15));
+const MERCADOPAGO_SETTLEMENT_GRACE_MS = Math.max(1, Math.min(60, Number(process.env.MERCADOPAGO_SETTLEMENT_GRACE_MINUTES) || 5)) * 60 * 1000;
+const MERCADOPAGO_ERROR_GRACE_MS = Math.max(5, Math.min(180, Number(process.env.MERCADOPAGO_ERROR_GRACE_MINUTES) || 30)) * 60 * 1000;
+const mercadoPagoLastChecks = new Map();
+const mercadoPagoLastErrorLogs = new Map();
 
 function sweepExpiredEntries(map, now = Date.now()) {
   let removed = 0;
@@ -189,7 +195,18 @@ async function sweepExpiredPayments() {
     for (const order of Object.values(db.orders || {})) {
       if (order.status !== ORDER_STATUS.OPEN || ![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW, PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT].includes(order.paymentState)) continue;
       const expiresAt = Date.parse(order.paymentExpiresAt || "");
-      if (!Number.isFinite(expiresAt) || expiresAt > now || !claimOrderActionLock(order)) continue;
+      if (!Number.isFinite(expiresAt) || expiresAt > now) continue;
+      if (order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX && order.mercadoPagoPaymentId) {
+        try {
+          const result = await reconcileMercadoPagoOrder(order, "mercadopago_expiry_check");
+          if (result.ok || result.processing) continue;
+          if (now < expiresAt + MERCADOPAGO_SETTLEMENT_GRACE_MS) continue;
+        } catch (error) {
+          logMercadoPagoReconcileError(order, error, "expiracao");
+          if (now < expiresAt + MERCADOPAGO_ERROR_GRACE_MS) continue;
+        }
+      }
+      if (!claimOrderActionLock(order)) continue;
       try {
         if (order.stockReservedAt && postgresEnabled()) await releaseOrderStock(getPostgresPool(), order.id);
         order.paymentState = PAYMENT_STATE.EXPIRED;
@@ -215,6 +232,53 @@ async function sweepExpiredPayments() {
 }
 const paymentExpiryTimer = setInterval(() => sweepExpiredPayments().catch(error => console.error("Falha ao expirar pagamentos:", errorSummary(error))), 60_000);
 paymentExpiryTimer.unref?.();
+let mercadoPagoReconcileSweepRunning = false;
+function logMercadoPagoReconcileError(order, error, source) {
+  const key = String(order?.id || "unknown");
+  const now = Date.now();
+  if (now - Number(mercadoPagoLastErrorLogs.get(key) || 0) < 5 * 60 * 1000) return;
+  mercadoPagoLastErrorLogs.set(key, now);
+  console.warn(`Mercado Pago ${source}: consulta do pedido #${key} falhou: ${errorSummary(error).message}`);
+}
+async function sweepPendingMercadoPagoPayments() {
+  if (mercadoPagoReconcileSweepRunning || !client.isReady() || !mercadoPagoReady()) return;
+  mercadoPagoReconcileSweepRunning = true;
+  try {
+    const now = Date.now();
+    const pending = Object.values(readOrders().orders || {})
+      .filter(order => order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX && order.mercadoPagoPaymentId)
+      .filter(order => [PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED, PAYMENT_STATE.CANCELED, PAYMENT_STATE.DELIVERING].includes(order.paymentState) ||
+        (order.paymentState === PAYMENT_STATE.PAID && Number(order.paymentSnapshot?.automaticUnits) > 0 && !order.automaticStockDeliveredAt));
+    const activeIds = new Set(pending.map(order => String(order.id)));
+    for (const key of mercadoPagoLastChecks.keys()) if (!activeIds.has(key)) mercadoPagoLastChecks.delete(key);
+    for (const key of mercadoPagoLastErrorLogs.keys()) if (!activeIds.has(key)) mercadoPagoLastErrorLogs.delete(key);
+    const candidates = pending
+      .filter(order => {
+        const lastCheck = Number(mercadoPagoLastChecks.get(String(order.id)) || 0);
+        const expiresAt = Date.parse(order.paymentExpiresAt || "");
+        const withinRecoveryWindow = !Number.isFinite(expiresAt) || now <= expiresAt + 24 * 60 * 60 * 1000;
+        return withinRecoveryWindow && now - lastCheck >= MERCADOPAGO_RECONCILE_INTERVAL_MS;
+      })
+      .sort((a, b) => Number(mercadoPagoLastChecks.get(String(a.id)) || 0) - Number(mercadoPagoLastChecks.get(String(b.id)) || 0))
+      .slice(0, MERCADOPAGO_RECONCILE_BATCH_SIZE);
+
+    for (const order of candidates) {
+      mercadoPagoLastChecks.set(String(order.id), Date.now());
+      try {
+        const result = await reconcileMercadoPagoOrder(order, "mercadopago_poll");
+        if (result.ok && !result.duplicate && !result.processing) {
+          console.log(`Mercado Pago: pedido #${order.id} confirmado automaticamente por reconciliacao.`);
+        }
+      } catch (error) {
+        logMercadoPagoReconcileError(order, error, "reconciliacao automatica");
+      }
+    }
+  } finally {
+    mercadoPagoReconcileSweepRunning = false;
+  }
+}
+const mercadoPagoReconcileTimer = setInterval(() => sweepPendingMercadoPagoPayments().catch(error => console.error("Falha na reconciliacao Mercado Pago:", errorSummary(error))), MERCADOPAGO_RECONCILE_INTERVAL_MS);
+mercadoPagoReconcileTimer.unref?.();
 
 function cloneJson(data) {
   return JSON.parse(JSON.stringify(data));
@@ -1189,7 +1253,9 @@ function orderStatusLabel(status) {
   return value;
 }
 function paymentStatusLabel(order) {
-  if (order?.paymentState === PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT) return "Aguardando Pix PagBank";
+  if (order?.paymentState === PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT) {
+    return order?.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX ? "Aguardando Pix Mercado Pago" : "Aguardando Pix PagBank";
+  }
   if (order?.paymentState === PAYMENT_STATE.AWAITING_MANUAL_PAYMENT) return "Aguardando Pix manual";
   if (order?.paymentState === PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW) return "Comprovante em analise";
   if (order?.paymentState === PAYMENT_STATE.MANUAL_PAYMENT_REJECTED) return "Pagamento recusado";
@@ -3374,7 +3440,7 @@ async function startOrderPayment(context, id, customerInput = null) {
   const needsPagBankCustomer = (automaticMethods.includes(order.paymentMethod) && !hasAutomaticPix) ||
     (!paymentStarted(order) && automaticMethods.includes(storePaymentMethod(order.guildId, serverOrderSnapshot(order).totalCents)));
   if (needsPagBankCustomer) {
-    if (actor.id !== order.userId) return actionReply(context, { content: "O cliente precisa clicar em Gerar pagamento e informar os dados exigidos pelo PagBank.", ephemeral: true });
+    if (actor.id !== order.userId) return actionReply(context, { content: "O cliente precisa clicar em Gerar pagamento e informar os dados exigidos pelo provedor Pix.", ephemeral: true });
     if (!customerInput) {
       if (typeof context.showModal === "function") return context.showModal(pagBankCustomerModal(order.id));
       return actionReply(context, { content: "Clique no botao Gerar pagamento do carrinho para preencher seus dados em privado.", ephemeral: true });
@@ -3389,7 +3455,8 @@ async function startOrderPayment(context, id, customerInput = null) {
   if (automaticMethods.includes(order.paymentMethod) && hasAutomaticPix) {
     const paymentPayload = await buildPagBankPaymentPayload(order, panel);
     await context.channel.send({ content: `<@${order.userId}> cobrança Pix do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
-    return actionReply(context, { content: "Cobranca PagBank reenviada no carrinho.", ephemeral: true });
+    const provider = order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX ? "Mercado Pago" : "PagBank";
+    return actionReply(context, { content: `Cobranca ${provider} reenviada no carrinho.`, ephemeral: true });
   }
   if (order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX && order.paymentState === PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT && order.mercadoPagoReferenceId && order.mercadoPagoIdempotencyKey) {
     if (!claimOrderActionLock(order)) return actionReply(context, { content: "A cobranca ja esta sendo recuperada.", ephemeral: true });
@@ -3429,7 +3496,7 @@ async function startOrderPayment(context, id, customerInput = null) {
       await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
       return actionReply(context, { content: "Cobranca PagBank recuperada com a mesma chave de idempotencia.", ephemeral: true });
     } catch (error) {
-      if (method === PAYMENT_METHOD.PAGBANK_PIX) safePagBankFailure(error, order);
+      safePagBankFailure(error, order);
       return actionReply(context, { content: "Nao foi possivel gerar o Pix. Verifique os dados informados e tente novamente.", ephemeral: true });
     } finally {
       releaseOrderActionLock(order);
@@ -3511,10 +3578,11 @@ async function startOrderPayment(context, id, customerInput = null) {
       }
       order.paymentExpiresAt = charge.expiresAt || order.paymentExpiresAt;
       touchOrder(order);
-      appendAuditLog(db, context, "order.pagbank_qr_created", { order, amountCents: snapshot.totalCents, pagBankOrderId: order.pagBankOrderId });
+      appendAuditLog(db, context, method === PAYMENT_METHOD.MERCADOPAGO_PIX ? "order.mercadopago_qr_created" : "order.pagbank_qr_created", { order, amountCents: snapshot.totalCents, providerPaymentId: order.mercadoPagoPaymentId || order.pagBankOrderId });
       await persistPaymentOrder(db, order, panel);
     } catch (error) {
-      safePagBankFailure(error, order);
+      if (method === PAYMENT_METHOD.PAGBANK_PIX) safePagBankFailure(error, order);
+      else console.warn(`Mercado Pago: falha ao criar cobranca do pedido #${order.id}: ${errorSummary(error).message}`);
       if (order.stockReservedAt) await releaseOrderStock(getPostgresPool(), order.id).catch(() => null);
       delete order.paymentMethod;
       delete order.paymentState;
@@ -3535,7 +3603,7 @@ async function startOrderPayment(context, id, customerInput = null) {
     await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
     await sendSafeDM(order.userId, paymentPayload);
     await refreshCartMessage(context.guild, order, panel, context.channel);
-    return actionReply(context, { content: "Pix PagBank gerado e enviado no carrinho.", ephemeral: true });
+    return actionReply(context, { content: `Pix ${method === PAYMENT_METHOD.MERCADOPAGO_PIX ? "Mercado Pago" : "PagBank"} gerado e enviado no carrinho.`, ephemeral: true });
   } finally {
     releaseOrderActionLock(order);
   }
@@ -6986,6 +7054,8 @@ function cartActionRows(orderOrId) {
   const frozen = paymentStarted(order);
   const proofAllowed = order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState);
   const manualApprovalAllowed = order.paymentFlowVersion < 2 || (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState));
+  const automaticPayment = [PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod);
+  const automaticVerificationAllowed = automaticPayment && Boolean(order.pagBankOrderId || order.mercadoPagoPaymentId);
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`addproduct:${orderId}`).setLabel("Adicionar produto").setEmoji("➕").setStyle(ButtonStyle.Primary).setDisabled(finished || frozen),
@@ -6997,7 +7067,7 @@ function cartActionRows(orderOrId) {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`assume:${orderId}`).setLabel("Assumir").setEmoji("🙋").setStyle(ButtonStyle.Secondary).setDisabled(finished || Boolean(order.assignedAdminId)),
       new ButtonBuilder().setCustomId(`sendpix:${orderId}`).setLabel("Reenviar Pix").setEmoji("💸").setStyle(ButtonStyle.Secondary).setDisabled(finished || (!order.assignedAdminId && ![PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod))),
-      new ButtonBuilder().setCustomId(`paid:${orderId}`).setLabel("Aprovar pagamento").setEmoji("💵").setStyle(ButtonStyle.Secondary).setDisabled(finished || paid || !manualApprovalAllowed),
+      new ButtonBuilder().setCustomId(`paid:${orderId}`).setLabel(automaticPayment ? "Verificar pagamento" : "Aprovar pagamento").setEmoji("💵").setStyle(ButtonStyle.Secondary).setDisabled(finished || paid || (!manualApprovalAllowed && !automaticVerificationAllowed)),
       new ButtonBuilder().setCustomId(`deliver:${orderId}`).setLabel("Entregar").setEmoji("📦").setStyle(ButtonStyle.Primary).setDisabled(finished || Boolean(order.deliveredAt)),
       new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(finished)
     ),
@@ -7102,6 +7172,7 @@ function commandHelpEmbed(member) {
     "`/configpix` ou `!configpix` - BOT_OWNER_IDS configura o Pix manual da loja.",
     "`/togglepagbank` ou `!togglepagbank` - alterna entre PagBank automatico e Pix manual antigo.",
     "`/reconciliarpagbank order_id` - consulta e processa um pagamento PagBank confirmado.",
+    "`/reconciliarmercadopago payment_id` - consulta e processa um Pix Mercado Pago confirmado.",
     "`/salvarpix` ou `!salvarpix` - salva backup do Pix e painel de atendimento.",
     "`/setup-ticket` - envia o painel de ticket.",
     "`/setupsucess` ou `!setupsucess` - define feed de vendas concluidas e cargo cliente.",
@@ -7116,7 +7187,7 @@ function commandHelpEmbed(member) {
   const salesCommands = [
     "`/addcar` - alias administrativo do `/addproduto`.",
     "`!pix` ou `!assumir` - assume o carrinho atual e envia o Pix do ADM.",
-    "`/pago`, `!pago` ou `!marcarpago` - marca o pagamento manual do carrinho atual.",
+    "`/pago`, `/verificarpagamento` ou `!pago` - aprova Pix manual ou consulta o provedor automatico.",
     "`/entregar` ou `!entregar key/link/mensagem` - salva a entrega manual e envia para o cliente.",
     "`!concluircompra` ou `!concluir` - conclui o carrinho atual.",
     "`!cancelarcompra` ou `!cancelar` - cancela e apaga o carrinho atual.",
@@ -9052,27 +9123,60 @@ async function reconcilePagBankCommand(context, orderId) {
     return actionReply(context, { content: `Nao foi possivel consultar o pedido PagBank: ${error.message}`, ephemeral: true });
   }
 }
+async function reconcileMercadoPagoOrder(order, source = "mercadopago_reconciliation") {
+  const paymentId = String(order?.mercadoPagoPaymentId || "").trim();
+  if (!paymentId) return { ok: false, reason: "payment_id_missing", internalOrderId: order?.id };
+  const payment = await getMercadoPagoPayment(paymentId);
+  const providerStatus = String(payment?.status || "unknown").toLowerCase();
+  if (providerStatus !== "approved") {
+    return { ok: false, reason: "not_approved", providerStatus, internalOrderId: order.id };
+  }
+  return processApprovedMercadoPagoPayment(payment, source);
+}
 async function processApprovedMercadoPagoPayment(payload, source = "mercadopago_webhook") {
   const db = readOrders();
   const order = Object.values(db.orders || {}).find(item => String(item.mercadoPagoPaymentId || "") === String(payload?.id || ""));
   if (!order || order.paymentMethod !== PAYMENT_METHOD.MERCADOPAGO_PIX) return { ok: false, reason: "order_not_found" };
   const validation = validateApprovedMercadoPagoPayment(order, payload);
   if (!validation.ok || !validStoredPaymentSnapshot(order)) return { ok: false, reason: "validation_failed", internalOrderId: order.id };
-  if ([PAYMENT_STATE.PAID, PAYMENT_STATE.DELIVERING, PAYMENT_STATE.DELIVERED, PAYMENT_STATE.PAID_DELIVERY_PENDING].includes(order.paymentState)) return { ok: true, duplicate: true, internalOrderId: order.id };
+  const automaticUnits = Number(order.paymentSnapshot?.automaticUnits) || 0;
+  if (order.paymentState === PAYMENT_STATE.DELIVERED || order.automaticStockDeliveredAt) {
+    return { ok: true, duplicate: true, internalOrderId: order.id };
+  }
+  if (order.paymentState === PAYMENT_STATE.PAID_DELIVERY_PENDING) {
+    return { ok: true, duplicate: true, deliveryPending: true, internalOrderId: order.id };
+  }
+  if (order.paymentState === PAYMENT_STATE.DELIVERING) {
+    const attemptedAt = Date.parse(order.deliveryAttemptedAt || "");
+    if (Number.isFinite(attemptedAt) && Date.now() - attemptedAt < 2 * 60 * 1000) {
+      return { ok: true, processing: true, internalOrderId: order.id };
+    }
+    order.paymentState = PAYMENT_STATE.PAID_DELIVERY_PENDING;
+    touchOrder(order);
+    await persistPaymentOrder(db, order, getOrderPanel(order, order.guildId));
+    return { ok: true, duplicate: true, deliveryPending: true, internalOrderId: order.id };
+  }
+  const alreadyPaid = order.paymentState === PAYMENT_STATE.PAID;
+  if (alreadyPaid && automaticUnits <= 0) return { ok: true, duplicate: true, internalOrderId: order.id };
+  if (!alreadyPaid && ![PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED, PAYMENT_STATE.CANCELED].includes(order.paymentState)) {
+    return { ok: false, reason: "invalid_state", internalOrderId: order.id, paymentState: order.paymentState };
+  }
   if (!claimOrderActionLock(order)) return { ok: true, processing: true, internalOrderId: order.id };
   try {
-    order.paymentState = PAYMENT_STATE.PAID;
-    order.paymentStatus = "marked_paid";
-    order.paidAt = String(payload.date_approved || new Date().toISOString());
-    order.paidAmount = validation.amountCents / 100;
-    touchOrder(order);
-    appendAuditLog(db, { guildId: order.guildId, channelId: order.channelId, user: { id: "mercadopago", username: "Mercado Pago" } }, "order.mercadopago_paid", { order, amountCents: validation.amountCents, source });
     const panel = getOrderPanel(order, order.guildId);
-    await persistPaymentOrder(db, order, panel);
+    if (!alreadyPaid) {
+      order.paymentState = PAYMENT_STATE.PAID;
+      order.paymentStatus = "marked_paid";
+      order.paidAt = String(payload.date_approved || new Date().toISOString());
+      order.paidAmount = validation.amountCents / 100;
+      touchOrder(order);
+      appendAuditLog(db, { guildId: order.guildId, channelId: order.channelId, user: { id: "mercadopago", username: "Mercado Pago" } }, "order.mercadopago_paid", { order, amountCents: validation.amountCents, source });
+      await persistPaymentOrder(db, order, panel);
+    }
     const delivery = await deliverAutomaticOrderStock(order, panel, db, source);
     const guild = client.guilds.cache.get(order.guildId) || await client.guilds.fetch(order.guildId).catch(() => null);
     const channel = guild ? await guild.channels.fetch(order.channelId).catch(() => null) : null;
-    if (channel?.isTextBased()) {
+    if (!alreadyPaid && channel?.isTextBased()) {
       await channel.send({ content: `<@${order.userId}> pagamento Pix confirmado pelo Mercado Pago.`, allowedMentions: { users: [order.userId] } }).catch(() => null);
       await refreshCartMessage(guild, order, panel, channel);
     }
@@ -9080,14 +9184,21 @@ async function processApprovedMercadoPagoPayment(payload, source = "mercadopago_
   } finally { releaseOrderActionLock(order); }
 }
 async function handleMercadoPagoWebhook(req, res) {
-  console.log("[Mercado Pago webhook] recebido", { method: req.method, path: req.originalUrl, hasSignature: Boolean(req.headers["x-signature"]), bodyIsBuffer: Buffer.isBuffer(req.body) });
+  console.log("[Mercado Pago webhook] recebido", { method: req.method, path: req.path, contentType: req.headers["content-type"] || null, hasSignature: Boolean(req.headers["x-signature"]), bodyIsBuffer: Buffer.isBuffer(req.body) });
   let body;
   try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "{}"); } catch { return res.status(400).json({ ok: false }); }
-  const paymentId = String(body?.data?.id || req.query?.["data.id"] || req.query?.id || "");
+  const queryPaymentId = String(req.query?.["data.id"] || req.query?.id || "").trim();
+  const bodyPaymentId = String(body?.data?.id || "").trim();
+  if (queryPaymentId && bodyPaymentId && queryPaymentId !== bodyPaymentId) return res.status(400).json({ ok: false });
+  const paymentId = queryPaymentId || bodyPaymentId;
+  if (!/^\d{5,30}$/.test(paymentId)) return res.status(400).json({ ok: false });
   const known = Object.values(readOrders().orders || {}).some(order => String(order.mercadoPagoPaymentId || "") === paymentId);
   if (!known) return res.status(200).json({ ok: true, ignored: true });
   const config = mercadoPagoConfig();
-  if (config.webhookSecret && !verifyMercadoPagoSignature({ xSignature: req.headers["x-signature"], xRequestId: req.headers["x-request-id"], dataId: paymentId, secret: config.webhookSecret })) return res.status(401).json({ ok: false });
+  if (config.webhookSecret && !verifyMercadoPagoSignature({ xSignature: req.headers["x-signature"], xRequestId: req.headers["x-request-id"], dataId: queryPaymentId || paymentId, secret: config.webhookSecret })) {
+    console.warn("Mercado Pago webhook recusado: assinatura invalida ou ausente.");
+    return res.status(401).json({ ok: false });
+  }
   try {
     const payment = await getMercadoPagoPayment(paymentId);
     const result = await processApprovedMercadoPagoPayment(payment);
@@ -9110,14 +9221,48 @@ async function reconcileMercadoPagoCommand(context, paymentId) {
     return actionReply(context, { content: result.duplicate ? `Pedido #${result.internalOrderId} ja estava confirmado; nenhuma entrega foi duplicada.` : `Pedido #${result.internalOrderId} reconciliado com sucesso.`, ephemeral: true });
   } catch (error) { return actionReply(context, { content: `Falha ao consultar Mercado Pago: ${error.message}`, ephemeral: true }); }
 }
+async function verifyAutomaticPayment(context, order) {
+  const actor = actionUser(context);
+  if (actor.id !== order.userId && !isAdmin(context.member) && !isBotOwner(actor)) {
+    return actionReply(context, { content: "Somente o cliente ou um ADM pode verificar este pagamento.", ephemeral: true });
+  }
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
+  }
+  try {
+    let result;
+    if (order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX) {
+      if (!order.mercadoPagoPaymentId) return actionReply(context, { content: "A cobranca Mercado Pago ainda nao possui um ID para consulta.", ephemeral: true });
+      result = await reconcileMercadoPagoOrder(order, "mercadopago_user_check");
+      if (result.reason === "not_approved") {
+        const label = result.providerStatus === "pending" ? "ainda aguardando o Pix" : `com status ${result.providerStatus}`;
+        return actionReply(context, { content: `O Mercado Pago respondeu que o pagamento esta ${label}. Se voce acabou de pagar, aguarde alguns segundos e tente novamente.`, ephemeral: true });
+      }
+    } else if (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX) {
+      if (!order.pagBankOrderId) return actionReply(context, { content: "A cobranca PagBank ainda nao possui um ID para consulta.", ephemeral: true });
+      const payload = await getPagBankOrder(order.pagBankOrderId);
+      result = await processPaidPagBankOrder(payload, "pagbank_user_check");
+      if (result.reason === "not_paid") {
+        return actionReply(context, { content: "O PagBank ainda nao confirmou o Pix. Se voce acabou de pagar, aguarde alguns segundos e tente novamente.", ephemeral: true });
+      }
+    } else {
+      return actionReply(context, { content: "Este carrinho nao usa pagamento automatico.", ephemeral: true });
+    }
+
+    if (result.processing) return actionReply(context, { content: "O pagamento foi localizado e ja esta sendo processado.", ephemeral: true });
+    if (!result.ok) return actionReply(context, { content: "O provedor respondeu, mas os dados do pagamento nao conferem com este pedido. Um proprietario precisa verificar o caso.", ephemeral: true });
+    if (result.deliveryPending) return actionReply(context, { content: "Pagamento confirmado. A entrega automatica ficou pendente e um ADM deve usar Reenviar entrega.", ephemeral: true });
+    if (result.duplicate) return actionReply(context, { content: `O pagamento do pedido #${result.internalOrderId || order.id} ja estava confirmado.`, ephemeral: true });
+    const delivered = Number(result.delivery?.count) || 0;
+    return actionReply(context, { content: `Pagamento do pedido #${result.internalOrderId || order.id} confirmado oficialmente.${delivered ? ` ${delivered} item(ns) automatico(s) processado(s).` : ""}`, ephemeral: true });
+  } catch (error) {
+    return actionReply(context, { content: `Nao foi possivel consultar o provedor agora: ${error.message}`, ephemeral: true });
+  }
+}
 async function markOrderPaid(context, id) {
   if (context.isRepliable?.() && !context.deferred && !context.replied) {
     await context.deferReply({ ephemeral: true }).catch(() => null);
   }
-  if (!isAdmin(context.member) && !isBotOwner(actionUser(context))) {
-    return actionReply(context, { content: "So ADM pode marcar pagamento.", ephemeral: true });
-  }
-
   const guildId = actionGuildId(context);
   const db = readOrders();
   const order = orderForAction(db, id, context, false);
@@ -9130,11 +9275,14 @@ async function markOrderPaid(context, id) {
   if (order.status !== ORDER_STATUS.OPEN) {
     return actionReply(context, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
   }
+  if ([PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod)) {
+    return verifyAutomaticPayment(context, order);
+  }
+  if (!isAdmin(context.member) && !isBotOwner(actionUser(context))) {
+    return actionReply(context, { content: "So ADM pode marcar pagamento manual.", ephemeral: true });
+  }
   if (order.paymentFlowVersion >= 2 && !order.paymentMethod) {
     return actionReply(context, { content: "Gere o pagamento antes de aprovar.", ephemeral: true });
-  }
-  if ([PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod)) {
-    return actionReply(context, { content: "Pagamentos PagBank so podem ser aprovados por webhook valido.", ephemeral: true });
   }
   if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && !await requireBotOwner(context)) return;
   if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && !canApproveManualPayment(actionUser(context).id, order.userId, process.env.BOT_OWNER_IDS)) {
@@ -10020,7 +10168,7 @@ client.on("messageCreate", async message => {
     return finishCurrentCartCommand(message);
   }
 
-  if ([`${config.prefix || "!"}pago`, `${config.prefix || "!"}marcarpago`, `${config.prefix || "!"}pagamento`].includes(content)) {
+  if ([`${config.prefix || "!"}pago`, `${config.prefix || "!"}marcarpago`, `${config.prefix || "!"}pagamento`, `${config.prefix || "!"}verificarpagamento`, `${config.prefix || "!"}verificarpix`].includes(content)) {
     return markPaidCurrentCartCommand(message);
   }
 
@@ -10237,7 +10385,7 @@ async function handleInteraction(interaction) {
       if (interaction.commandName === "diagnostico") return sendDiagnosticsCommand(interaction);
       if (interaction.commandName === "reconciliarpagbank") return reconcilePagBankCommand(interaction, interaction.options.getString("order_id"));
       if (interaction.commandName === "reconciliarmercadopago") return reconcileMercadoPagoCommand(interaction, interaction.options.getString("payment_id"));
-      if (interaction.commandName === "pago") {
+      if (["pago", "verificarpagamento"].includes(interaction.commandName)) {
         const order = findOrderInChannel(readOrders(), interaction, false);
         if (!order) return actionReply(interaction, { content: "Nao encontrei carrinho neste canal.", ephemeral: true });
         return markOrderPaid(interaction, order.id);
@@ -10347,6 +10495,7 @@ function shutdown(signal) {
   console.log(`${signal} recebido; salvando persistencia pendente antes de sair.`);
   clearInterval(ephemeralCleanupTimer);
   clearInterval(paymentExpiryTimer);
+  clearInterval(mercadoPagoReconcileTimer);
   oauthHttp?.server?.close?.(() => null);
   drainPersistentWriteQueues()
     .finally(() => closePostgresPool())
@@ -10356,8 +10505,15 @@ process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 async function boot() {
   await hydratePersistentFiles();
-  await sweepExpiredPayments().catch(error => console.error("Falha ao recuperar expiracoes:", errorSummary(error)));
   await client.login(token);
+  if (!client.isReady()) {
+    await Promise.race([
+      new Promise(resolve => client.once("clientReady", resolve)),
+      new Promise(resolve => setTimeout(resolve, 30_000))
+    ]);
+  }
+  await sweepPendingMercadoPagoPayments().catch(error => console.error("Falha na reconciliacao inicial Mercado Pago:", errorSummary(error)));
+  await sweepExpiredPayments().catch(error => console.error("Falha ao recuperar expiracoes:", errorSummary(error)));
 }
 boot().catch(error => {
   if (/Used disallowed intents/i.test(String(error?.message || ""))) {
