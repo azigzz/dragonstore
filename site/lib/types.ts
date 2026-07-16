@@ -70,6 +70,8 @@ export type SiteConfig = {
   heroImageUrl: string;
   trustBadges: string[];
   manualCatalogEnabled?: boolean;
+  safeCatalogEnabled?: boolean;
+  safeProductKeys?: string[];
   fallbackCategories?: StoreCategory[];
   fallbackProducts?: StoreProduct[];
 };

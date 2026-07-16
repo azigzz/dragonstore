@@ -1,6 +1,6 @@
 "use client";
 
-import { BarChart3, CheckCircle2, Copy, LogIn, LogOut, Plus, RefreshCw, Save, ShieldCheck, TestTube2, Trash2 } from "lucide-react";
+import { BarChart3, CheckCircle2, Copy, Eye, EyeOff, LogIn, LogOut, Plus, RefreshCw, Save, ShieldCheck, TestTube2, Trash2 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { AdminConfigPayload, AnalyticsSummary, StoreCategory, StoreProduct } from "@/lib/types";
 
@@ -23,6 +23,8 @@ const emptyConfig: AdminConfigPayload = {
   heroImageUrl: "/savio-store-logo.png",
   trustBadges: ["Carrinho rapido", "Atendimento por ADM", "Pagamento via Pix", "Produtos digitais", "Suporte no Discord"],
   manualCatalogEnabled: false,
+  safeCatalogEnabled: false,
+  safeProductKeys: [],
   fallbackCategories: [],
   fallbackProducts: []
 };
@@ -115,6 +117,9 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
 
   const tokenLabel = useMemo(() => config.botApiTokenConfigured ? "Token ja configurado" : "Token ainda nao salvo", [config.botApiTokenConfigured]);
   const selectedCategory = categories.find(category => category.id === selectedCategoryId) || categories[0] || null;
+  const safeKeys = useMemo(() => new Set(config.safeProductKeys || []), [config.safeProductKeys]);
+  const allProductKeys = useMemo(() => categories.flatMap(category => category.products.map(product => `${category.id}:${product.id}`)), [categories]);
+  const visibleProductCount = allProductKeys.filter(key => safeKeys.has(key)).length;
 
   useEffect(() => {
     if (isLoggedIn) {
@@ -191,10 +196,12 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
     const nextId = uniqueId(value, categories.filter(category => category.id !== oldId).map(category => category.id));
     if (!nextId) return;
     setCategories(current => current.map(category => category.id === oldId ? { ...category, id: nextId } : category));
+    setSafeKeys([...safeKeys].map(key => key.startsWith(`${oldId}:`) ? `${nextId}:${key.slice(oldId.length + 1)}` : key));
     setSelectedCategoryId(nextId);
   }
 
   function updateProduct(categoryId: string, productId: string, patch: Partial<StoreProduct>) {
+    const nextProductId = patch.id && patch.id !== productId ? patch.id : "";
     setCategories(current => current.map(category => {
       if (category.id !== categoryId) return category;
       return {
@@ -202,6 +209,38 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
         products: category.products.map(product => product.id === productId ? { ...product, ...patch } : product)
       };
     }));
+    if (nextProductId && safeKeys.has(`${categoryId}:${productId}`)) {
+      const next = new Set(safeKeys);
+      next.delete(`${categoryId}:${productId}`);
+      next.add(`${categoryId}:${nextProductId}`);
+      setSafeKeys(next);
+    }
+  }
+
+  function setSafeKeys(keys: Iterable<string>) {
+    update("safeProductKeys", [...new Set(keys)]);
+  }
+
+  function setProductVisibility(categoryId: string, productId: string, visible: boolean) {
+    const key = `${categoryId}:${productId}`;
+    const next = new Set(safeKeys);
+    if (visible) next.add(key);
+    else next.delete(key);
+    setSafeKeys(next);
+  }
+
+  function setCategoryVisibility(category: StoreCategory, visible: boolean) {
+    const next = new Set(safeKeys);
+    for (const product of category.products) {
+      const key = `${category.id}:${product.id}`;
+      if (visible) next.add(key);
+      else next.delete(key);
+    }
+    setSafeKeys(next);
+  }
+
+  function categoryVisibilityCount(category: StoreCategory) {
+    return category.products.filter(product => safeKeys.has(`${category.id}:${product.id}`)).length;
   }
 
   function addCategory() {
@@ -438,6 +477,29 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
                 />
                 <span className="text-sm font-bold text-slate-200">Catalogo manual ativo</span>
               </label>
+              <div className="grid gap-3 rounded-md border border-emerald-300/20 bg-emerald-300/[.06] p-4 md:col-span-2 sm:grid-cols-[1fr_auto] sm:items-center">
+                <label className="flex min-h-11 items-center gap-3">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(config.safeCatalogEnabled)}
+                    onChange={event => update("safeCatalogEnabled", event.target.checked)}
+                    className="h-4 w-4 accent-emerald-300"
+                  />
+                  <span>
+                    <strong className="block text-sm text-white">Vitrine segura</strong>
+                    <span className="text-xs text-slate-400">Publica somente os produtos marcados abaixo, sem apagar nada.</span>
+                  </span>
+                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="mr-1 text-xs font-bold text-emerald-100">{visibleProductCount}/{allProductKeys.length} visiveis</span>
+                  <button type="button" onClick={() => setSafeKeys(allProductKeys)} title="Mostrar todos os produtos" className="inline-flex h-9 items-center gap-2 rounded-md border border-white/10 bg-white/[.06] px-3 text-xs font-bold hover:bg-white/10">
+                    <Eye className="h-4 w-4" /> Todos
+                  </button>
+                  <button type="button" onClick={() => setSafeKeys([])} title="Ocultar todos os produtos" className="inline-flex h-9 items-center gap-2 rounded-md border border-white/10 bg-white/[.06] px-3 text-xs font-bold hover:bg-white/10">
+                    <EyeOff className="h-4 w-4" /> Nenhum
+                  </button>
+                </div>
+              </div>
               <div className="md:col-span-2">
                 <TextField label="Texto principal" value={config.heroText} onChange={value => update("heroText", value)} rows={3} />
               </div>
@@ -460,22 +522,33 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
 
               <div className="grid gap-4 lg:grid-cols-[260px_1fr]">
                 <div className="grid content-start gap-2">
-                  {categories.map(category => (
-                    <button
-                      key={category.id}
-                      type="button"
-                      onClick={() => setSelectedCategoryId(category.id)}
-                      className={`rounded-md border px-3 py-3 text-left text-sm transition ${selectedCategory?.id === category.id ? "border-emerald-300/50 bg-emerald-300/10 text-white" : "border-white/10 bg-white/[.04] text-slate-300 hover:bg-white/[.08]"}`}
-                    >
-                      <strong className="block truncate">{category.title}</strong>
-                      <span className="text-xs text-slate-500">{productLabel(category.products.length)}</span>
-                    </button>
-                  ))}
+                  {categories.map(category => {
+                    const visibleCount = categoryVisibilityCount(category);
+                    const allVisible = Boolean(category.products.length) && visibleCount === category.products.length;
+                    return (
+                      <div key={category.id} className={`grid grid-cols-[1fr_40px] overflow-hidden rounded-md border transition ${selectedCategory?.id === category.id ? "border-emerald-300/50 bg-emerald-300/10" : "border-white/10 bg-white/[.04]"}`}>
+                        <button type="button" onClick={() => setSelectedCategoryId(category.id)} className="min-w-0 px-3 py-3 text-left text-sm text-slate-300 hover:bg-white/[.05]">
+                          <strong className="block truncate text-white">{category.title}</strong>
+                          <span className="text-xs text-slate-500">{visibleCount}/{category.products.length} no site</span>
+                        </button>
+                        <button type="button" onClick={() => setCategoryVisibility(category, !allVisible)} title={allVisible ? "Ocultar categoria da vitrine" : "Mostrar categoria na vitrine"} className="flex items-center justify-center border-l border-white/10 text-slate-300 hover:bg-white/10 hover:text-white">
+                          {allVisible ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
 
                 {selectedCategory ? (
                   <div className="space-y-4">
                     <div className="grid gap-3 rounded-lg border border-white/10 bg-black/20 p-4 md:grid-cols-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2 md:col-span-2">
+                        <span className="text-sm font-bold text-slate-300">Visibilidade da categoria</span>
+                        <button type="button" onClick={() => setCategoryVisibility(selectedCategory, categoryVisibilityCount(selectedCategory) !== selectedCategory.products.length)} className="inline-flex h-9 items-center gap-2 rounded-md border border-white/10 bg-white/[.06] px-3 text-xs font-bold hover:bg-white/10">
+                          {categoryVisibilityCount(selectedCategory) === selectedCategory.products.length ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+                          {categoryVisibilityCount(selectedCategory) === selectedCategory.products.length ? "Categoria visivel" : `${categoryVisibilityCount(selectedCategory)}/${selectedCategory.products.length} visiveis`}
+                        </button>
+                      </div>
                       <Field label="ID da categoria" value={selectedCategory.id} onChange={value => changeCategoryId(selectedCategory.id, value)} />
                       <Field label="Titulo" value={selectedCategory.title} onChange={value => updateCategory(selectedCategory.id, { title: value })} />
                       <Field label="Imagem da categoria" value={selectedCategory.imageUrl || ""} onChange={value => updateCategory(selectedCategory.id, { imageUrl: value })} />
@@ -502,6 +575,13 @@ export default function AdminPanel({ loggedIn, initialConfig }: AdminPanelProps)
                     <div className="grid gap-3">
                       {selectedCategory.products.map(product => (
                         <div key={product.id} className="grid gap-3 rounded-lg border border-white/10 bg-black/20 p-4 md:grid-cols-2">
+                          <label className="flex min-h-10 items-center gap-3 rounded-md border border-white/10 bg-white/[.04] px-3 md:col-span-2">
+                            <input type="checkbox" checked={safeKeys.has(`${selectedCategory.id}:${product.id}`)} onChange={event => setProductVisibility(selectedCategory.id, product.id, event.target.checked)} className="h-4 w-4 accent-emerald-300" />
+                            <span className="inline-flex items-center gap-2 text-sm font-bold text-slate-200">
+                              {safeKeys.has(`${selectedCategory.id}:${product.id}`) ? <Eye className="h-4 w-4 text-emerald-200" /> : <EyeOff className="h-4 w-4 text-slate-500" />}
+                              Mostrar na vitrine segura
+                            </span>
+                          </label>
                           <Field label="ID" value={product.id} onChange={value => updateProduct(selectedCategory.id, product.id, { id: slugify(value) })} />
                           <Field label="Nome" value={product.name} onChange={value => updateProduct(selectedCategory.id, product.id, { name: value })} />
                           <Field label="Preco" value={product.price} onChange={value => updateProduct(selectedCategory.id, product.id, { price: value })} />

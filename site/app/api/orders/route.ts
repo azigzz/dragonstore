@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { readSiteConfig } from "@/lib/config";
+import { getStoreData } from "@/lib/store";
 import type { WebOrderReceipt } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -46,6 +47,13 @@ export async function POST(request: Request) {
     const config = await readSiteConfig();
     if (!config.botApiUrl || !config.botApiToken) {
       return NextResponse.json({ error: "A criacao de pedidos esta temporariamente indisponivel." }, { status: 503 });
+    }
+    if (config.safeCatalogEnabled) {
+      const store = await getStoreData();
+      const visibleProductIds = new Set((store.categories || []).flatMap(category => category.products.map(product => product.id)));
+      if (items.some(item => !visibleProductIds.has(item.productId))) {
+        return NextResponse.json({ error: "Um produto do carrinho nao esta disponivel na vitrine publica." }, { status: 400 });
+      }
     }
     const response = await fetch(orderApiUrl(config.botApiUrl), {
       method: "POST",

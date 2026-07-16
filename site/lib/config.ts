@@ -70,6 +70,10 @@ function cleanConfig(input: Partial<SiteConfig>): Partial<SiteConfig> {
   if (typeof input.primaryColor === "string") output.primaryColor = normalizeColor(input.primaryColor);
   if (typeof input.heroImageUrl === "string") output.heroImageUrl = input.heroImageUrl.slice(0, 500);
   if (typeof input.manualCatalogEnabled === "boolean") output.manualCatalogEnabled = input.manualCatalogEnabled;
+  if (typeof input.safeCatalogEnabled === "boolean") output.safeCatalogEnabled = input.safeCatalogEnabled;
+  if (Array.isArray(input.safeProductKeys)) {
+    output.safeProductKeys = [...new Set(input.safeProductKeys.map(item => String(item).trim().slice(0, 240)).filter(Boolean))].slice(0, 5000);
+  }
   if (Array.isArray(input.trustBadges)) {
     output.trustBadges = input.trustBadges.map(item => String(item).slice(0, 60)).filter(Boolean).slice(0, 8);
   }
@@ -202,6 +206,8 @@ export async function readSiteConfig(): Promise<SiteConfig> {
     heroImageUrl: merged.heroImageUrl || "/savio-store-logo.png",
     trustBadges: merged.trustBadges?.length ? merged.trustBadges : baseConfig.trustBadges,
     manualCatalogEnabled: Boolean(merged.manualCatalogEnabled),
+    safeCatalogEnabled: Boolean(merged.safeCatalogEnabled),
+    safeProductKeys: merged.safeProductKeys || [],
     fallbackCategories: merged.fallbackCategories?.length
       ? merged.fallbackCategories
       : asCategories((fallbackStore as { categories?: unknown }).categories),

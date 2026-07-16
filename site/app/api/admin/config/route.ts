@@ -7,7 +7,7 @@ import type { SiteConfig } from "@/lib/types";
 export const dynamic = "force-dynamic";
 
 function changedFields(before: Partial<SiteConfig>, after: Partial<SiteConfig>) {
-  const fields = ["storeName", "subtitle", "heroTitle", "heroText", "discordInviteUrl", "ticketChannelUrl", "botApiUrl", "primaryColor", "heroImageUrl", "manualCatalogEnabled", "trustBadges", "fallbackCategories", "fallbackProducts"];
+  const fields = ["storeName", "subtitle", "heroTitle", "heroText", "discordInviteUrl", "ticketChannelUrl", "botApiUrl", "primaryColor", "heroImageUrl", "manualCatalogEnabled", "safeCatalogEnabled", "safeProductKeys", "trustBadges", "fallbackCategories", "fallbackProducts"];
   return fields.filter(field => JSON.stringify(before[field as keyof SiteConfig] ?? null) !== JSON.stringify(after[field as keyof SiteConfig] ?? null));
 }
 
@@ -40,6 +40,8 @@ export async function POST(request: Request) {
       changedFields: changedFields(previous, saved),
       categories: saved.fallbackCategories?.length || 0,
       products: saved.fallbackProducts?.length || 0,
+      safeCatalogEnabled: Boolean(saved.safeCatalogEnabled),
+      safeVisibleProducts: saved.safeProductKeys?.length || 0,
       botApiTokenChanged: Boolean(body.botApiToken)
     });
     return NextResponse.json(toAdminPayload(saved));

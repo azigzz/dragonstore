@@ -50,6 +50,21 @@ function minProductPrice(products: StoreProduct[]) {
   return values.length ? Math.min(...values) : null;
 }
 
+export function safeProductKey(categoryId: string, productId: string) {
+  return `${String(categoryId)}:${String(productId)}`;
+}
+
+export function applySafeCatalogFilter(store: StoreData, config: SiteConfig): StoreData {
+  if (!config.safeCatalogEnabled) return store;
+  const allowed = new Set(config.safeProductKeys || []);
+  const categories = (store.categories || []).map(category => {
+    const products = category.products.filter(product => allowed.has(safeProductKey(category.id, product.id)));
+    return { ...category, products, minPrice: minProductPrice(products) };
+  }).filter(category => category.products.length);
+  const products = categories.flatMap(category => category.products);
+  return { ...store, categories, products };
+}
+
 function normalizeCategories(categories: unknown, defaultImage: string, fallbackTitle = "Catalogo"): StoreCategory[] {
   if (!Array.isArray(categories)) return [];
   const seen = new Set<string>();
@@ -197,10 +212,10 @@ export async function getStoreData(): Promise<StoreData> {
   const config = await readSiteConfig();
   try {
     const botStore = await fetchBotStore(config);
-    return mergeBotData(botStore, config);
+    return applySafeCatalogFilter(mergeBotData(botStore, config), config);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Falha ao conectar no bot.";
-    return fallbackData(config, message);
+    return applySafeCatalogFilter(fallbackData(config, message), config);
   }
 }
 
