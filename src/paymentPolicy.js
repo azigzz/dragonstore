@@ -1,6 +1,7 @@
 const PAYMENT_METHOD = Object.freeze({
   MANUAL_PIX: "MANUAL_PIX",
-  PAGBANK_PIX: "PAGBANK_PIX"
+  PAGBANK_PIX: "PAGBANK_PIX",
+  MERCADOPAGO_PIX: "MERCADOPAGO_PIX"
 });
 
 function validAmountInCents(value) {

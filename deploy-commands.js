@@ -126,6 +126,11 @@ const commands = [
     .setName("togglepagbank")
     .setDescription("Alterna entre Pix automatico PagBank e Pix manual antigo."),
   new SlashCommandBuilder()
+    .setName("configpagamento")
+    .setDescription("Escolhe o provedor de pagamento automatico da loja.")
+    .addStringOption(option => option.setName("provedor").setDescription("Provedor para novos pagamentos.").setRequired(true)
+      .addChoices({ name: "Mercado Pago", value: "mercadopago" }, { name: "PagBank", value: "pagbank" }, { name: "Pix manual", value: "manual" })),
+  new SlashCommandBuilder()
     .setName("salvarpix")
     .setDescription("Salva/atualiza o backup do Pix e painel de atendimento no Discord."),
   new SlashCommandBuilder()
@@ -180,6 +185,10 @@ const commands = [
         .setMaxLength(90)
         .setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName("reconciliarmercadopago")
+    .setDescription("Consulta e processa um Pix Mercado Pago.")
+    .addStringOption(option => option.setName("payment_id").setDescription("ID numerico do pagamento.").setRequired(true).setMinLength(5).setMaxLength(30)),
   new SlashCommandBuilder()
     .setName("pago")
     .setDescription("Marca o pagamento manual do carrinho atual."),

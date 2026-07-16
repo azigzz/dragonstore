@@ -177,13 +177,18 @@ async function pullVerifiedUsersToBackup() {
   return { ...summary, total: users.length, failures };
 }
 
-function createOAuthServer(client, publicStoreHandler, pagBankWebhookHandler = null) {
+function createOAuthServer(client, publicStoreHandler, pagBankWebhookHandler = null, mercadoPagoWebhookHandler = null) {
   const app = express();
   app.disable("x-powered-by");
 
   if (pagBankWebhookHandler) {
     app.post("/webhooks/pagbank", express.raw({ type: "application/json", limit: "256kb" }), (req, res, next) => {
       Promise.resolve(pagBankWebhookHandler(req, res)).catch(next);
+    });
+  }
+  if (mercadoPagoWebhookHandler) {
+    app.post("/webhooks/mercadopago", express.raw({ type: "application/json", limit: "256kb" }), (req, res, next) => {
+      Promise.resolve(mercadoPagoWebhookHandler(req, res)).catch(next);
     });
   }
 
