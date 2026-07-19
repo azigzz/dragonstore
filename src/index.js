@@ -14,9 +14,32 @@ const { createServerBackup, restoreServerBackup, validateServerBackup } = requir
 const { currentSetupSummary, provisionStoreSetup } = require("./storeSetup");
 const { QUICK_PANEL_TEMPLATE, parseQuickPanelTemplate } = require("./quickPanelTemplate");
 const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("./paymentPolicy");
-const { canApproveManualPayment, isAuthorizedOwner, parseOwnerIds } = require("./securityPolicy");
+const { isAuthorizedOwner, parseOwnerIds } = require("./securityPolicy");
 const { createPixOrder, getPagBankOrder, normalizeCustomer, pagBankConfig, pagBankReady, paidPixCharge, validatePaidPixNotification, verifyWebhookSignature } = require("./pagBank");
 const { createMercadoPagoPix, getMercadoPagoPayment, mercadoPagoConfig, mercadoPagoReady, validateApprovedMercadoPagoPayment, verifyMercadoPagoSignature } = require("./mercadoPago");
+const {
+  downloadAndValidateProof,
+  findLatestProofAttachment,
+  proofMaxBytes,
+  safeProofFilename,
+  validateProofMetadata
+} = require("./proofAttachment");
+const {
+  ntfyReady,
+  sendAutomaticPaymentNotification,
+  sendManualProofNotification
+} = require("./services/notificationService");
+const {
+  inactivityMs,
+  initializeActivity,
+  isInactive,
+  isManualInactivityCandidate,
+  manualNotificationCooldownMs,
+  manualNotificationRemaining,
+  markHumanActivity,
+  paymentChoiceAvailability,
+  recordManualNotification
+} = require("./orderLifecycle");
 const {
   STOCK_MODE,
   STOCK_STATUS,
@@ -133,8 +156,11 @@ const addCartSessions = new Map();
 const imageUploads = new Map();
 const paymentProofUploads = new Map();
 const cartDeleteTimers = new Map();
+const ticketDeleteTimers = new Map();
 const publicPanelScanCache = new Map();
 const orderActionLocks = new Set();
+const automaticNotificationLocks = new Set();
+const ticketInactivityLocks = new Set();
 const statusVoiceReconnectTimers = new Map();
 const serverRestoreSessions = new Map();
 const stockAdminSessions = new Map();
@@ -150,6 +176,7 @@ const MERCADOPAGO_RECONCILE_INTERVAL_MS = Math.max(10, Math.min(300, Number(proc
 const MERCADOPAGO_RECONCILE_BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.MERCADOPAGO_RECONCILE_BATCH_SIZE) || 15));
 const MERCADOPAGO_SETTLEMENT_GRACE_MS = Math.max(1, Math.min(60, Number(process.env.MERCADOPAGO_SETTLEMENT_GRACE_MINUTES) || 5)) * 60 * 1000;
 const MERCADOPAGO_ERROR_GRACE_MS = Math.max(5, Math.min(180, Number(process.env.MERCADOPAGO_ERROR_GRACE_MINUTES) || 30)) * 60 * 1000;
+const INACTIVITY_SWEEP_INTERVAL_MS = Math.max(60, Math.min(3600, Number(process.env.CART_INACTIVITY_SWEEP_SECONDS) || 300)) * 1000;
 const mercadoPagoLastChecks = new Map();
 const mercadoPagoLastErrorLogs = new Map();
 
@@ -193,7 +220,7 @@ async function sweepExpiredPayments() {
     const db = readOrders();
     const now = Date.now();
     for (const order of Object.values(db.orders || {})) {
-      if (order.status !== ORDER_STATUS.OPEN || ![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW, PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT].includes(order.paymentState)) continue;
+      if (order.status !== ORDER_STATUS.OPEN || order.paymentState !== PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT) continue;
       const expiresAt = Date.parse(order.paymentExpiresAt || "");
       if (!Number.isFinite(expiresAt) || expiresAt > now) continue;
       if (order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX && order.mercadoPagoPaymentId) {
@@ -559,6 +586,7 @@ function dbCents(value) {
 function dbStatus(status) {
   const value = dbText(status, ORDER_STATUS.OPEN).toLowerCase();
   if (value === ORDER_STATUS.CANCELED) return ORDER_STATUS.CANCELLED;
+  if (value === ORDER_STATUS.EXPIRED_INACTIVITY) return "expired";
   if ([ORDER_STATUS.OPEN, ORDER_STATUS.PROCESSING, ORDER_STATUS.CLOSED, ORDER_STATUS.CANCELLED, "expired"].includes(value)) return value;
   return ORDER_STATUS.OPEN;
 }
@@ -888,6 +916,24 @@ async function writeOrderRelational(dbClient, order, panel) {
     dbText(order.pagBankChargeId) || null,
     order.paymentExpiresAt || null
   ]);
+  await dbClient.query(`
+    update orders set
+      last_interaction_at = $2,
+      manual_payment_notification_sent_at = $3,
+      manual_payment_notification_sent_by = $4,
+      automatic_payment_notification_key = $5,
+      manually_approved_by = $6,
+      manually_approved_at = $7
+    where id = $1
+  `, [
+    dbText(order.id),
+    order.lastInteractionAt || order.updatedAt || order.createdAt || new Date().toISOString(),
+    order.manualPaymentNotificationSentAt || null,
+    dbText(order.manualPaymentNotificationSentBy) || null,
+    dbText(order.automaticPaymentNotificationKey) || null,
+    dbText(order.manuallyApprovedBy) || null,
+    order.manuallyApprovedAt || null
+  ]);
   await syncOrderItemsRelational(dbClient, order, panel);
 }
 async function writeStatsRelational(dbClient, db, order) {
@@ -1139,6 +1185,12 @@ function ensureOrdersStore(db) {
   if (!store.webOrders || typeof store.webOrders !== "object" || Array.isArray(store.webOrders)) store.webOrders = {};
   if (!store.customers || typeof store.customers !== "object" || Array.isArray(store.customers)) store.customers = {};
   if (!store.sellers || typeof store.sellers !== "object" || Array.isArray(store.sellers)) store.sellers = {};
+  if (!store.manualNotificationRateLimits || typeof store.manualNotificationRateLimits !== "object" || Array.isArray(store.manualNotificationRateLimits)) store.manualNotificationRateLimits = {};
+  const rateLimitCutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [key, value] of Object.entries(store.manualNotificationRateLimits)) {
+    const timestamp = Date.parse(String(value || ""));
+    if (!Number.isFinite(timestamp) || timestamp < rateLimitCutoff) delete store.manualNotificationRateLimits[key];
+  }
   if (!Array.isArray(store.auditLogs)) store.auditLogs = [];
   if (store.auditLogs.length > 1000) store.auditLogs = store.auditLogs.slice(-1000);
 
@@ -1153,6 +1205,7 @@ function ensureOrdersStore(db) {
     order.createdAt = order.createdAt || new Date().toISOString();
     order.closedAt = order.closedAt || null;
     order.version = Number.isFinite(Number(order.version)) ? Number(order.version) : 0;
+    initializeActivity(order);
   }
 
   for (const [id, ticket] of Object.entries(store.tickets)) {
@@ -1163,6 +1216,7 @@ function ensureOrdersStore(db) {
     ticket.id = String(ticket.id || id);
     ticket.status = String(ticket.status || "open");
     ticket.createdAt = ticket.createdAt || new Date().toISOString();
+    initializeActivity(ticket);
   }
 
   for (const [id, webOrder] of Object.entries(store.webOrders)) {
@@ -1205,7 +1259,8 @@ const ORDER_STATUS = {
   PROCESSING: "processing",
   CLOSED: "closed",
   CANCELLED: "cancelled",
-  CANCELED: "canceled"
+  CANCELED: "canceled",
+  EXPIRED_INACTIVITY: "expired_inactivity"
 };
 const PAYMENT_STATE = Object.freeze({
   AWAITING_MANUAL_PAYMENT: "AWAITING_MANUAL_PAYMENT",
@@ -1250,6 +1305,7 @@ function orderStatusLabel(status) {
   if (value === ORDER_STATUS.PROCESSING) return "Processando";
   if (value === ORDER_STATUS.CLOSED) return "Fechado";
   if (value === ORDER_STATUS.CANCELLED || value === ORDER_STATUS.CANCELED) return "Cancelado";
+  if (value === ORDER_STATUS.EXPIRED_INACTIVITY) return "Expirado por inatividade";
   return value;
 }
 function paymentStatusLabel(order) {
@@ -2121,17 +2177,14 @@ async function assumeOrder(interaction, id) {
 
   await ensureStaffState(interaction.guild, interaction.channel);
   const profile = getStaffProfile(interaction.guildId, interaction.user.id);
-  if (!profile?.pixKey) {
-    return actionReply(interaction, { content: "Configure seu Pix primeiro com `!configpix`, `/configpix` ou no botão **Configurar meu Pix** do painel de atendimento.", ephemeral: true });
-  }
 
   const online = onlineStaffProfiles(interaction.guildId);
-  if (online.length > 0 && !profile.online) {
+  if (online.length > 0 && profile && !profile.online) {
     return actionReply(interaction, { content: "Você está OFF. Clique em **Ficar ON** no painel de atendimento antes de assumir.", ephemeral: true });
   }
 
   order.assignedAdminId = interaction.user.id;
-  order.assignedAdminName = profile.displayName || interaction.user.username;
+  order.assignedAdminName = profile?.displayName || interaction.member?.displayName || interaction.user.username;
   order.assignedAt = new Date().toISOString();
   touchOrder(order);
   appendAuditLog(db, interaction, "order.assigned", { order, staffUserId: interaction.user.id });
@@ -2139,8 +2192,13 @@ async function assumeOrder(interaction, id) {
   writeOrders(db);
 
   const panel = getOrderPanel(order, actionGuildId(interaction));
-  persistOrderRelationalAsync(db, order, panel);
-  return startOrderPayment(interaction, order.id);
+  await persistOrderRelationalAsync(db, order, panel);
+  await refreshCartMessage(interaction.guild, order, panel, interaction.channel);
+  await interaction.channel.send({
+    content: `<@${order.userId}> sua compra foi assumida por <@${interaction.user.id}>. Escolha a forma de pagamento no botao **Gerar pagamento**.`,
+    allowedMentions: { users: [order.userId, interaction.user.id] }
+  }).catch(() => null);
+  return actionReply(interaction, { content: "Compra assumida. O cliente ja pode escolher a forma de pagamento.", ephemeral: true });
 }
 async function resendPix(interaction, id) {
   if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true }).catch(() => null);
@@ -2213,6 +2271,7 @@ async function sendPixCommand(message) {
     db.orders[order.id] = order;
     writeOrders(db);
   }
+  order.paymentPreference = "manual";
   appendAuditLog(db, message, "order.pix_sent", { order, staffUserId: message.author.id, via: "pix_command" });
   writeOrders(db);
 
@@ -3339,9 +3398,23 @@ async function persistPaymentOrder(db, order, panel) {
   await persistOrderRelationalAsync(db, order, panel);
 }
 function manualPaymentProfile(order) {
-  if (order.assignedAdminId) return getStaffProfile(order.guildId, order.assignedAdminId);
+  if (order.assignedAdminId) {
+    const assigned = getStaffProfile(order.guildId, order.assignedAdminId);
+    if (assigned?.pixKey) return assigned;
+  }
   const online = onlineStaffProfiles(order.guildId);
-  return online.length === 1 ? online[0] : null;
+  if (online.length === 1) return online[0];
+  const pixKey = String(process.env.MANUAL_PIX_KEY || "").trim();
+  if (!pixKey) return null;
+  return {
+    userId: client.user?.id || "loja",
+    displayName: String(process.env.MANUAL_PIX_RECEIVER || "Loja").trim(),
+    pixKey,
+    pixKeyType: String(process.env.MANUAL_PIX_KEY_TYPE || "").trim(),
+    pixCity: "",
+    qrCodeUrl: String(process.env.MANUAL_PIX_QR_IMAGE_URL || "").trim(),
+    note: "Envie uma imagem ou um arquivo PDF do comprovante neste carrinho."
+  };
 }
 function buildManualPaymentEmbed(order, snapshot, profile, panel) {
   return new EmbedBuilder()
@@ -3404,6 +3477,95 @@ function pagBankCustomerModal(orderId) {
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("taxId").setLabel("CPF/CNPJ privado exigido pelo provedor").setPlaceholder("Nao sera exibido no canal").setStyle(TextInputStyle.Short).setMinLength(11).setMaxLength(18).setRequired(true))
     );
 }
+function automaticPaymentMethodForGuild(guildId) {
+  const provider = automaticPaymentProvider(guildId);
+  if (provider === "mercadopago") return PAYMENT_METHOD.MERCADOPAGO_PIX;
+  if (provider === "pagbank") return PAYMENT_METHOD.PAGBANK_PIX;
+  return null;
+}
+function automaticPaymentConfigured(guildId) {
+  const method = automaticPaymentMethodForGuild(guildId);
+  if (method === PAYMENT_METHOD.MERCADOPAGO_PIX) return postgresEnabled() && mercadoPagoReady();
+  if (method === PAYMENT_METHOD.PAGBANK_PIX) return postgresEnabled() && pagBankReady();
+  return false;
+}
+function selectedPaymentMethod(order, totalCents) {
+  if (order.paymentPreference === "manual") return PAYMENT_METHOD.MANUAL_PIX;
+  if (order.paymentPreference === "automatic") {
+    if (totalCents < 100) return null;
+    return automaticPaymentMethodForGuild(order.guildId);
+  }
+  return storePaymentMethod(order.guildId, totalCents);
+}
+function paymentMethodChoicePayload(order, panel) {
+  const snapshot = serverOrderSnapshot(order);
+  const availability = paymentChoiceAvailability(snapshot.totalCents, automaticPaymentConfigured(order.guildId));
+  const automaticMethod = automaticPaymentMethodForGuild(order.guildId);
+  const providerName = automaticMethod === PAYMENT_METHOD.MERCADOPAGO_PIX ? "Mercado Pago" : automaticMethod === PAYMENT_METHOD.PAGBANK_PIX ? "PagBank" : "indisponivel";
+  const embed = new EmbedBuilder()
+    .setTitle("Escolha como pagar")
+    .setDescription([
+      `**Total do pedido:** ${money(snapshot.totalCents / 100)}`,
+      "",
+      "**PIX Automatico**",
+      `Identificado e aprovado automaticamente pelo ${providerName}. Solicita dados privados, incluindo CPF/CNPJ.`,
+      "",
+      "**PIX Manual**",
+      "Use a chave ou QR Code da loja e envie uma imagem ou PDF do comprovante.",
+      availability.reason ? `\n${availability.reason}` : ""
+    ].filter(Boolean).join("\n"))
+    .setColor(parseColor(panel.color));
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`payauto:${order.id}`)
+      .setLabel("PIX Automatico - precisa CPF")
+      .setEmoji("⚡")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!availability.automatic),
+    new ButtonBuilder()
+      .setCustomId(`paymanual:${order.id}`)
+      .setLabel("PIX Manual")
+      .setEmoji("📋")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!availability.manual)
+  );
+  return { embeds: [embed], components: [row], ephemeral: true };
+}
+async function showPaymentMethodChoice(context, id) {
+  const db = readOrders();
+  const order = orderForAction(db, id, context, false);
+  if (!order || order.status !== ORDER_STATUS.OPEN) return actionReply(context, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  const actor = actionUser(context);
+  if (actor.id !== order.userId && !isAdmin(context.member)) return actionReply(context, { content: "Voce nao pode escolher o pagamento deste carrinho.", ephemeral: true });
+  if (paymentStarted(order)) return startOrderPayment(context, order.id);
+  if (!order.items?.length) return actionReply(context, { content: "Adicione um produto antes de escolher o pagamento.", ephemeral: true });
+  try {
+    return actionReply(context, paymentMethodChoicePayload(order, getOrderPanel(order, order.guildId)));
+  } catch (error) {
+    return actionReply(context, { content: error.message, ephemeral: true });
+  }
+}
+async function selectPaymentMethod(context, id, preference) {
+  const db = readOrders();
+  const order = orderForAction(db, id, context, false);
+  if (!order || order.status !== ORDER_STATUS.OPEN) return actionReply(context, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  const actor = actionUser(context);
+  if (actor.id !== order.userId && !isAdmin(context.member)) return actionReply(context, { content: "Somente o cliente pode escolher a forma de pagamento.", ephemeral: true });
+  if (paymentStarted(order)) return actionReply(context, { content: `O pagamento ja esta em ${paymentStatusLabel(order)}.`, ephemeral: true });
+  const panel = getOrderPanel(order, order.guildId);
+  const snapshot = serverOrderSnapshot(order);
+  const availability = paymentChoiceAvailability(snapshot.totalCents, automaticPaymentConfigured(order.guildId));
+  if (preference === "automatic" && !availability.automatic) return actionReply(context, { content: availability.reason, ephemeral: true });
+  if (preference !== "automatic" && preference !== "manual") return actionReply(context, { content: "Forma de pagamento invalida.", ephemeral: true });
+  order.paymentPreference = preference;
+  touchOrder(order);
+  db.orders[order.id] = order;
+  writeOrders(db);
+  persistOrderRelationalAsync(db, order, panel).catch(error => {
+    console.warn(`Nao consegui espelhar a escolha de pagamento do pedido #${order.id}: ${errorSummary(error).message}`);
+  });
+  return startOrderPayment(context, order.id);
+}
 let lastPagBankDiagnostic = null;
 function safePagBankFailure(error, order) {
   let config;
@@ -3437,8 +3599,9 @@ async function startOrderPayment(context, id, customerInput = null) {
   let customer = null;
   const automaticMethods = [PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX];
   const hasAutomaticPix = order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX ? order.mercadoPagoPixCopyPaste : order.pagBankPixCopyPaste;
+  const intendedMethod = order.paymentMethod || selectedPaymentMethod(order, serverOrderSnapshot(order).totalCents);
   const needsPagBankCustomer = (automaticMethods.includes(order.paymentMethod) && !hasAutomaticPix) ||
-    (!paymentStarted(order) && automaticMethods.includes(storePaymentMethod(order.guildId, serverOrderSnapshot(order).totalCents)));
+    (!paymentStarted(order) && automaticMethods.includes(intendedMethod));
   if (needsPagBankCustomer) {
     if (actor.id !== order.userId) return actionReply(context, { content: "O cliente precisa clicar em Gerar pagamento e informar os dados exigidos pelo provedor Pix.", ephemeral: true });
     if (!customerInput) {
@@ -3513,7 +3676,13 @@ async function startOrderPayment(context, id, customerInput = null) {
   if (!claimOrderActionLock(order)) return actionReply(context, { content: "O pagamento deste pedido ja esta sendo gerado.", ephemeral: true });
   try {
     const snapshot = serverOrderSnapshot(order);
-    const method = storePaymentMethod(order.guildId, snapshot.totalCents);
+    const method = selectedPaymentMethod(order, snapshot.totalCents);
+    if (!method) {
+      delete order.paymentPreference;
+      touchOrder(order);
+      await persistPaymentOrder(db, order, panel);
+      return actionReply(context, { content: "O Pix automatico esta disponivel somente a partir de R$ 1,00. Escolha Pix manual.", ephemeral: true });
+    }
     if (method === PAYMENT_METHOD.PAGBANK_PIX && (!postgresEnabled() || !pagBankReady())) {
       return actionReply(context, { content: "Pix PagBank ainda nao esta configurado com Postgres, PAGBANK_TOKEN e PAGBANK_WEBHOOK_URL.", ephemeral: true });
     }
@@ -3528,7 +3697,8 @@ async function startOrderPayment(context, id, customerInput = null) {
     order.paymentMethod = method;
     order.totalCentsSnapshot = snapshot.totalCents;
     order.paymentSnapshot = { items: snapshot.items, grossCents: snapshot.grossCents, discountCents: snapshot.discountCents, totalCents: snapshot.totalCents, automaticUnits: snapshot.automaticUnits, hash: snapshot.hash };
-    order.paymentExpiresAt = new Date(Date.now() + (automaticMethods.includes(method) ? 15 : Math.max(1, Number(process.env.MANUAL_PIX_RESERVATION_MINUTES) || 30)) * 60 * 1000).toISOString();
+    if (automaticMethods.includes(method)) order.paymentExpiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    else delete order.paymentExpiresAt;
     order.paymentState = automaticMethods.includes(method) ? PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT : PAYMENT_STATE.AWAITING_MANUAL_PAYMENT;
     const reservedIds = await reserveAutomaticStockForOrder(order, panel, snapshot);
     if (reservedIds.length) order.stockReservedAt = new Date().toISOString();
@@ -3594,6 +3764,7 @@ async function startOrderPayment(context, id, customerInput = null) {
       delete order.pagBankIdempotencyKey;
       delete order.mercadoPagoReferenceId;
       delete order.mercadoPagoIdempotencyKey;
+      delete order.paymentPreference;
       touchOrder(order);
       appendAuditLog(db, context, method === PAYMENT_METHOD.MERCADOPAGO_PIX ? "order.mercadopago_create_failed" : "order.pagbank_create_failed", { order, httpStatus: error?.pagBank?.status || error?.mercadoPago?.status || 0 });
       await persistPaymentOrder(db, order, panel);
@@ -3637,6 +3808,10 @@ function discountLine(order) {
   return `${order.discount?.label || "Desconto aplicado"}: **${percent}% OFF**`;
 }
 function closedCartDeleteSeconds(order = null) {
+  if (String(order?.status || "") === ORDER_STATUS.EXPIRED_INACTIVITY) {
+    const inactive = Number(process.env.INACTIVE_CART_DELETE_SECONDS ?? 10);
+    return Number.isFinite(inactive) && inactive >= 0 ? inactive : 10;
+  }
   if ([ORDER_STATUS.CANCELLED, ORDER_STATUS.CANCELED].includes(String(order?.status || ""))) {
     const cancelled = Number(process.env.CANCELLED_CART_DELETE_SECONDS ?? 10);
     return Number.isFinite(cancelled) && cancelled >= 0 ? cancelled : 10;
@@ -3656,7 +3831,7 @@ function closedCartDeleteLabel(order = null) {
   return `${wholeHours}h${String(minutes).padStart(2, "0")}`;
 }
 function isFinishedCart(order) {
-  return ["closed", "cancelled", "canceled"].includes(String(order?.status || ""));
+  return ["closed", "cancelled", "canceled", ORDER_STATUS.EXPIRED_INACTIVITY].includes(String(order?.status || ""));
 }
 async function deleteClosedCartChannel(order) {
   if (!order?.guildId || !order?.channelId || !isFinishedCart(order)) return;
@@ -3688,6 +3863,176 @@ function scheduleExistingClosedCarts() {
   const db = readOrders();
   Object.values(db.orders || {}).forEach(scheduleCartDeletion);
 }
+function scheduleInactiveTicketDeletion(ticket) {
+  if (!ticket?.id || !ticket.channelId || ticket.status !== ORDER_STATUS.EXPIRED_INACTIVITY) return false;
+  if (ticketDeleteTimers.has(ticket.id)) clearTimeout(ticketDeleteTimers.get(ticket.id));
+  const seconds = Math.max(0, Number(process.env.INACTIVE_CART_DELETE_SECONDS ?? 10) || 10);
+  const closedAt = Date.parse(ticket.closedAt || new Date().toISOString());
+  const delay = Math.max(1000, closedAt + seconds * 1000 - Date.now());
+  const timer = setTimeout(async () => {
+    ticketDeleteTimers.delete(ticket.id);
+    const guild = client.guilds.cache.get(ticket.guildId);
+    const channel = guild ? await guild.channels.fetch(ticket.channelId).catch(() => null) : null;
+    if (channel?.deletable) await channel.delete(`Ticket ${ticket.id} expirado por inatividade`).catch(() => null);
+  }, Math.min(delay, 2_147_483_647));
+  ticketDeleteTimers.set(ticket.id, timer);
+  return true;
+}
+async function recordHumanActivity(guildId, channelId, at = new Date()) {
+  if (!guildId || !channelId) return false;
+  const db = readOrders();
+  const order = Object.values(db.orders || {}).find(item =>
+    item.guildId === guildId &&
+    item.channelId === channelId &&
+    item.status === ORDER_STATUS.OPEN
+  );
+  const ticket = Object.values(db.tickets || {}).find(item =>
+    (!item.guildId || item.guildId === guildId) &&
+    item.channelId === channelId &&
+    item.status === ORDER_STATUS.OPEN
+  );
+  let changed = false;
+  if (order && markHumanActivity(order, at)) {
+    touchOrder(order);
+    db.orders[order.id] = order;
+    changed = true;
+  }
+  if (ticket && markHumanActivity(ticket, at)) {
+    ticket.guildId = ticket.guildId || guildId;
+    db.tickets[ticket.id] = ticket;
+    changed = true;
+  }
+  if (!changed) return false;
+  writeOrders(db);
+  if (order) await persistOrderRelationalAsync(db, order, getOrderPanel(order, guildId));
+  return true;
+}
+async function backfillLegacyActivity(guild) {
+  const db = readOrders();
+  const records = [
+    ...Object.values(db.orders || {}).filter(item => item.guildId === guild.id && item.status === ORDER_STATUS.OPEN && item.activityNeedsChannelBackfill),
+    ...Object.values(db.tickets || {}).filter(item => (!item.guildId || item.guildId === guild.id) && item.status === ORDER_STATUS.OPEN && item.activityNeedsChannelBackfill)
+  ];
+  if (!records.length) return 0;
+  let changed = 0;
+  const changedOrders = [];
+  for (const record of records) {
+    record.guildId = record.guildId || guild.id;
+    const channel = await guild.channels.fetch(record.channelId).catch(() => null);
+    let latestHuman = null;
+    if (channel?.isTextBased?.() && channel.messages?.fetch) {
+      let before;
+      for (let page = 0; page < 5 && !latestHuman; page += 1) {
+        const messages = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+        if (!messages?.size) break;
+        latestHuman = [...messages.values()]
+          .filter(message => !message.author?.bot)
+          .sort((a, b) => Number(b.createdTimestamp) - Number(a.createdTimestamp))[0] || null;
+        before = messages.last()?.id;
+        if (messages.size < 100) break;
+      }
+    }
+    if (latestHuman) markHumanActivity(record, new Date(latestHuman.createdTimestamp));
+    else delete record.activityNeedsChannelBackfill;
+    if (db.orders?.[record.id]) {
+      touchOrder(record);
+      db.orders[record.id] = record;
+      changedOrders.push(record);
+    } else {
+      record.guildId = record.guildId || guild.id;
+      db.tickets[record.id] = record;
+    }
+    changed += 1;
+  }
+  if (!changed) return 0;
+  writeOrders(db);
+  for (const order of changedOrders) {
+    await persistOrderRelationalAsync(db, order, getOrderPanel(order, guild.id));
+  }
+  return changed;
+}
+let inactivitySweepRunning = false;
+async function sweepInactiveCarts() {
+  if (inactivitySweepRunning) return;
+  inactivitySweepRunning = true;
+  try {
+    const db = readOrders();
+    const now = Date.now();
+    const threshold = inactivityMs();
+    for (const order of Object.values(db.orders || {})) {
+      if (!isManualInactivityCandidate(order)) continue;
+      if (!isInactive(order, now, threshold) || !claimOrderActionLock(order)) continue;
+      try {
+        const current = readOrders().orders?.[order.id];
+        if (!current || current.status !== ORDER_STATUS.OPEN || !isInactive(current, now, threshold)) continue;
+        const panel = getOrderPanel(current, current.guildId);
+        if (current.stockReservedAt && postgresEnabled()) {
+          await releaseOrderStock(getPostgresPool(), current.id).catch(error => {
+            console.warn(`Nao consegui liberar a reserva do pedido #${current.id} expirado: ${errorSummary(error).message}`);
+          });
+          delete current.stockReservedAt;
+          current.stockReleasedAt = new Date().toISOString();
+        }
+        current.status = ORDER_STATUS.EXPIRED_INACTIVITY;
+        current.paymentState = PAYMENT_STATE.EXPIRED;
+        current.expiredInactivityAt = new Date().toISOString();
+        current.closedAt = current.expiredInactivityAt;
+        touchOrder(current);
+        const currentDb = readOrders();
+        currentDb.orders[current.id] = current;
+        await persistPaymentOrder(currentDb, current, panel);
+        const guild = client.guilds.cache.get(current.guildId);
+        const channel = guild ? await guild.channels.fetch(current.channelId).catch(() => null) : null;
+        if (channel?.isTextBased?.()) {
+          await channel.send("Este carrinho foi fechado automaticamente por ficar mais de 16 horas sem interacoes.").catch(() => null);
+          await channel.permissionOverwrites.edit(current.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
+          await channel.setName(channel.name.includes("aberto") ? channel.name.replace("aberto", "expirado") : `carrinho-expirado-${current.id}`).catch(() => null);
+          const closedCategoryId = categoryId(current.guildId, "closed");
+          if (closedCategoryId) await channel.setParent(closedCategoryId, { lockPermissions: false }).catch(() => null);
+          await refreshCartMessage(guild, current, panel, channel).catch(() => null);
+        }
+        scheduleCartDeletion(current);
+      } catch (error) {
+        console.warn(`Falha ao expirar o pedido #${order.id}: ${errorSummary(error).message}`);
+      } finally {
+        releaseOrderActionLock(order);
+      }
+    }
+    const freshDb = readOrders();
+    for (const ticket of Object.values(freshDb.tickets || {})) {
+      if (ticket.status !== ORDER_STATUS.OPEN || !isInactive(ticket, now, threshold) || ticketInactivityLocks.has(ticket.id)) continue;
+      ticketInactivityLocks.add(ticket.id);
+      try {
+        const current = readOrders().tickets?.[ticket.id];
+        if (!current || current.status !== ORDER_STATUS.OPEN || !isInactive(current, now, threshold)) continue;
+        current.status = ORDER_STATUS.EXPIRED_INACTIVITY;
+        current.expiredInactivityAt = new Date().toISOString();
+        current.closedAt = current.expiredInactivityAt;
+        const currentDb = readOrders();
+        currentDb.tickets[current.id] = current;
+        writeOrders(currentDb);
+        await flushPersistentFile(ORDERS_FILE);
+        const guild = client.guilds.cache.get(current.guildId);
+        const channel = guild ? await guild.channels.fetch(current.channelId).catch(() => null) : null;
+        if (channel?.isTextBased?.()) {
+          await channel.send("Este ticket foi fechado automaticamente por ficar mais de 16 horas sem interacoes.").catch(() => null);
+          await channel.permissionOverwrites.edit(current.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
+        }
+        scheduleInactiveTicketDeletion(current);
+      } catch (error) {
+        console.warn(`Falha ao expirar o ticket #${ticket.id}: ${errorSummary(error).message}`);
+      } finally {
+        ticketInactivityLocks.delete(ticket.id);
+      }
+    }
+  } finally {
+    inactivitySweepRunning = false;
+  }
+}
+const inactivitySweepTimer = setInterval(() => {
+  sweepInactiveCarts().catch(error => console.error("Falha ao encerrar carrinhos inativos:", errorSummary(error)));
+}, INACTIVITY_SWEEP_INTERVAL_MS);
+inactivitySweepTimer.unref?.();
 function maskCustomerName(value) {
   const clean = String(value || "cliente").replace(/\s+/g, "");
   return `${clean.slice(0, 4) || "clie"}****`;
@@ -6937,7 +7282,7 @@ async function openManualCartCommand(context, targetUser) {
   const ch = await privateChannel(guild, targetUser, `carrinho-${safeName(targetUser.username)}-aberto-${id}`, categoryId(guild.id, "cartOpen") || undefined);
   const order = {
     id,
-    paymentFlowVersion: 2,
+    paymentFlowVersion: 3,
     guildId: guild.id,
     panelId: panel.id,
     panelScopeId: panel.scopeId || "default",
@@ -6953,6 +7298,7 @@ async function openManualCartCommand(context, targetUser) {
     assignedAdminName: null,
     assignedAt: null,
     createdAt: new Date().toISOString(),
+    lastInteractionAt: new Date().toISOString(),
     closedAt: null
   };
 
@@ -7052,8 +7398,18 @@ function cartActionRows(orderOrId) {
   const finished = isFinishedCart(order);
   const paid = Boolean(order.paymentStatus === "marked_paid" || order.paidAt);
   const frozen = paymentStarted(order);
-  const proofAllowed = order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState);
-  const manualApprovalAllowed = order.paymentFlowVersion < 2 || (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState));
+  const proofAllowed = order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
+    (Number(order.paymentFlowVersion || 0) >= 3
+      ? order.paymentState === PAYMENT_STATE.AWAITING_MANUAL_PAYMENT
+      : [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState));
+  const manualConfirmationAllowed = order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
+    [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState) &&
+    !order.manualPaymentNotificationSentAt;
+  const manualApprovalAllowed = order.paymentFlowVersion < 2 ||
+    (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
+      (Number(order.paymentFlowVersion || 0) >= 3
+        ? order.paymentState === PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW
+        : [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)));
   const automaticPayment = [PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod);
   const automaticVerificationAllowed = automaticPayment && Boolean(order.pagBankOrderId || order.mercadoPagoPaymentId);
   return [
@@ -7072,6 +7428,12 @@ function cartActionRows(orderOrId) {
       new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(finished)
     ),
     new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`manualconfirm:${orderId}`)
+        .setLabel(order.manualPaymentNotificationSentAt ? "Comprovante enviado" : "Ja fiz o pagamento")
+        .setEmoji("✅")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(finished || !manualConfirmationAllowed),
       new ButtonBuilder().setCustomId(`rejectpay:${orderId}`).setLabel("Recusar pagamento").setStyle(ButtonStyle.Danger).setDisabled(finished || order.paymentMethod !== PAYMENT_METHOD.MANUAL_PIX || ![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)),
       new ButtonBuilder().setCustomId(`newproof:${orderId}`).setLabel("Novo comprovante").setStyle(ButtonStyle.Secondary).setDisabled(finished || order.paymentState !== PAYMENT_STATE.MANUAL_PAYMENT_REJECTED),
       new ButtonBuilder().setCustomId(`retrydelivery:${orderId}`).setLabel("Reenviar entrega").setStyle(ButtonStyle.Secondary).setDisabled(order.paymentState !== PAYMENT_STATE.PAID_DELIVERY_PENDING)
@@ -8133,7 +8495,7 @@ async function openCart(interaction) {
   const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, categoryId(interaction.guildId, "cartOpen") || undefined);
   const order = {
     id,
-    paymentFlowVersion: 2,
+    paymentFlowVersion: 3,
     guildId: interaction.guildId,
     panelId: panel.id,
     panelScopeId: panel.scopeId || "default",
@@ -8147,6 +8509,7 @@ async function openCart(interaction) {
     assignedAdminName: null,
     assignedAt: null,
     createdAt: new Date().toISOString(),
+    lastInteractionAt: new Date().toISOString(),
     closedAt: null
   };
   const db = readOrders(); db.orders[id] = order; writeOrders(db);
@@ -8203,6 +8566,7 @@ async function handleQuickOrderSubmit(interaction) {
   const ch = await privateChannel(interaction.guild, interaction.user, `carrinho-${safeName(interaction.user.username)}-aberto-${id}`, categoryId(interaction.guildId, "cartOpen") || undefined);
   const order = {
     id,
+    paymentFlowVersion: 3,
     guildId: interaction.guildId,
     panelId: panel.id,
     panelScopeId: panel.scopeId || "default",
@@ -8231,6 +8595,7 @@ async function handleQuickOrderSubmit(interaction) {
     assignedAdminName: null,
     assignedAt: null,
     createdAt: new Date().toISOString(),
+    lastInteractionAt: new Date().toISOString(),
     closedAt: null
   };
 
@@ -8951,7 +9316,7 @@ async function requestNewManualProof(context, id) {
   const reservedIds = await reserveAutomaticStockForOrder(order, panel, snapshot);
   if (reservedIds.length) order.stockReservedAt = new Date().toISOString();
   order.paymentState = PAYMENT_STATE.AWAITING_MANUAL_PAYMENT;
-  order.paymentExpiresAt = new Date(Date.now() + Math.max(1, Number(process.env.MANUAL_PIX_RESERVATION_MINUTES) || 30) * 60 * 1000).toISOString();
+  delete order.paymentExpiresAt;
   touchOrder(order);
   appendAuditLog(db, context, "order.new_proof_requested", { order });
   await persistPaymentOrder(db, order, panel);
@@ -9012,6 +9377,9 @@ async function processPaidPagBankOrder(payload, source = "pagbank_webhook") {
     console.warn(`PagBank ${source}: validacao de referencia, valor ou snapshot falhou no pedido ${order.id}.`);
     return { ok: false, reason: "validation_failed", orderFound: true, internalOrderId: order.id };
   }
+  if ([ORDER_STATUS.CANCELLED, ORDER_STATUS.CANCELED].includes(order.status) || order.paymentState === PAYMENT_STATE.CANCELED) {
+    return { ok: false, reason: "invalid_state", orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
+  }
   if (order.paymentState === PAYMENT_STATE.DELIVERED || order.automaticStockDeliveredAt) {
     return { ok: true, duplicate: true, orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
   }
@@ -9022,7 +9390,7 @@ async function processPaidPagBankOrder(payload, source = "pagbank_webhook") {
   if (alreadyPaid && Number(order.paymentSnapshot?.automaticUnits) <= 0) {
     return { ok: true, duplicate: true, orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
   }
-  if (!alreadyPaid && ![PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED, PAYMENT_STATE.CANCELED].includes(order.paymentState)) {
+  if (!alreadyPaid && ![PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED].includes(order.paymentState)) {
     return { ok: false, reason: "invalid_state", orderFound: true, internalOrderId: order.id, paymentState: order.paymentState };
   }
   if (!claimOrderActionLock(order)) return { ok: true, processing: true, orderFound: true, internalOrderId: order.id };
@@ -9031,7 +9399,7 @@ async function processPaidPagBankOrder(payload, source = "pagbank_webhook") {
       const locked = await withPostgresTransaction(async dbClient => {
         const result = await dbClient.query(`
           update orders set payment_state = 'PAID', pagbank_charge_id = $2, updated_at = now()
-          where id = $1 and payment_method = 'PAGBANK_PIX' and payment_state in ('AWAITING_PAGBANK_PAYMENT', 'EXPIRED', 'CANCELED')
+          where id = $1 and payment_method = 'PAGBANK_PIX' and payment_state in ('AWAITING_PAGBANK_PAYMENT', 'EXPIRED')
             and total_cents_snapshot = $3 and pagbank_reference_id = $4 and user_id = $5
           returning id
         `, [order.id, validation.chargeId || null, validation.amountCents, validation.referenceId, order.userId]);
@@ -9133,12 +9501,45 @@ async function reconcileMercadoPagoOrder(order, source = "mercadopago_reconcilia
   }
   return processApprovedMercadoPagoPayment(payment, source);
 }
+async function notifyAutomaticPaymentOnce(order, panel, paymentId) {
+  const key = `${order.id}:${String(paymentId || "")}`;
+  if (!paymentId || order.automaticPaymentNotificationKey === key) return { sent: false, duplicate: true };
+  if (!ntfyReady()) return { sent: false, reason: "not_configured" };
+  if (automaticNotificationLocks.has(key)) return { sent: false, processing: true };
+  automaticNotificationLocks.add(key);
+  try {
+    const result = await sendAutomaticPaymentNotification(orderNotificationInput(order, panel, {
+      idempotencyKey: `automatic:${key}`
+    }));
+    if (!result.sent) return result;
+    order.automaticPaymentNotificationKey = key;
+    const db = readOrders();
+    const current = db.orders?.[order.id];
+    if (current && current.automaticPaymentNotificationKey !== key) {
+      current.automaticPaymentNotificationKey = key;
+      touchOrder(current);
+      db.orders[current.id] = current;
+      await persistPaymentOrder(db, current, panel);
+    }
+    return result;
+  } catch (error) {
+    console.warn(`Falha ao enviar notificacao automatica do pedido #${order.id}: ${errorSummary(error).message}`);
+    return { sent: false, reason: "failed" };
+  } finally {
+    automaticNotificationLocks.delete(key);
+  }
+}
 async function processApprovedMercadoPagoPayment(payload, source = "mercadopago_webhook") {
   const db = readOrders();
   const order = Object.values(db.orders || {}).find(item => String(item.mercadoPagoPaymentId || "") === String(payload?.id || ""));
   if (!order || order.paymentMethod !== PAYMENT_METHOD.MERCADOPAGO_PIX) return { ok: false, reason: "order_not_found" };
   const validation = validateApprovedMercadoPagoPayment(order, payload);
   if (!validation.ok || !validStoredPaymentSnapshot(order)) return { ok: false, reason: "validation_failed", internalOrderId: order.id };
+  if ([ORDER_STATUS.CANCELLED, ORDER_STATUS.CANCELED].includes(order.status) || order.paymentState === PAYMENT_STATE.CANCELED) {
+    return { ok: false, reason: "invalid_state", internalOrderId: order.id, paymentState: order.paymentState };
+  }
+  const panel = getOrderPanel(order, order.guildId);
+  await notifyAutomaticPaymentOnce(order, panel, payload.id);
   const automaticUnits = Number(order.paymentSnapshot?.automaticUnits) || 0;
   if (order.paymentState === PAYMENT_STATE.DELIVERED || order.automaticStockDeliveredAt) {
     return { ok: true, duplicate: true, internalOrderId: order.id };
@@ -9158,12 +9559,11 @@ async function processApprovedMercadoPagoPayment(payload, source = "mercadopago_
   }
   const alreadyPaid = order.paymentState === PAYMENT_STATE.PAID;
   if (alreadyPaid && automaticUnits <= 0) return { ok: true, duplicate: true, internalOrderId: order.id };
-  if (!alreadyPaid && ![PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED, PAYMENT_STATE.CANCELED].includes(order.paymentState)) {
+  if (!alreadyPaid && ![PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT, PAYMENT_STATE.EXPIRED].includes(order.paymentState)) {
     return { ok: false, reason: "invalid_state", internalOrderId: order.id, paymentState: order.paymentState };
   }
   if (!claimOrderActionLock(order)) return { ok: true, processing: true, internalOrderId: order.id };
   try {
-    const panel = getOrderPanel(order, order.guildId);
     if (!alreadyPaid) {
       order.paymentState = PAYMENT_STATE.PAID;
       order.paymentStatus = "marked_paid";
@@ -9278,18 +9678,20 @@ async function markOrderPaid(context, id) {
   if ([PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod)) {
     return verifyAutomaticPayment(context, order);
   }
-  if (!isAdmin(context.member) && !isBotOwner(actionUser(context))) {
-    return actionReply(context, { content: "So ADM pode marcar pagamento manual.", ephemeral: true });
+  if (!authorizedManualPaymentStaff(context)) {
+    return actionReply(context, { content: "Somente dono, ADM ou atendente configurado pode confirmar pagamento manual.", ephemeral: true });
   }
   if (order.paymentFlowVersion >= 2 && !order.paymentMethod) {
     return actionReply(context, { content: "Gere o pagamento antes de aprovar.", ephemeral: true });
   }
-  if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && !await requireBotOwner(context)) return;
-  if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && !canApproveManualPayment(actionUser(context).id, order.userId, process.env.BOT_OWNER_IDS)) {
+  if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && actionUser(context).id === order.userId) {
     writeAuditLog(context, "security.self_payment_approval_denied", { orderId: order.id, targetUserId: order.userId });
     return actionReply(context, { content: "O comprador nao pode aprovar o proprio pagamento, mesmo sendo proprietario.", ephemeral: true });
   }
-  if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && ![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)) {
+  const manualApprovalStates = Number(order.paymentFlowVersion || 0) >= 3
+    ? [PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW]
+    : [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW];
+  if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && !manualApprovalStates.includes(order.paymentState)) {
     return actionReply(context, { content: `Este pagamento manual nao pode ser aprovado no estado ${paymentStatusLabel(order)}.`, ephemeral: true });
   }
   if (order.paymentStatus === "marked_paid" || order.paidAt) {
@@ -9311,10 +9713,10 @@ async function markOrderPaid(context, id) {
           const result = await dbClient.query(`
             update orders set payment_state = 'MANUAL_PAYMENT_APPROVED', updated_at = now()
             where id = $1 and payment_method = 'MANUAL_PIX'
-              and payment_state in ('AWAITING_MANUAL_PAYMENT', 'MANUAL_PAYMENT_UNDER_REVIEW')
+              and payment_state = any($4::text[])
               and total_cents_snapshot = $2 and user_id = $3
             returning id
-          `, [order.id, order.totalCentsSnapshot, order.userId]);
+          `, [order.id, order.totalCentsSnapshot, order.userId, manualApprovalStates]);
           return result.rowCount === 1;
         });
         if (!approved) return actionReply(context, { content: "Este pagamento ja foi aprovado, recusado ou processado por outra acao.", ephemeral: true });
@@ -9326,6 +9728,10 @@ async function markOrderPaid(context, id) {
     order.paidAt = now;
     order.paidByAdminId = actor.id;
     order.paidByAdminName = context.member?.displayName || actor.username;
+    if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX) {
+      order.manuallyApprovedBy = actor.id;
+      order.manuallyApprovedAt = now;
+    }
     order.paidAmount = order.totalCentsSnapshot ? order.totalCentsSnapshot / 100 : totals.amount;
     order.paidGrossAmount = order.paymentSnapshot?.grossCents ? order.paymentSnapshot.grossCents / 100 : totals.grossAmount;
     order.paidDiscountAmount = order.paymentSnapshot?.discountCents ? order.paymentSnapshot.discountCents / 100 : totals.discountAmount;
@@ -9470,7 +9876,7 @@ async function requestPaymentProof(interaction, id) {
     return actionReply(interaction, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
   }
   if (order.paymentMethod !== PAYMENT_METHOD.MANUAL_PIX) {
-    return actionReply(interaction, { content: "Comprovante manual so e aceito em pedidos abaixo de R$ 1,00 configurados como Pix manual.", ephemeral: true });
+    return actionReply(interaction, { content: "Este carrinho nao esta usando PIX manual.", ephemeral: true });
   }
   if (![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)) {
     return actionReply(interaction, { content: "Este pagamento manual nao esta aceitando comprovantes agora.", ephemeral: true });
@@ -9492,17 +9898,170 @@ async function requestPaymentProof(interaction, id) {
 
   if (interaction.user.id === targetUserId) {
     return actionReply(interaction, {
-      content: "Envie o print do comprovante aqui neste carrinho nos proximos 2 minutos.",
+      content: "Envie uma imagem ou um arquivo PDF do comprovante aqui neste carrinho nos proximos 2 minutos.",
       ephemeral: true
     });
   }
 
   await interaction.channel.send({
-    content: `<@${targetUserId}> envie o print do comprovante aqui neste carrinho nos proximos 2 minutos.`,
+    content: `<@${targetUserId}> envie uma imagem ou um arquivo PDF do comprovante aqui neste carrinho nos proximos 2 minutos.`,
     allowedMentions: { users: [targetUserId] }
   }).catch(() => null);
 
   return actionReply(interaction, { content: `Solicitei o comprovante para <@${targetUserId}>.`, ephemeral: true });
+}
+function authorizedManualPaymentStaff(context) {
+  const actor = actionUser(context);
+  return isAdmin(context.member) ||
+    isBotOwner(actor) ||
+    Boolean(getStaffProfile(actionGuildId(context), actor.id));
+}
+function orderNotificationInput(order, panel, extra = {}) {
+  const snapshotItems = Array.isArray(order.paymentSnapshot?.items) && order.paymentSnapshot.items.length
+    ? order.paymentSnapshot.items
+    : (order.items || []).map(item => {
+      const sourcePanel = getPanelById(order.guildId, item.sourcePanelId || order.panelId) || panel;
+      const sourceProduct = product(sourcePanel, item.sourceProductId || item.productId);
+      return {
+        name: sourceProduct?.name || item.name || "Produto",
+        quantity: Math.max(1, Number(item.quantity) || 1)
+      };
+    });
+  return {
+    products: snapshotItems.map(item => `${item.name || "Produto"} x${Math.max(1, Number(item.quantity) || 1)}`),
+    total: money((Number(order.totalCentsSnapshot) || Math.round(orderTotals(order, panel).amount * 100)) / 100),
+    customerName: order.username || "cliente",
+    customerId: order.userId,
+    orderId: order.id,
+    discordUrl: `https://discord.com/channels/${order.guildId}/${order.channelId}`,
+    ...extra
+  };
+}
+async function confirmManualPaymentNotification(context, id) {
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
+  }
+  const db = readOrders();
+  const order = orderForAction(db, id, context, false);
+  const actor = actionUser(context);
+  if (!order || order.status !== ORDER_STATUS.OPEN) {
+    return actionReply(context, { content: "Carrinho fechado ou inexistente.", ephemeral: true });
+  }
+  if (order.paymentMethod !== PAYMENT_METHOD.MANUAL_PIX) {
+    return actionReply(context, { content: "Este carrinho nao esta usando PIX manual.", ephemeral: true });
+  }
+  if (actor.id !== order.userId && !authorizedManualPaymentStaff(context)) {
+    return actionReply(context, { content: "Somente o cliente ou um atendente autorizado pode enviar esta confirmacao.", ephemeral: true });
+  }
+  if (![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)) {
+    return actionReply(context, { content: `Este pagamento nao aceita confirmacao no estado ${paymentStatusLabel(order)}.`, ephemeral: true });
+  }
+  if (order.manualPaymentNotificationSentAt) {
+    return actionReply(context, { content: "O comprovante deste carrinho ja foi enviado para analise.", ephemeral: true });
+  }
+  const remaining = manualNotificationRemaining(
+    db,
+    order.guildId,
+    actor.id,
+    Date.now(),
+    manualNotificationCooldownMs()
+  );
+  if (remaining > 0) {
+    return actionReply(context, {
+      content: `Voce ja enviou uma confirmacao recentemente. Aguarde ${Math.max(1, Math.ceil(remaining / 60_000))} minuto(s) e tente novamente.`,
+      ephemeral: true
+    });
+  }
+  if (!claimOrderActionLock(order)) {
+    return actionReply(context, { content: "Outra confirmacao deste carrinho esta sendo processada.", ephemeral: true });
+  }
+  try {
+    const recentMessages = await context.channel.messages.fetch({ limit: 100 }).catch(() => null);
+    const latest = findLatestProofAttachment(recentMessages || [], order.userId, { maxBytes: proofMaxBytes() });
+    if (!latest) {
+      return actionReply(context, {
+        content: "Envie uma imagem ou um arquivo PDF do comprovante antes de confirmar o pagamento.",
+        ephemeral: true
+      });
+    }
+    let proof;
+    try {
+      proof = await downloadAndValidateProof(latest.attachment, { maxBytes: proofMaxBytes() });
+    } catch (error) {
+      return actionReply(context, {
+        content: error.message || "Nao foi possivel validar o comprovante mais recente.",
+        ephemeral: true
+      });
+    }
+    const panel = getOrderPanel(order, order.guildId);
+    const now = new Date().toISOString();
+    const savedProof = {
+      url: latest.attachment.url,
+      proxyUrl: latest.attachment.proxyURL || latest.attachment.proxyUrl || "",
+      name: latest.attachment.name || safeProofFilename(order.id, proof),
+      contentType: proof.contentType,
+      kind: proof.kind,
+      extension: proof.extension,
+      size: proof.size,
+      messageId: latest.message.id,
+      submittedAt: now,
+      submittedById: order.userId,
+      requestedById: actor.id
+    };
+    if (!Array.isArray(order.paymentProofs)) order.paymentProofs = [];
+    if (!order.paymentProofs.some(item => item.messageId === savedProof.messageId && item.url === savedProof.url)) {
+      order.paymentProofs.push(savedProof);
+    }
+    order.paymentProofSubmittedAt = now;
+    order.paymentProofLatestUrl = savedProof.url;
+    order.paymentState = PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW;
+    order.paymentStatus = "proof_received";
+    touchOrder(order);
+    db.orders[order.id] = order;
+    writeOrders(db);
+    await persistOrderRelationalAsync(db, order, panel);
+    await refreshCartMessage(context.guild, order, panel, context.channel);
+    try {
+      const notification = await sendManualProofNotification(orderNotificationInput(order, panel, {
+        idempotencyKey: `manual:${order.id}`,
+        attachment: {
+          buffer: proof.buffer,
+          contentType: proof.contentType,
+          filename: safeProofFilename(order.id, proof)
+        }
+      }));
+      if (!notification.sent) {
+        return actionReply(context, {
+          content: "O comprovante foi salvo para analise, mas o ntfy ainda nao esta configurado. Um ADM pode aprovar ou tentar o aviso novamente.",
+          ephemeral: true
+        });
+      }
+    } catch (error) {
+      console.warn(`Falha ao encaminhar comprovante do pedido #${order.id} ao ntfy: ${errorSummary(error).message}`);
+      return actionReply(context, {
+        content: "O comprovante foi salvo para analise, mas nao consegui avisar o responsavel agora. Um ADM pode aprovar ou tentar novamente.",
+        ephemeral: true
+      });
+    }
+    order.manualPaymentNotificationSentAt = now;
+    order.manualPaymentNotificationSentBy = actor.id;
+    recordManualNotification(db, order.guildId, actor.id, new Date(now));
+    touchOrder(order);
+    db.orders[order.id] = order;
+    writeOrders(db);
+    await persistOrderRelationalAsync(db, order, panel);
+    await refreshCartMessage(context.guild, order, panel, context.channel);
+    await context.channel.send({
+      content: `<@${order.userId}> seu comprovante foi enviado para analise. Aguarde a confirmacao do responsavel.`,
+      allowedMentions: { users: [order.userId] }
+    }).catch(() => null);
+    return actionReply(context, {
+      content: "Seu comprovante foi enviado para analise. Aguarde a confirmacao do responsavel.",
+      ephemeral: true
+    });
+  } finally {
+    releaseOrderActionLock(order);
+  }
 }
 async function cancelCart(interaction, id) {
   if (interaction.isRepliable?.() && !interaction.deferred && !interaction.replied) {
@@ -9763,7 +10322,8 @@ async function setupTicket(interaction) {
 async function openTicket(interaction) {
   const id = orderId("ticket");
   const ch = await privateChannel(interaction.guild, interaction.user, `ticket-${safeName(interaction.user.username)}-aberto-${id}`, categoryId(interaction.guildId, "ticketOpen") || categoryId(interaction.guildId, "cartOpen") || undefined);
-  const db = readOrders(); db.tickets[id] = { id, status: "open", userId: interaction.user.id, username: interaction.user.username, channelId: ch.id, createdAt: new Date().toISOString(), closedAt: null }; writeOrders(db);
+  const now = new Date().toISOString();
+  const db = readOrders(); db.tickets[id] = { id, status: "open", guildId: interaction.guildId, userId: interaction.user.id, username: interaction.user.username, channelId: ch.id, createdAt: now, lastInteractionAt: now, closedAt: null }; writeOrders(db);
   const embed = new EmbedBuilder().setTitle(`🎫 Ticket #${id}`).setDescription(config.messages.ticketWelcome).setColor(0x2b2d31).addFields({ name: "Cliente", value: `<@${interaction.user.id}>`, inline: true });
   const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`tcall:${id}`).setLabel("Chamar ADM").setEmoji("📣").setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(`tclose:${id}`).setLabel("Fechar ticket").setEmoji("🔒").setStyle(ButtonStyle.Danger));
   await ch.send({ content: `<@${interaction.user.id}>`, embeds: [embed], components: [row] });
@@ -9789,13 +10349,23 @@ async function handlePaymentProofUpload(message) {
     return false;
   }
 
-  const attachment = message.attachments.find(isImageAttachment);
-  if (!attachment) {
-    if (message.attachments.size) {
-      await message.reply("Recebi um anexo, mas ele nao parece ser imagem. Envie PNG, JPG, WEBP ou GIF.").catch(() => null);
-      return true;
-    }
-    return false;
+  const attachments = [...message.attachments.values()];
+  if (!attachments.length) return false;
+  const candidate = attachments
+    .map(attachment => ({ attachment, validation: validateProofMetadata(attachment, { maxBytes: proofMaxBytes() }) }))
+    .find(item => item.validation.ok);
+  if (!candidate) {
+    const firstFailure = validateProofMetadata(attachments[0], { maxBytes: proofMaxBytes() });
+    await message.reply(firstFailure.message).catch(() => null);
+    return true;
+  }
+  const attachment = candidate.attachment;
+  let validatedProof;
+  try {
+    validatedProof = await downloadAndValidateProof(attachment, { maxBytes: proofMaxBytes() });
+  } catch (error) {
+    await message.reply(error.message || "Nao foi possivel validar o comprovante enviado.").catch(() => null);
+    return true;
   }
 
   const db = readOrders();
@@ -9831,8 +10401,10 @@ async function handlePaymentProofUpload(message) {
     url: attachment.url,
     proxyUrl: attachment.proxyURL || attachment.proxyUrl || "",
     name: attachment.name || "comprovante",
-    contentType: attachment.contentType || "",
-    size: attachment.size || 0,
+    contentType: validatedProof.contentType,
+    kind: validatedProof.kind,
+    extension: validatedProof.extension,
+    size: validatedProof.size,
     messageId: message.id,
     submittedAt: now,
     submittedById: message.author.id,
@@ -9842,8 +10414,12 @@ async function handlePaymentProofUpload(message) {
   order.paymentProofs.push(proof);
   order.paymentProofSubmittedAt = now;
   order.paymentProofLatestUrl = attachment.url;
-  order.paymentState = PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW;
-  if (!order.paymentStatus || order.paymentStatus === "pending") order.paymentStatus = "proof_received";
+  if (Number(order.paymentFlowVersion || 0) < 3 || order.manualPaymentNotificationSentAt) {
+    order.paymentState = PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW;
+  }
+  if (!order.paymentStatus || ["pending", "proof_uploaded"].includes(order.paymentStatus)) {
+    order.paymentStatus = order.manualPaymentNotificationSentAt ? "proof_received" : "proof_uploaded";
+  }
   touchOrder(order);
   appendAuditLog(db, message, "order.payment_proof_uploaded", {
     order,
@@ -9856,11 +10432,12 @@ async function handlePaymentProofUpload(message) {
   await persistOrderRelationalAsync(db, order, panel);
   paymentProofUploads.delete(key);
 
-  const staffRoleId = adminRoleId(message.guild.id);
   await refreshCartMessage(message.guild, order, panel, message.channel);
   await message.reply({
-    content: `Comprovante recebido e salvo. ${staffRoleId ? `<@&${staffRoleId}> ` : ""}A equipe vai conferir o pedido #${order.id}.`,
-    allowedMentions: { roles: staffRoleId ? [staffRoleId] : [] }
+    content: Number(order.paymentFlowVersion || 0) >= 3 && !order.manualPaymentNotificationSentAt
+      ? `Comprovante valido recebido. Agora clique em **Ja fiz o pagamento** para avisar o responsavel pelo pedido #${order.id}.`
+      : `Comprovante recebido e salvo. A equipe vai conferir o pedido #${order.id}.`,
+    allowedMentions: { parse: [] }
   }).catch(() => null);
   return true;
 }
@@ -10058,6 +10635,11 @@ client.once("clientReady", async () => {
   if (recoveredProcessing) console.log(`${recoveredProcessing} carrinho(s) preso(s) em processing foram reabertos automaticamente.`);
   for (const guild of client.guilds.cache.values()) {
     if (!instanceConfig.acceptsGuild(guild.id)) continue;
+    const backfilled = await backfillLegacyActivity(guild).catch(error => {
+      console.warn(`Nao consegui recuperar atividade antiga em ${guild.id}: ${errorSummary(error).message}`);
+      return 0;
+    });
+    if (backfilled) console.log(`${backfilled} carrinho(s)/ticket(s) tiveram a atividade antiga recuperada.`);
     await ensureStaffState(guild, null).catch(error => {
       console.log(`Nao consegui recuperar atendimento em ${guild.id}: ${error.message}`);
     });
@@ -10077,11 +10659,17 @@ client.once("clientReady", async () => {
     }
   }
   scheduleExistingClosedCarts();
+  const db = readOrders();
+  Object.values(db.tickets || {}).forEach(scheduleInactiveTicketDeletion);
+  await sweepInactiveCarts().catch(error => console.error("Falha na verificacao inicial de inatividade:", errorSummary(error)));
 });
 
 client.on("messageCreate", async message => {
   if (message.author.bot || !message.guild) return;
   if (!instanceConfig.acceptsGuild(message.guild.id)) return;
+  await recordHumanActivity(message.guild.id, message.channel.id, message.createdAt).catch(error => {
+    console.warn(`Nao consegui salvar atividade humana no canal ${message.channel.id}: ${errorSummary(error).message}`);
+  });
   if (await handlePaymentProofUpload(message)) return;
   if (await handlePendingImageUpload(message)) return;
   const rawContent = message.content.trim();
@@ -10311,6 +10899,10 @@ async function handleInteraction(interaction) {
       }
       return;
     }
+    if (interaction.guildId && interaction.channelId && interaction.user && !interaction.user.bot) {
+      recordHumanActivity(interaction.guildId, interaction.channelId, new Date(interaction.createdTimestamp || Date.now()))
+        .catch(error => console.warn(`Nao consegui salvar atividade da interacao em ${interaction.channelId}: ${errorSummary(error).message}`));
+    }
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "help") return sendHelpCommand(interaction);
       if (interaction.commandName === "configds") {
@@ -10430,11 +11022,14 @@ async function handleInteraction(interaction) {
       if (interaction.customId === "openticket") return openTicket(interaction);
       const [act, id] = interaction.customId.split(":");
       if (act === "addproduct") return startAddCartFlow(interaction);
-      if (act === "pay") return startOrderPayment(interaction, id);
+      if (act === "pay") return showPaymentMethodChoice(interaction, id);
+      if (act === "payauto") return selectPaymentMethod(interaction, id, "automatic");
+      if (act === "paymanual") return selectPaymentMethod(interaction, id, "manual");
       if (act === "call") return callAdmin(interaction, id, "order");
       if (act === "view") return viewCart(interaction, id);
       if (act === "paid") return markOrderPaid(interaction, id);
       if (act === "proof") return requestPaymentProof(interaction, id);
+      if (act === "manualconfirm") return confirmManualPaymentNotification(interaction, id);
       if (act === "deliver") return requestDelivery(interaction, id);
       if (act === "finish") return finishCart(interaction, id);
       if (act === "cancel") return cancelCart(interaction, id);
@@ -10496,6 +11091,9 @@ function shutdown(signal) {
   clearInterval(ephemeralCleanupTimer);
   clearInterval(paymentExpiryTimer);
   clearInterval(mercadoPagoReconcileTimer);
+  clearInterval(inactivitySweepTimer);
+  for (const timer of cartDeleteTimers.values()) clearTimeout(timer);
+  for (const timer of ticketDeleteTimers.values()) clearTimeout(timer);
   oauthHttp?.server?.close?.(() => null);
   drainPersistentWriteQueues()
     .finally(() => closePostgresPool())

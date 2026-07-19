@@ -1,6 +1,6 @@
 # Dragon Store - Bot de vendas para Discord
 
-Versao atual: **2.6.0**. Esta versao adiciona painel privado de faturamento real, pedidos identificados vindos do site e a vitrine separada da Sávio Store. Consulte `docs/RELEASE-2.6.0.md`.
+Versao atual: **3.0.0**.
 
 Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pelo Discord, carrinho privado, atendimento manual por ADM, Pix individual por atendente, tickets e caixa surpresa de brindes digitais.
 
@@ -25,6 +25,10 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - `/setup-loja` e `!setup-loja` para criar apenas cargos/canais ausentes, sem substituir a loja configurada.
 - `/backup` e `/restaurar` para clonar estrutura, permissoes, visual, paineis e catalogo em outra instalacao.
 - Pix, QR Code e mensagem extra por atendente.
+- Escolha explicita entre PIX automatico e PIX manual; o automatico fica disponivel a partir de R$ 1,00.
+- Comprovante manual validado por MIME, extensao, tamanho e conteudo real em PNG, JPG, JPEG, WEBP ou PDF.
+- Notificacao no celular via ntfy para pagamento Mercado Pago aprovado e comprovante manual recebido.
+- Carrinhos manuais e tickets encerrados depois de 16 horas sem atividade humana, inclusive apos reinicio.
 - Assumir compra, reenviar Pix e finalizar compra.
 - DM segura para cliente na abertura do carrinho e na finalizacao.
 - Caixa surpresa de brindes digitais com pesos/chances, sorteada somente ao finalizar a compra.
@@ -72,6 +76,19 @@ PUBLIC_STORE_MESSAGE_ID=id_da_mensagem_do_painel_publicado
 PUBLIC_STORE_SCAN_CHANNELS=true
 PUBLIC_STORE_SCAN_CHANNEL_LIMIT=80
 PUBLIC_STORE_SCAN_MESSAGE_LIMIT=75
+MANUAL_PIX_KEY=chave_pix_da_loja
+MANUAL_PIX_KEY_TYPE=tipo_da_chave
+MANUAL_PIX_RECEIVER=nome_do_recebedor
+MANUAL_PIX_QR_IMAGE_URL=https://url-publica-do-qr-code
+NTFY_URL=https://ntfy.sh
+NTFY_TOPIC=topico_privado_e_dificil
+# opcional se o topico exigir autenticacao
+NTFY_TOKEN=
+PAYMENT_PROOF_MAX_BYTES=8388608
+MANUAL_NOTIFICATION_COOLDOWN_SECONDS=300
+CART_INACTIVITY_HOURS=16
+CART_INACTIVITY_SWEEP_SECONDS=300
+INACTIVE_CART_DELETE_SECONDS=10
 ```
 
 Para operar uma segunda loja sem misturar pedidos, Pix ou pagamentos, use outra instancia do bot. O passo a passo esta em [docs/SECOND-STORE-SETUP.md](docs/SECOND-STORE-SETUP.md).
@@ -329,23 +346,38 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 ## Fluxo de atendimento
 
 1. Um ADM usa `/setup-atendimento` no canal da equipe.
-2. Um usuario listado em `BOT_OWNER_IDS` usa `!configpix`, `/configpix` ou **Configurar meu Pix**.
+2. Um usuario listado em `BOT_OWNER_IDS` usa `!configpix`, `/configpix` ou **Configurar meu Pix**, ou a loja define o PIX manual nas variaveis de ambiente.
 3. O proprietario salva recebedor, chave, tipo, cidade, QR Code opcional e mensagem extra.
 4. O ADM clica em **Ficar ON** quando puder receber vendas.
 5. Se houver um unico ADM ON, o bot assume a compra automaticamente para ele.
 6. Se houver dois ou mais ADMs ON, o primeiro que clicar em **Assumir compra** fica responsavel.
-7. O cliente ou ADM usa **Gerar pagamento**. O Pix sempre aparece no ticket privado; a DM e apenas uma copia adicional.
+7. O cliente usa **Gerar pagamento** e escolhe PIX automatico ou manual. O Pix sempre aparece no ticket privado; a DM e apenas uma copia adicional.
 
 ## Pagamentos Pix
 
 O total e recalculado usando os produtos salvos no servidor e congelado no momento em que **Gerar pagamento** e usado. IDs, precos ou metodo enviados pelo cliente nao sao aceitos como fonte do valor.
 
-- De `R$ 0,01` a `R$ 0,99`: Pix manual existente. O comprovante fica em analise ate um usuario de `BOT_OWNER_IDS` aprovar ou recusar.
-- A partir de `R$ 1,00`: QR Code Pix da API Order do PagBank, com validade de 15 minutos.
-- A criacao do QR Code nao marca pagamento. Somente `POST /webhooks/pagbank`, com assinatura valida e cobranca `PAID` via `PIX`, confirma o pedido.
-- Pagamentos e reservas expirados sao recuperados por varredura persistente; o fluxo nao depende apenas de `setTimeout`.
+- O cliente escolhe entre **PIX Automatico** e **PIX Manual**.
+- Abaixo de `R$ 1,00`, somente o PIX manual fica habilitado.
+- No automatico, o bot solicita os dados privados exigidos pelo provedor, cria o QR Code e so aprova depois da confirmacao oficial.
+- No manual, nao existe prazo curto: o carrinho permanece aberto ate pagamento, cancelamento ou 16 horas sem interacao humana.
+- O cliente pode enviar PNG, JPG, JPEG, WEBP ou PDF e clicar em **Ja fiz o pagamento**. Isso avisa o responsavel pelo ntfy, mas nao aprova a compra.
+- Cada carrinho envia uma notificacao manual; cada usuario possui intervalo persistente de 5 minutos.
+- Dono, ADM ou atendente configurado confirma o pagamento manual. A operacao continua protegida contra clique concorrente e entrega duplicada.
+- A falha do ntfy nao apaga o comprovante nem aprova o pedido; um atendente pode repetir a notificacao.
+- Pagamentos automaticos e reservas expiradas sao recuperados por varredura persistente; o fluxo nao depende apenas de `setTimeout`.
 
-No Render, configure `PAGBANK_TOKEN`, `PAGBANK_ENV`, `PAGBANK_WEBHOOK_URL`, `BOT_OWNER_IDS`, `DATABASE_URL` e `STOCK_ENCRYPTION_KEY`. Em sandbox, use `PAGBANK_ENV=sandbox`; em producao, use `production`.
+Para Mercado Pago, configure `PAYMENT_PROVIDER=mercadopago`, `MERCADOPAGO_ACCESS_TOKEN`, `MERCADOPAGO_WEBHOOK_URL`, `DATABASE_URL` e `STOCK_ENCRYPTION_KEY`. Para PagBank, use `PAYMENT_PROVIDER=pagbank`, `PAGBANK_TOKEN`, `PAGBANK_ENV` e `PAGBANK_WEBHOOK_URL`.
+
+## Notificacoes ntfy
+
+1. Instale o aplicativo ntfy no celular.
+2. Escolha um topico privado e dificil de adivinhar.
+3. Configure `NTFY_URL=https://ntfy.sh` e `NTFY_TOPIC=seu_topico`.
+4. Se o topico for protegido, configure tambem `NTFY_TOKEN`.
+5. Reinicie o bot e teste um comprovante manual. A notificacao deve abrir o carrinho correto pelo link do Discord.
+
+O bot nao envia CPF, tokens, chaves PIX ou credenciais ao ntfy. O comprovante e baixado para validacao e encaminhado por arquivo temporario, removido mesmo se o envio falhar.
 
 ## Estoque secreto
 
@@ -469,8 +501,11 @@ A recuperacao pelo Discord preserva titulo, descricao, cor, banner, thumbnail, n
 5. Clique em **Editar compra**, confira as perguntas, publique a mensagem e teste o botao **Comprar**.
 6. Use **Remover produto**, selecione mais de um item e confirme a remocao.
 7. Use `/setup-atendimento`, configure Pix com `/configpix` e fique ON.
-8. Abra outro carrinho e confirme se o Pix vai automaticamente quando houver um unico ADM ON.
-9. Clique em **Enviar comprovante**, envie uma imagem como cliente e confirme que o carrinho mostra `Comprovante recebido` antes do ADM marcar pago.
-10. Use **Marcar pago** e depois **Entregar produto** ou `/entregar`; confira se o checklist muda para pagamento recebido e produto entregue antes da finalizacao.
-9. Adicione uma caixa surpresa, compre e finalize como ADM para verificar o sorteio.
-10. Use `/status-loja` no canal desejado para conferir o resumo daquele painel.
+8. Abra outro carrinho, confira a atribuicao automatica quando houver um unico ADM ON e escolha a forma de pagamento.
+9. Escolha PIX manual, clique em **Enviar comprovante**, envie imagem ou PDF e use **Ja fiz o pagamento**.
+10. Confirme a notificacao no ntfy e aprove o pagamento como ADM.
+11. Teste um arquivo renomeado para `.pdf`, um arquivo acima do limite e um anexo enviado por outra pessoa.
+12. Escolha PIX automatico em pedido de pelo menos R$ 1,00 e confirme que a entrega depende da API oficial.
+13. Use **Marcar pago** e depois **Entregar produto** ou `/entregar`; confira os estados antes da finalizacao.
+14. Adicione uma caixa surpresa, compre e finalize como ADM para verificar o sorteio.
+15. Use `/status-loja` no canal desejado para conferir o resumo daquele painel.

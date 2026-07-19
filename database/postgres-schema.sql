@@ -87,6 +87,12 @@ create table if not exists orders (
   pagbank_reference_id text,
   pagbank_charge_id text,
   payment_expires_at timestamptz,
+  last_interaction_at timestamptz,
+  manual_payment_notification_sent_at timestamptz,
+  manual_payment_notification_sent_by text,
+  automatic_payment_notification_key text,
+  manually_approved_by text,
+  manually_approved_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -109,7 +115,17 @@ alter table if exists orders add column if not exists pagbank_order_id text;
 alter table if exists orders add column if not exists pagbank_reference_id text;
 alter table if exists orders add column if not exists pagbank_charge_id text;
 alter table if exists orders add column if not exists payment_expires_at timestamptz;
+alter table if exists orders add column if not exists last_interaction_at timestamptz;
+alter table if exists orders add column if not exists manual_payment_notification_sent_at timestamptz;
+alter table if exists orders add column if not exists manual_payment_notification_sent_by text;
+alter table if exists orders add column if not exists automatic_payment_notification_key text;
+alter table if exists orders add column if not exists manually_approved_by text;
+alter table if exists orders add column if not exists manually_approved_at timestamptz;
 create index if not exists idx_orders_pagbank_reference on orders(pagbank_reference_id) where pagbank_reference_id is not null;
+create index if not exists idx_orders_open_last_interaction on orders(last_interaction_at) where status = 'open';
+create unique index if not exists idx_orders_automatic_notification_key
+  on orders(automatic_payment_notification_key)
+  where automatic_payment_notification_key is not null;
 
 create table if not exists order_items (
   id bigserial primary key,
