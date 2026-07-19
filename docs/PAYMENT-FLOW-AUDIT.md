@@ -25,6 +25,9 @@ auditoria existente nao foi reformulado, expandido ou substituido.
   explicitas. O automatico fica indisponivel abaixo de R$ 1,00.
 - **Falha do ntfy podia deixar o operador sem contexto.** O comprovante continua
   no Discord, o carrinho nao e aprovado e um atendente pode repetir o envio.
+- **Notificacao manual usava prioridade nao aceita pelo ntfy.** Corrigido para
+  prioridade `max`; o endpoint agora aceita tanto URL completa quanto
+  `NTFY_URL` + `NTFY_TOPIC` e possui `/testntfy`.
 
 ## Medio
 
@@ -34,6 +37,10 @@ auditoria existente nao foi reformulado, expandido ou substituido.
 - **Reenvios podiam gerar notificacoes repetidas.** Corrigido com estado
   persistente por carrinho, cooldown por usuario e chave separada para Mercado
   Pago.
+- **O carrinho principal concentrava acoes demais.** Corrigido: confirmacao de
+  comprovante fica abaixo do Pix e acoes raras/duplicadas sairam do painel.
+- **Remover o botao de reenvio podia bloquear entrega pendente.** Corrigido:
+  o botao **Entregar** reutiliza a mesma reserva quando precisa tentar de novo.
 - **Registro legado sem `guildId` ou atividade podia ficar preso.** Corrigido
   com migracao em memoria e busca limitada das mensagens humanas mais recentes.
 - **Um registro defeituoso podia interromper uma rodada de limpeza.** Corrigido
@@ -45,6 +52,18 @@ auditoria existente nao foi reformulado, expandido ou substituido.
   imagem ou PDF e apresentam formatos/limite quando a validacao falha.
 - Botoes manuais permaneciam disponiveis fora de ordem. Agora refletem o estado
   do pedido e ficam desabilitados depois da notificacao.
+
+## Testes automatizados
+
+- PNG, JPEG, WEBP e PDF validos.
+- Extensao/MIME divergentes, PDF falso e arquivo ausente.
+- Imagem e PDF acima do limite, inclusive download maior que o anunciado.
+- Anexo de terceiro ignorado e comprovante mais recente do cliente selecionado,
+  inclusive quando o mais novo e invalido e existe um arquivo antigo valido.
+- Falha no download, falha no ntfy e limpeza do arquivo temporario nos dois casos.
+- Estados inicial, recusado/substituicao, enviado, cancelado e pagamento automatico.
+- Separacao entre os controles do carrinho e o botao de confirmacao abaixo do Pix.
+- Envio real de texto ao `ntfy.sh`, com HTTP 200 e mensagem recuperada no topico.
 
 ## Recomendacoes
 

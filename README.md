@@ -29,7 +29,7 @@ Bot em Node.js com `discord.js v14` para loja digital com painel configuravel pe
 - Comprovante manual validado por MIME, extensao, tamanho e conteudo real em PNG, JPG, JPEG, WEBP ou PDF.
 - Notificacao no celular via ntfy para pagamento Mercado Pago aprovado e comprovante manual recebido.
 - Carrinhos manuais e tickets encerrados depois de 16 horas sem atividade humana, inclusive apos reinicio.
-- Assumir compra, reenviar Pix e finalizar compra.
+- Carrinho compacto com adicionar produto, gerar/reenviar Pix, aprovar, entregar, finalizar e cancelar.
 - DM segura para cliente na abertura do carrinho e na finalizacao.
 - Caixa surpresa de brindes digitais com pesos/chances, sorteada somente ao finalizar a compra.
 - Ticket de suporte privado.
@@ -229,7 +229,7 @@ Em runtime, quando o Postgres esta ativo, o bot:
 - grava snapshot dos JSONs em `bot_json_store`;
 - espelha paineis, produtos, carrinhos, itens, staff, gastos, vendas e audit logs nas tabelas relacionais;
 - usa trava local e banco como trava na finalizacao: apenas uma chamada consegue fazer `open -> processing`; se outro ADM clicar de novo, o bot nao sorteia caixa, nao soma gasto e nao duplica venda.
-- registra pagamento manual em `payments` quando o ADM usa **Marcar pago** ou `/pago`; o botao **Enviar comprovante** salva o anexo no pedido e no Postgres como `proof_received` ate um ADM validar o pagamento.
+- registra pagamento manual em `payments` quando o ADM usa **Marcar pago** ou `/pago`; o cliente envia a imagem/PDF diretamente no carrinho e confirma no botao abaixo do Pix, salvando o anexo como `proof_received` ate um ADM validar o pagamento.
 - separa entrega de finalizacao: **Entregar produto**, `/entregar` ou `!entregar` salva a entrega no pedido, manda para o cliente e registra `delivered_at` no Postgres; finalizar direto ainda marca entrega automaticamente para manter o fluxo antigo funcionando.
 - gera transcript TXT com resumo do pedido e mensagens recentes do carrinho ao finalizar/cancelar, anexando nos canais de conclusao/cancelamento quando configurados.
 - controla estoque simples quando o campo `Estoque` e numerico: bloqueia compra sem quantidade suficiente e baixa estoque uma unica vez na finalizacao. Valores como `infinito`, `sob consulta` e `sob demanda` nao sao decrementados.
@@ -350,7 +350,7 @@ O banner usado nessa mensagem e o mesmo do painel principal; use **Enviar imagem
 3. O proprietario salva recebedor, chave, tipo, cidade, QR Code opcional e mensagem extra.
 4. O ADM clica em **Ficar ON** quando puder receber vendas.
 5. Se houver um unico ADM ON, o bot assume a compra automaticamente para ele.
-6. Se houver dois ou mais ADMs ON, o primeiro que clicar em **Assumir compra** fica responsavel.
+6. Se houver dois ou mais ADMs ON, `!pix` atribui o atendimento ao primeiro ADM que agir no carrinho.
 7. O cliente usa **Gerar pagamento** e escolhe PIX automatico ou manual. O Pix sempre aparece no ticket privado; a DM e apenas uma copia adicional.
 
 ## Pagamentos Pix
@@ -361,7 +361,7 @@ O total e recalculado usando os produtos salvos no servidor e congelado no momen
 - Abaixo de `R$ 1,00`, somente o PIX manual fica habilitado.
 - No automatico, o bot solicita os dados privados exigidos pelo provedor, cria o QR Code e so aprova depois da confirmacao oficial.
 - No manual, nao existe prazo curto: o carrinho permanece aberto ate pagamento, cancelamento ou 16 horas sem interacao humana.
-- O cliente pode enviar PNG, JPG, JPEG, WEBP ou PDF e clicar em **Ja fiz o pagamento**. Isso avisa o responsavel pelo ntfy, mas nao aprova a compra.
+- O cliente envia PNG, JPG, JPEG, WEBP ou PDF diretamente no carrinho e clica em **Ja fiz o pagamento**, abaixo da mensagem do Pix. Isso avisa o responsavel pelo ntfy, mas nao aprova a compra.
 - Cada carrinho envia uma notificacao manual; cada usuario possui intervalo persistente de 5 minutos.
 - Dono, ADM ou atendente configurado confirma o pagamento manual. A operacao continua protegida contra clique concorrente e entrega duplicada.
 - A falha do ntfy nao apaga o comprovante nem aprova o pedido; um atendente pode repetir a notificacao.
@@ -373,11 +373,11 @@ Para Mercado Pago, configure `PAYMENT_PROVIDER=mercadopago`, `MERCADOPAGO_ACCESS
 
 1. Instale o aplicativo ntfy no celular.
 2. Escolha um topico privado e dificil de adivinhar.
-3. Configure `NTFY_URL=https://ntfy.sh` e `NTFY_TOPIC=seu_topico`.
+3. Configure `NTFY_TOPIC=https://ntfy.sh/seu_topico`. Como alternativa, use `NTFY_URL=https://ntfy.sh` e `NTFY_TOPIC=seu_topico`.
 4. Se o topico for protegido, configure tambem `NTFY_TOKEN`.
-5. Reinicie o bot e teste um comprovante manual. A notificacao deve abrir o carrinho correto pelo link do Discord.
+5. Reinicie o bot e rode `/testntfy` ou `!testntfy`. Depois teste um comprovante manual; a notificacao deve abrir o carrinho correto pelo link do Discord.
 
-O bot nao envia CPF, tokens, chaves PIX ou credenciais ao ntfy. O comprovante e baixado para validacao e encaminhado por arquivo temporario, removido mesmo se o envio falhar.
+O teste simples equivale a `curl -d "teste" https://ntfy.sh/seu_topico`. Para comprovantes, o bot usa o upload binario do ntfy para preservar PNG, JPEG, WEBP ou PDF. Ele nao envia CPF, tokens, chaves PIX ou credenciais; o arquivo temporario e removido mesmo se o envio falhar.
 
 ## Estoque secreto
 
@@ -502,7 +502,7 @@ A recuperacao pelo Discord preserva titulo, descricao, cor, banner, thumbnail, n
 6. Use **Remover produto**, selecione mais de um item e confirme a remocao.
 7. Use `/setup-atendimento`, configure Pix com `/configpix` e fique ON.
 8. Abra outro carrinho, confira a atribuicao automatica quando houver um unico ADM ON e escolha a forma de pagamento.
-9. Escolha PIX manual, clique em **Enviar comprovante**, envie imagem ou PDF e use **Ja fiz o pagamento**.
+9. Escolha PIX manual, envie imagem ou PDF no carrinho e use **Ja fiz o pagamento** abaixo da mensagem do Pix.
 10. Confirme a notificacao no ntfy e aprove o pagamento como ADM.
 11. Teste um arquivo renomeado para `.pdf`, um arquivo acima do limite e um anexo enviado por outra pessoa.
 12. Escolha PIX automatico em pedido de pelo menos R$ 1,00 e confirme que a entrega depende da API oficial.

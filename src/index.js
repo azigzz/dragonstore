@@ -27,13 +27,15 @@ const {
 const {
   ntfyReady,
   sendAutomaticPaymentNotification,
-  sendManualProofNotification
+  sendManualProofNotification,
+  sendNtfyTestNotification
 } = require("./services/notificationService");
 const {
   inactivityMs,
   initializeActivity,
   isInactive,
   isManualInactivityCandidate,
+  manualPaymentConfirmationMode,
   manualNotificationCooldownMs,
   manualNotificationRemaining,
   markHumanActivity,
@@ -2216,33 +2218,29 @@ async function resendPix(interaction, id) {
   const panel = getOrderPanel(order, actionGuildId(interaction));
   if ([PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod) && (order.pagBankPixCopyPaste || order.mercadoPagoPixCopyPaste)) {
     const paymentPayload = await buildPagBankPaymentPayload(order, panel);
+    const provider = order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX ? "Mercado Pago" : "PagBank";
     appendAuditLog(db, interaction, "order.pix_resent", { order, paymentMethod: PAYMENT_METHOD.PAGBANK_PIX });
     writeOrders(db);
-    await interaction.channel.send({ content: `<@${order.userId}> Pix PagBank reenviado no carrinho.`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
+    await interaction.channel.send({ content: `<@${order.userId}> Pix ${provider} reenviado no carrinho.`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
     await sendSafeDM(order.userId, paymentPayload);
-    return actionReply(interaction, { content: "Pix PagBank reenviado no carrinho.", ephemeral: true });
-  }
-
-  if (!order.assignedAdminId) {
-    return actionReply(interaction, { content: "Essa compra ainda não foi assumida. Clique em **Assumir compra** primeiro.", ephemeral: true });
+    return actionReply(interaction, { content: `Pix ${provider} reenviado no carrinho.`, ephemeral: true });
   }
 
   await ensureStaffState(interaction.guild, interaction.channel);
-  const profile = getStaffProfile(interaction.guildId, order.assignedAdminId);
+  const profile = manualPaymentProfile(order);
   if (!profile?.pixKey) {
-    return actionReply(interaction, { content: "O ADM responsável não tem Pix configurado mais.", ephemeral: true });
+    return actionReply(interaction, { content: "Nao existe uma chave Pix manual configurada para este pedido.", ephemeral: true });
   }
 
   appendAuditLog(db, interaction, "order.pix_resent", { order, staffUserId: order.assignedAdminId });
+  await sendOrRefreshManualPaymentMessage(interaction.channel, order, panel, profile);
+  touchOrder(order);
+  db.orders[order.id] = order;
   writeOrders(db);
-  await interaction.channel.send({
-    content: `<@${order.userId}> Pix reenviado no carrinho.`,
-    embeds: [buildPixEmbed(order, panel, profile)],
-    allowedMentions: { users: [order.userId] }
-  });
-  const dmSent = await sendSafeDM(order.userId, { embeds: [buildPixEmbed(order, panel, profile)] });
+  await persistOrderRelationalAsync(db, order, panel);
+  const dmSent = await sendSafeDM(order.userId, { embeds: [manualPaymentEmbed(order, panel, profile)] });
 
-  return actionReply(interaction, { content: dmSent ? "Pix reenviado no carrinho e por DM." : "Pix reenviado no carrinho.", ephemeral: true });
+  return actionReply(interaction, { content: dmSent ? "Pix atualizado no carrinho e reenviado por DM." : "Pix atualizado no carrinho.", ephemeral: true });
 }
 async function sendPixCommand(message) {
   if (!isAdmin(message.member)) return message.reply("So ADM pode enviar Pix do carrinho.");
@@ -3417,7 +3415,7 @@ function manualPaymentProfile(order) {
   };
 }
 function buildManualPaymentEmbed(order, snapshot, profile, panel) {
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setTitle("Pagamento manual")
     .setDescription([
       `**Valor:** ${money(snapshot.totalCents / 100)}`,
@@ -3432,6 +3430,68 @@ function buildManualPaymentEmbed(order, snapshot, profile, panel) {
     ].filter(Boolean).join("\n\n"))
     .setColor(parseColor(panel.color))
     .setTimestamp();
+  if (profile.qrCodeUrl && validUrl(profile.qrCodeUrl)) embed.setImage(profile.qrCodeUrl);
+  return embed;
+}
+function manualPaymentConfirmationAllowed(order) {
+  return manualPaymentConfirmationMode(order) !== "disabled";
+}
+function manualPaymentActionRows(order) {
+  const mode = manualPaymentConfirmationMode(order);
+  const label = mode === "replacement"
+    ? "Enviei novo comprovante"
+    : order.manualPaymentNotificationSentAt
+      ? "Comprovante enviado"
+      : "Ja fiz o pagamento";
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`manualconfirm:${order.id}`)
+        .setLabel(label)
+        .setEmoji("✅")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(!manualPaymentConfirmationAllowed(order))
+    )
+  ];
+}
+function manualPaymentEmbed(order, panel, profile) {
+  return order.paymentSnapshot?.items?.length
+    ? buildManualPaymentEmbed(order, order.paymentSnapshot, profile, panel)
+    : buildPixEmbed(order, panel, profile);
+}
+async function sendOrRefreshManualPaymentMessage(channel, order, panel, profile) {
+  const payload = {
+    content: `<@${order.userId}> pagamento manual do pedido #${order.id}:`,
+    embeds: [manualPaymentEmbed(order, panel, profile)],
+    components: manualPaymentActionRows(order),
+    allowedMentions: { users: [order.userId] }
+  };
+  const existing = order.manualPaymentMessageId
+    ? await channel.messages.fetch(order.manualPaymentMessageId).catch(() => null)
+    : null;
+  const message = existing ? await existing.edit(payload) : await channel.send(payload);
+  order.manualPaymentMessageId = message.id;
+  return message;
+}
+async function refreshManualPaymentMessage(order, channel) {
+  if (!order || !channel?.messages?.fetch) return false;
+  let message = order.manualPaymentMessageId
+    ? await channel.messages.fetch(order.manualPaymentMessageId).catch(() => null)
+    : null;
+  if (!message) {
+    const recent = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    message = recent ? [...recent.values()].find(candidate =>
+      candidate.author?.id === client.user?.id &&
+      candidate.embeds?.some(embed =>
+        ["Pagamento manual", "💸 Pagamento Pix manual"].includes(String(embed.title || "")) &&
+        String(embed.description || "").includes(String(order.id))
+      )
+    ) : null;
+  }
+  if (!message) return false;
+  order.manualPaymentMessageId = message.id;
+  await message.edit({ components: manualPaymentActionRows(order) }).catch(() => null);
+  return true;
 }
 function buildPagBankPaymentEmbed(order, panel) {
   const mercadoPago = order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX;
@@ -3668,8 +3728,9 @@ async function startOrderPayment(context, id, customerInput = null) {
   if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX && [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)) {
     const profile = manualPaymentProfile(order);
     if (!profile?.pixKey) return actionReply(context, { content: "O recebedor Pix deste pedido nao esta mais configurado.", ephemeral: true });
-    const embed = buildManualPaymentEmbed(order, order.paymentSnapshot, profile, panel);
-    await context.channel.send({ content: `<@${order.userId}> pagamento manual do pedido #${order.id}:`, embeds: [embed], allowedMentions: { users: [order.userId] } });
+    await sendOrRefreshManualPaymentMessage(context.channel, order, panel, profile);
+    touchOrder(order);
+    await persistPaymentOrder(db, order, panel);
     return actionReply(context, { content: "Pix manual reenviado no carrinho.", ephemeral: true });
   }
   if (paymentStarted(order)) return actionReply(context, { content: `O pagamento deste pedido ja esta em ${paymentStatusLabel(order)}.`, ephemeral: true });
@@ -3691,7 +3752,7 @@ async function startOrderPayment(context, id, customerInput = null) {
     }
     const profile = method === PAYMENT_METHOD.MANUAL_PIX ? manualPaymentProfile(order) : null;
     if (method === PAYMENT_METHOD.MANUAL_PIX && !profile?.pixKey) {
-      return actionReply(context, { content: "Nenhum recebedor Pix esta definido. Um ADM precisa assumir a compra primeiro.", ephemeral: true });
+      return actionReply(context, { content: "Nenhum recebedor Pix esta definido. Um ADM deve usar `!pix` neste carrinho ou configurar MANUAL_PIX_KEY.", ephemeral: true });
     }
 
     order.paymentMethod = method;
@@ -3707,9 +3768,10 @@ async function startOrderPayment(context, id, customerInput = null) {
     await persistPaymentOrder(db, order, panel);
 
     if (method === PAYMENT_METHOD.MANUAL_PIX) {
-      const embed = buildManualPaymentEmbed(order, snapshot, profile, panel);
-      await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, embeds: [embed], allowedMentions: { users: [order.userId] } });
-      await sendSafeDM(order.userId, { embeds: [embed] });
+      await sendOrRefreshManualPaymentMessage(context.channel, order, panel, profile);
+      touchOrder(order);
+      await persistPaymentOrder(db, order, panel);
+      await sendSafeDM(order.userId, { embeds: [manualPaymentEmbed(order, panel, profile)] });
       await refreshCartMessage(context.guild, order, panel, context.channel);
       return actionReply(context, { content: "Pix manual enviado no carrinho.", ephemeral: true });
     }
@@ -7398,13 +7460,6 @@ function cartActionRows(orderOrId) {
   const finished = isFinishedCart(order);
   const paid = Boolean(order.paymentStatus === "marked_paid" || order.paidAt);
   const frozen = paymentStarted(order);
-  const proofAllowed = order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
-    (Number(order.paymentFlowVersion || 0) >= 3
-      ? order.paymentState === PAYMENT_STATE.AWAITING_MANUAL_PAYMENT
-      : [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState));
-  const manualConfirmationAllowed = order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
-    [PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState) &&
-    !order.manualPaymentNotificationSentAt;
   const manualApprovalAllowed = order.paymentFlowVersion < 2 ||
     (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
       (Number(order.paymentFlowVersion || 0) >= 3
@@ -7416,27 +7471,14 @@ function cartActionRows(orderOrId) {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`addproduct:${orderId}`).setLabel("Adicionar produto").setEmoji("➕").setStyle(ButtonStyle.Primary).setDisabled(finished || frozen),
       new ButtonBuilder().setCustomId(`pay:${orderId}`).setLabel(frozen ? "Pagamento gerado" : "Gerar pagamento").setEmoji("💠").setStyle(ButtonStyle.Success).setDisabled(finished || frozen),
-      new ButtonBuilder().setCustomId(`proof:${orderId}`).setLabel("Enviar comprovante").setEmoji("📎").setStyle(ButtonStyle.Secondary).setDisabled(finished || !proofAllowed),
-      new ButtonBuilder().setCustomId(`call:${orderId}`).setLabel("Chamar ADM").setEmoji("📣").setStyle(ButtonStyle.Secondary).setDisabled(finished),
       new ButtonBuilder().setCustomId(`cancel:${orderId}`).setLabel("Cancelar").setEmoji("✖️").setStyle(ButtonStyle.Danger).setDisabled(finished)
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`assume:${orderId}`).setLabel("Assumir").setEmoji("🙋").setStyle(ButtonStyle.Secondary).setDisabled(finished || Boolean(order.assignedAdminId)),
-      new ButtonBuilder().setCustomId(`sendpix:${orderId}`).setLabel("Reenviar Pix").setEmoji("💸").setStyle(ButtonStyle.Secondary).setDisabled(finished || (!order.assignedAdminId && ![PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order.paymentMethod))),
+      new ButtonBuilder().setCustomId(`sendpix:${orderId}`).setLabel("Reenviar Pix").setEmoji("💸").setStyle(ButtonStyle.Secondary).setDisabled(finished || !frozen),
       new ButtonBuilder().setCustomId(`paid:${orderId}`).setLabel(automaticPayment ? "Verificar pagamento" : "Aprovar pagamento").setEmoji("💵").setStyle(ButtonStyle.Secondary).setDisabled(finished || paid || (!manualApprovalAllowed && !automaticVerificationAllowed)),
       new ButtonBuilder().setCustomId(`deliver:${orderId}`).setLabel("Entregar").setEmoji("📦").setStyle(ButtonStyle.Primary).setDisabled(finished || Boolean(order.deliveredAt)),
-      new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(finished)
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`manualconfirm:${orderId}`)
-        .setLabel(order.manualPaymentNotificationSentAt ? "Comprovante enviado" : "Ja fiz o pagamento")
-        .setEmoji("✅")
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(finished || !manualConfirmationAllowed),
-      new ButtonBuilder().setCustomId(`rejectpay:${orderId}`).setLabel("Recusar pagamento").setStyle(ButtonStyle.Danger).setDisabled(finished || order.paymentMethod !== PAYMENT_METHOD.MANUAL_PIX || ![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)),
-      new ButtonBuilder().setCustomId(`newproof:${orderId}`).setLabel("Novo comprovante").setStyle(ButtonStyle.Secondary).setDisabled(finished || order.paymentState !== PAYMENT_STATE.MANUAL_PAYMENT_REJECTED),
-      new ButtonBuilder().setCustomId(`retrydelivery:${orderId}`).setLabel("Reenviar entrega").setStyle(ButtonStyle.Secondary).setDisabled(order.paymentState !== PAYMENT_STATE.PAID_DELIVERY_PENDING)
+      new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(finished),
+      new ButtonBuilder().setCustomId(`rejectpay:${orderId}`).setLabel("Recusar pagamento").setStyle(ButtonStyle.Danger).setDisabled(finished || order.paymentMethod !== PAYMENT_METHOD.MANUAL_PIX || order.paymentState !== PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW)
     )
   ];
 }
@@ -7495,6 +7537,31 @@ async function refreshCartMessage(guild, order, panel, fallbackChannel = null) {
   }
   return true;
 }
+async function refreshOpenOrderInterfaces(guild) {
+  const db = readOrders();
+  let changed = 0;
+  for (const order of Object.values(db.orders || {})) {
+    if (order.guildId !== guild.id || order.status !== ORDER_STATUS.OPEN) continue;
+    try {
+      const channel = await guild.channels.fetch(order.channelId).catch(() => null);
+      if (!channel?.isTextBased?.()) continue;
+      const panel = getOrderPanel(order, guild.id);
+      await refreshCartMessage(guild, order, panel, channel).catch(() => null);
+      if (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
+          await refreshManualPaymentMessage(order, channel).catch(() => false)) {
+        db.orders[order.id] = order;
+        changed += 1;
+      }
+    } catch (error) {
+      console.warn(`Nao consegui atualizar a interface do pedido #${order.id}: ${errorSummary(error).message}`);
+    }
+  }
+  if (changed) {
+    writeOrders(db);
+    await flushPersistentFile(ORDERS_FILE);
+  }
+  return changed;
+}
 function helpFields(name, lines) {
   const fields = [];
   let chunk = [];
@@ -7544,7 +7611,8 @@ function commandHelpEmbed(member) {
     "`!puxarbackup` - adiciona verificados ao servidor reserva usando OAuth2.",
     "`/status-loja` ou `!status-loja` - mostra resumo da loja.",
     "`/pedidos` ou `!pedidos` - lista pedidos abertos e permite assumir o proximo.",
-    "`/diagnostico` ou `!diagnostico` - mostra saude do bot, KV, Pix, paineis e carrinhos."
+    "`/diagnostico` ou `!diagnostico` - mostra saude do bot, KV, Pix, paineis e carrinhos.",
+    "`/testntfy` ou `!testntfy` - envia uma notificacao de teste para o celular."
   ];
   const salesCommands = [
     "`/addcar` - alias administrativo do `/addproduto`.",
@@ -9069,6 +9137,29 @@ async function actionReply(context, payload) {
   }
   return context.channel.send(stripEphemeral(payload));
 }
+async function testNtfyCommand(context) {
+  if (!isAdmin(context.member) && !isBotOwner(actionUser(context))) {
+    return actionReply(context, { content: "So ADM pode testar as notificacoes.", ephemeral: true });
+  }
+  if (context.isRepliable?.() && !context.deferred && !context.replied) {
+    await context.deferReply({ ephemeral: true }).catch(() => null);
+  }
+  try {
+    const result = await sendNtfyTestNotification();
+    if (!result.sent) {
+      return actionReply(context, {
+        content: "ntfy nao configurado. Use NTFY_TOPIC com o link completo ou NTFY_URL + NTFY_TOPIC.",
+        ephemeral: true
+      });
+    }
+    return actionReply(context, { content: `Teste ntfy enviado com sucesso (HTTP ${result.status}).`, ephemeral: true });
+  } catch (error) {
+    return actionReply(context, {
+      content: `Falha no teste ntfy: ${errorSummary(error).message}`,
+      ephemeral: true
+    });
+  }
+}
 function openOrderByChannel(guildId, channelId) {
   const db = readOrders();
   return Object.values(db.orders || {}).find(order =>
@@ -9290,13 +9381,16 @@ async function rejectManualPayment(context, id) {
     order.paymentState = PAYMENT_STATE.MANUAL_PAYMENT_REJECTED;
     order.paymentRejectedAt = new Date().toISOString();
     order.paymentRejectedById = actionUser(context).id;
+    order.manualPaymentAwaitingReplacement = true;
+    order.lastRejectedProofMessageId = order.paymentProofLatestMessageId || order.manualPaymentNotificationProofMessageId || "";
     delete order.stockReservedAt;
     touchOrder(order);
     appendAuditLog(db, context, "order.manual_payment_rejected", { order });
     const panel = getOrderPanel(order, order.guildId);
     await persistPaymentOrder(db, order, panel);
-    await context.channel.send({ content: `<@${order.userId}> o pagamento do pedido #${order.id} foi recusado. Envie um novo comprovante ou cancele a compra.`, allowedMentions: { users: [order.userId] } }).catch(() => null);
+    await context.channel.send({ content: `<@${order.userId}> o comprovante do pedido #${order.id} foi recusado. Envie uma nova imagem ou PDF e clique em **Enviei novo comprovante** abaixo do Pix.`, allowedMentions: { users: [order.userId] } }).catch(() => null);
     await refreshCartMessage(context.guild, order, panel, context.channel);
+    await refreshManualPaymentMessage(order, context.channel);
     return actionReply(context, { content: "Pagamento recusado e reserva liberada.", ephemeral: true });
   } finally {
     releaseOrderActionLock(order);
@@ -9316,16 +9410,21 @@ async function requestNewManualProof(context, id) {
   const reservedIds = await reserveAutomaticStockForOrder(order, panel, snapshot);
   if (reservedIds.length) order.stockReservedAt = new Date().toISOString();
   order.paymentState = PAYMENT_STATE.AWAITING_MANUAL_PAYMENT;
+  order.manualPaymentAwaitingReplacement = true;
+  order.lastRejectedProofMessageId = order.paymentProofLatestMessageId || order.manualPaymentNotificationProofMessageId || "";
   delete order.paymentExpiresAt;
   touchOrder(order);
   appendAuditLog(db, context, "order.new_proof_requested", { order });
   await persistPaymentOrder(db, order, panel);
-  await context.channel.send({ content: `<@${order.userId}> envie um novo comprovante usando o botao **Enviar comprovante**.`, allowedMentions: { users: [order.userId] } });
+  await context.channel.send({ content: `<@${order.userId}> envie uma nova imagem ou PDF e clique no botao abaixo da mensagem Pix.`, allowedMentions: { users: [order.userId] } });
   await refreshCartMessage(context.guild, order, panel, context.channel);
+  await refreshManualPaymentMessage(order, context.channel);
   return actionReply(context, { content: "Novo comprovante solicitado.", ephemeral: true });
 }
 async function retryAutomaticDelivery(context, id) {
-  if (!await requireBotOwner(context)) return;
+  if (!isAdmin(context.member) && !isBotOwner(actionUser(context))) {
+    return actionReply(context, { content: "Somente ADM pode reenviar uma entrega pendente.", ephemeral: true });
+  }
   if (context.isRepliable?.() && !context.deferred && !context.replied) await context.deferReply({ ephemeral: true });
   const db = readOrders();
   const order = orderForAction(db, id, context, false);
@@ -9651,7 +9750,7 @@ async function verifyAutomaticPayment(context, order) {
 
     if (result.processing) return actionReply(context, { content: "O pagamento foi localizado e ja esta sendo processado.", ephemeral: true });
     if (!result.ok) return actionReply(context, { content: "O provedor respondeu, mas os dados do pagamento nao conferem com este pedido. Um proprietario precisa verificar o caso.", ephemeral: true });
-    if (result.deliveryPending) return actionReply(context, { content: "Pagamento confirmado. A entrega automatica ficou pendente e um ADM deve usar Reenviar entrega.", ephemeral: true });
+    if (result.deliveryPending) return actionReply(context, { content: "Pagamento confirmado. A entrega automatica ficou pendente; um ADM pode tentar novamente pelo botao **Entregar**.", ephemeral: true });
     if (result.duplicate) return actionReply(context, { content: `O pagamento do pedido #${result.internalOrderId || order.id} ja estava confirmado.`, ephemeral: true });
     const delivered = Number(result.delivery?.count) || 0;
     return actionReply(context, { content: `Pagamento do pedido #${result.internalOrderId || order.id} confirmado oficialmente.${delivered ? ` ${delivered} item(ns) automatico(s) processado(s).` : ""}`, ephemeral: true });
@@ -9744,6 +9843,7 @@ async function markOrderPaid(context, id) {
     await persistPaymentOrder(db, order, panel);
     const automaticDelivery = await deliverAutomaticOrderStock(order, panel, db, "manual_approval");
     await refreshCartMessage(context.guild, order, panel, context.channel);
+    await refreshManualPaymentMessage(order, context.channel);
     return actionReply(context, { content: `Pagamento do carrinho #${order.id} aprovado (${money(order.paidAmount)}).${automaticDelivery.count ? ` ${automaticDelivery.count} item(ns) automatico(s) processado(s).` : ""}`, ephemeral: true });
   } finally {
     releaseOrderActionLock(order);
@@ -9783,6 +9883,9 @@ async function requestDelivery(interaction, id) {
   if (order.deliveredAt) return interaction.reply({ content: "Esse pedido ja foi marcado como entregue.", ephemeral: true });
   if (order.paymentStatus !== "marked_paid" && !order.paidAt) {
     return interaction.reply({ content: "Marque o pagamento como recebido antes de entregar.", ephemeral: true });
+  }
+  if (order.paymentState === PAYMENT_STATE.PAID_DELIVERY_PENDING) {
+    return retryAutomaticDelivery(interaction, id);
   }
   return interaction.showModal(deliveryModal(order));
 }
@@ -9953,24 +10056,28 @@ async function confirmManualPaymentNotification(context, id) {
   if (actor.id !== order.userId && !authorizedManualPaymentStaff(context)) {
     return actionReply(context, { content: "Somente o cliente ou um atendente autorizado pode enviar esta confirmacao.", ephemeral: true });
   }
-  if (![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState)) {
+  const replacement = Boolean(order.manualPaymentAwaitingReplacement) &&
+    [PAYMENT_STATE.MANUAL_PAYMENT_REJECTED, PAYMENT_STATE.AWAITING_MANUAL_PAYMENT].includes(order.paymentState);
+  if (![PAYMENT_STATE.AWAITING_MANUAL_PAYMENT, PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW].includes(order.paymentState) && !replacement) {
     return actionReply(context, { content: `Este pagamento nao aceita confirmacao no estado ${paymentStatusLabel(order)}.`, ephemeral: true });
   }
-  if (order.manualPaymentNotificationSentAt) {
+  if (order.manualPaymentNotificationSentAt && !replacement) {
     return actionReply(context, { content: "O comprovante deste carrinho ja foi enviado para analise.", ephemeral: true });
   }
-  const remaining = manualNotificationRemaining(
-    db,
-    order.guildId,
-    actor.id,
-    Date.now(),
-    manualNotificationCooldownMs()
-  );
-  if (remaining > 0) {
-    return actionReply(context, {
-      content: `Voce ja enviou uma confirmacao recentemente. Aguarde ${Math.max(1, Math.ceil(remaining / 60_000))} minuto(s) e tente novamente.`,
-      ephemeral: true
-    });
+  if (!replacement) {
+    const remaining = manualNotificationRemaining(
+      db,
+      order.guildId,
+      actor.id,
+      Date.now(),
+      manualNotificationCooldownMs()
+    );
+    if (remaining > 0) {
+      return actionReply(context, {
+        content: `Voce ja enviou uma confirmacao recentemente. Aguarde ${Math.max(1, Math.ceil(remaining / 60_000))} minuto(s) e tente novamente.`,
+        ephemeral: true
+      });
+    }
   }
   if (!claimOrderActionLock(order)) {
     return actionReply(context, { content: "Outra confirmacao deste carrinho esta sendo processada.", ephemeral: true });
@@ -9984,6 +10091,12 @@ async function confirmManualPaymentNotification(context, id) {
         ephemeral: true
       });
     }
+    if (replacement && latest.message.id === order.lastRejectedProofMessageId) {
+      return actionReply(context, {
+        content: "Envie um novo comprovante em imagem ou PDF antes de confirmar novamente.",
+        ephemeral: true
+      });
+    }
     let proof;
     try {
       proof = await downloadAndValidateProof(latest.attachment, { maxBytes: proofMaxBytes() });
@@ -9994,6 +10107,21 @@ async function confirmManualPaymentNotification(context, id) {
       });
     }
     const panel = getOrderPanel(order, order.guildId);
+    if (replacement && Number(order.paymentSnapshot?.automaticUnits) > 0 && !order.stockReservedAt) {
+      const snapshot = serverOrderSnapshot(order);
+      if (snapshot.hash !== order.paymentSnapshot?.hash || snapshot.totalCents !== order.totalCentsSnapshot) {
+        return actionReply(context, { content: "O produto ou valor mudou. Cancele este carrinho e gere um pedido novo.", ephemeral: true });
+      }
+      try {
+        const reservedIds = await reserveAutomaticStockForOrder(order, panel, snapshot);
+        if (reservedIds.length) order.stockReservedAt = new Date().toISOString();
+      } catch {
+        return actionReply(context, {
+          content: "Nao consegui reservar novamente o estoque deste pedido. Chame um administrador.",
+          ephemeral: true
+        });
+      }
+    }
     const now = new Date().toISOString();
     const savedProof = {
       url: latest.attachment.url,
@@ -10014,13 +10142,26 @@ async function confirmManualPaymentNotification(context, id) {
     }
     order.paymentProofSubmittedAt = now;
     order.paymentProofLatestUrl = savedProof.url;
+    order.paymentProofLatestMessageId = savedProof.messageId;
     order.paymentState = PAYMENT_STATE.MANUAL_PAYMENT_UNDER_REVIEW;
     order.paymentStatus = "proof_received";
+    delete order.manualPaymentAwaitingReplacement;
     touchOrder(order);
     db.orders[order.id] = order;
     writeOrders(db);
     await persistOrderRelationalAsync(db, order, panel);
     await refreshCartMessage(context.guild, order, panel, context.channel);
+    await refreshManualPaymentMessage(order, context.channel);
+    if (replacement && order.manualPaymentNotificationSentAt) {
+      await context.channel.send({
+        content: `<@${order.userId}> o novo comprovante foi recebido e voltou para analise.`,
+        allowedMentions: { users: [order.userId] }
+      }).catch(() => null);
+      return actionReply(context, {
+        content: "Novo comprovante recebido. O responsavel ja havia sido notificado e pode analisar o novo arquivo.",
+        ephemeral: true
+      });
+    }
     try {
       const notification = await sendManualProofNotification(orderNotificationInput(order, panel, {
         idempotencyKey: `manual:${order.id}`,
@@ -10045,12 +10186,14 @@ async function confirmManualPaymentNotification(context, id) {
     }
     order.manualPaymentNotificationSentAt = now;
     order.manualPaymentNotificationSentBy = actor.id;
+    order.manualPaymentNotificationProofMessageId = savedProof.messageId;
     recordManualNotification(db, order.guildId, actor.id, new Date(now));
     touchOrder(order);
     db.orders[order.id] = order;
     writeOrders(db);
     await persistOrderRelationalAsync(db, order, panel);
     await refreshCartMessage(context.guild, order, panel, context.channel);
+    await refreshManualPaymentMessage(order, context.channel);
     await context.channel.send({
       content: `<@${order.userId}> seu comprovante foi enviado para analise. Aguarde a confirmacao do responsavel.`,
       allowedMentions: { users: [order.userId] }
@@ -10125,6 +10268,7 @@ async function cancelCart(interaction, id) {
   await interaction.channel.permissionOverwrites.edit(order.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => null);
   scheduleCartDeletion(order);
   await refreshCartMessage(interaction.guild, order, panel, interaction.channel);
+  await refreshManualPaymentMessage(order, interaction.channel);
   await interaction.channel.send({ content: `<@${order.userId}> Compra #${order.id} cancelada. Este canal sera apagado em instantes.` }).catch(() => null);
   await actionReply(interaction, { content: `Carrinho #${order.id} cancelado e movido para fechados.`, ephemeral: true });
 }
@@ -10147,7 +10291,7 @@ async function finishCart(interaction, id, options = {}) {
     return actionReply(interaction, { content: `Compra #${order.id} ja foi cancelada.`, ephemeral: true });
   }
   if (!canStartOrderProcessing(order)) return actionReply(interaction, { content: `Carrinho em estado ${orderStatusLabel(order.status)}.`, ephemeral: true });
-  if (config.settings.finalizeCartOnlyAdmins && !isAdmin(interaction.member)) return actionReply(interaction, { content: "Só admin finaliza. Clique em **Chamar ADM**.", ephemeral: true });
+  if (config.settings.finalizeCartOnlyAdmins && !isAdmin(interaction.member)) return actionReply(interaction, { content: "So ADM pode finalizar. Aguarde o atendimento da equipe.", ephemeral: true });
   if (!Array.isArray(order.items) || !order.items.length) {
     return actionReply(interaction, { content: "Esse carrinho ainda esta vazio. Adicione um produto antes de finalizar.", ephemeral: true });
   }
@@ -10158,7 +10302,7 @@ async function finishCart(interaction, id, options = {}) {
     const totalUnits = (order.paymentSnapshot?.items || []).reduce((sum, item) => sum + Math.max(1, Number(item.quantity) || 1), 0);
     const manualUnits = Math.max(0, totalUnits - (Number(order.paymentSnapshot?.automaticUnits) || 0));
     if (order.paymentState === PAYMENT_STATE.PAID_DELIVERY_PENDING && order.stockReservedAt && !order.automaticStockDeliveredAt) {
-      return actionReply(interaction, { content: "A entrega automatica ainda esta pendente. Use **Reenviar entrega** antes de finalizar.", ephemeral: true });
+      return actionReply(interaction, { content: "A entrega automatica ainda esta pendente. Use **Entregar** para tentar novamente antes de finalizar.", ephemeral: true });
     }
     if (manualUnits > 0 && !order.deliveredAt) return actionReply(interaction, { content: "Este pedido ainda possui item de entrega manual. Use **Entregar** antes de finalizar.", ephemeral: true });
   }
@@ -10267,6 +10411,7 @@ async function finishCart(interaction, id, options = {}) {
     ? await sendReviewRequest(interaction, order, options).catch(error => ({ ok: false, message: `Nao consegui enviar avaliacao: ${error.message}` }))
     : null;
   await refreshCartMessage(interaction.guild, order, panel, interaction.channel);
+  await refreshManualPaymentMessage(order, interaction.channel);
   await interaction.channel.send({ content: `<@${order.userId}> ${thanks}\nEste canal sera apagado automaticamente em ${closedCartDeleteLabel()}.`, embeds: [extraEmbed].filter(Boolean) });
 
   const customerTranscript = await buildCustomerTranscriptAttachment(interaction.channel, order, panel).catch(error => {
@@ -10651,6 +10796,11 @@ client.once("clientReady", async () => {
     await updateRevenueDashboard(guild).catch(error => {
       console.log(`Nao consegui atualizar painel de faturamento em ${guild.id}: ${error.message}`);
     });
+    const refreshedOrders = await refreshOpenOrderInterfaces(guild).catch(error => {
+      console.warn(`Nao consegui atualizar interfaces de carrinhos em ${guild.id}: ${errorSummary(error).message}`);
+      return 0;
+    });
+    if (refreshedOrders) console.log(`${refreshedOrders} mensagem(ns) Pix antiga(s) foram recuperadas em ${guild.id}.`);
     const panelStore = readPanels();
     const guildStore = ensurePanelStore(panelStore, guild.id);
     const permissionWarnings = await discordPermissionWarnings(guild, allPublicPanels(guildStore), getStaffGuild(guild.id)).catch(error => [`Falha ao validar permissoes: ${error.message}`]);
@@ -10864,6 +11014,10 @@ client.on("messageCreate", async message => {
     await message.delete().catch(() => null);
     return sendDiagnosticsCommand(message);
   }
+  if (content === `${config.prefix || "!"}testntfy`) {
+    await message.delete().catch(() => null);
+    return testNtfyCommand(message);
+  }
   if (content.startsWith(`${config.prefix || "!"}reconciliarpagbank `)) {
     await message.delete().catch(() => null);
     return reconcilePagBankCommand(message, rawContent.split(/\s+/)[1]);
@@ -10975,6 +11129,7 @@ async function handleInteraction(interaction) {
       }
       if (interaction.commandName === "pedidos") return showOpenOrders(interaction);
       if (interaction.commandName === "diagnostico") return sendDiagnosticsCommand(interaction);
+      if (interaction.commandName === "testntfy") return testNtfyCommand(interaction);
       if (interaction.commandName === "reconciliarpagbank") return reconcilePagBankCommand(interaction, interaction.options.getString("order_id"));
       if (interaction.commandName === "reconciliarmercadopago") return reconcileMercadoPagoCommand(interaction, interaction.options.getString("payment_id"));
       if (["pago", "verificarpagamento"].includes(interaction.commandName)) {

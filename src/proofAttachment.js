@@ -178,7 +178,6 @@ function findLatestProofAttachment(messages, ownerId, options = {}) {
     if (String(message?.author?.id || "") !== String(ownerId || "")) continue;
     for (const attachment of attachmentValues(message)) {
       const metadata = validateProofMetadata(attachment, options);
-      if (!metadata.ok) continue;
       candidates.push({
         attachment,
         message,

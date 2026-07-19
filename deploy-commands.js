@@ -175,6 +175,9 @@ const commands = [
     .setName("diagnostico")
     .setDescription("Mostra saude do bot, KV, Pix, paineis e carrinhos."),
   new SlashCommandBuilder()
+    .setName("testntfy")
+    .setDescription("Envia uma notificacao de teste para o ntfy configurado."),
+  new SlashCommandBuilder()
     .setName("reconciliarpagbank")
     .setDescription("Consulta e processa um pedido PagBank pago.")
     .addStringOption(option =>

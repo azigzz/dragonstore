@@ -9,7 +9,9 @@ const {
   validateProofMetadata
 } = require("../src/proofAttachment");
 const {
-  sendManualProofNotification
+  ntfyEndpoint,
+  sendManualProofNotification,
+  sendNtfyTestNotification
 } = require("../src/services/notificationService");
 
 function response(buffer, status = 200) {
@@ -47,6 +49,12 @@ const samples = {
 };
 
 (async () => {
+  assert.equal(ntfyEndpoint({ baseUrl: "https://ntfy.sh", topic: "dragon-test" }), "https://ntfy.sh/dragon-test");
+  assert.equal(ntfyEndpoint({ baseUrl: "https://ntfy.sh", topic: "https://ntfy.sh/dragon-full" }), "https://ntfy.sh/dragon-full");
+  assert.equal(ntfyEndpoint({ baseUrl: "ntfy.sh/dragon-link", topic: "" }), "https://ntfy.sh/dragon-link");
+  assert.equal(ntfyEndpoint({ baseUrl: "https://ntfy.sh/dragon-link", topic: "dragon-link" }), "https://ntfy.sh/dragon-link");
+  assert.equal(ntfyEndpoint({ baseUrl: "https://ntfy.sh", topic: "" }), "");
+
   for (const [name, contentType, buffer] of [
     ["comprovante.png", "image/png", samples.png],
     ["comprovante.jpg", "image/jpeg", samples.jpeg],
@@ -91,6 +99,17 @@ const samples = {
   assert.equal(latest.attachment.name, "novo.pdf");
   assert.equal(findLatestProofAttachment([message("outra-pessoa", 300, [otherUserProof])], ownerId), null);
 
+  const newestInvalid = attachment("falso.pdf", "application/pdf", invalidPdf);
+  const invalidLatest = findLatestProofAttachment([
+    message(ownerId, 100, [oldProof]),
+    message(ownerId, 400, [newestInvalid])
+  ], ownerId);
+  assert.equal(invalidLatest.attachment.name, "falso.pdf");
+  await assert.rejects(
+    downloadAndValidateProof(invalidLatest.attachment, { fetchImpl: async () => response(invalidPdf) }),
+    error => error.code === "invalid_content"
+  );
+
   await assert.rejects(
     downloadAndValidateProof(oldProof, { fetchImpl: async () => { throw new Error("cdn offline"); } }),
     error => error.code === "download_failed"
@@ -126,6 +145,7 @@ const samples = {
   assert.equal(sent.sent, true);
   assert.equal(published.options.method, "PUT");
   assert.equal(published.options.headers.Filename, "comprovante-pedido-7654321.pdf");
+  assert.equal(published.options.headers.Priority, "max");
   assert.equal(Buffer.from(published.options.body).equals(samples.pdf), true);
   assert.deepEqual(await fs.readdir(tmpRoot), []);
 
@@ -147,6 +167,19 @@ const samples = {
   });
   assert.equal(imageSent.sent, true);
   assert.deepEqual(await fs.readdir(tmpRoot), []);
+
+  let textRequest;
+  const testSent = await sendNtfyTestNotification({
+    env: { NTFY_TOPIC: "https://ntfy.test/teste-direto" },
+    fetchImpl: async (url, options) => {
+      textRequest = { url, options };
+      return { ok: true, status: 200 };
+    }
+  });
+  assert.equal(testSent.sent, true);
+  assert.equal(textRequest.url, "https://ntfy.test/teste-direto");
+  assert.equal(textRequest.options.method, "POST");
+  assert.equal(textRequest.options.body, "Teste de notificacao enviado com sucesso.");
 
   await assert.rejects(
     sendManualProofNotification(notificationInput, {

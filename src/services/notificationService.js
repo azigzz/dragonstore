@@ -5,22 +5,48 @@ const path = require("node:path");
 
 function ntfyConfig(env = process.env) {
   return {
-    baseUrl: String(env.NTFY_URL || "").trim().replace(/\/+$/, ""),
+    baseUrl: String(env.NTFY_URL || "https://ntfy.sh").trim(),
     topic: String(env.NTFY_TOPIC || "").trim(),
     token: String(env.NTFY_TOKEN || "").trim()
   };
 }
 
-function ntfyEndpoint(config) {
-  if (!config.baseUrl || !config.topic) return "";
+function parsedHttpUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const candidate = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
   let url;
   try {
-    url = new URL(config.baseUrl);
+    url = new URL(candidate);
   } catch {
+    return null;
+  }
+  if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return null;
+  url.hash = "";
+  url.search = "";
+  return url;
+}
+
+function ntfyEndpoint(config) {
+  const rawTopic = String(config?.topic || "").trim();
+  const topicAsUrl = rawTopic && (/^https?:\/\//i.test(rawTopic) || /^[^/]+\.[^/]+\//.test(rawTopic))
+    ? parsedHttpUrl(rawTopic)
+    : null;
+  if (topicAsUrl && topicAsUrl.pathname !== "/") return topicAsUrl.toString().replace(/\/$/, "");
+
+  const url = parsedHttpUrl(config?.baseUrl);
+  if (!url) return "";
+  if (rawTopic) {
+    const topic = rawTopic.replace(/^\/+|\/+$/g, "");
+    if (!topic || topic.includes("/")) return "";
+    const currentTopic = url.pathname.replace(/\/+$/, "").split("/").pop();
+    if (currentTopic && (currentTopic === topic || currentTopic === encodeURIComponent(topic))) {
+      return url.toString().replace(/\/$/, "");
+    }
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/${encodeURIComponent(topic)}`;
+  } else if (!url.pathname || url.pathname === "/") {
     return "";
   }
-  if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return "";
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}/${encodeURIComponent(config.topic)}`;
   return url.toString();
 }
 
@@ -69,13 +95,13 @@ function notificationText(input) {
 function notificationInput(kind, input) {
   const automatic = kind === "automatic";
   return {
-    title: automatic ? "✅ PAGAMENTO APROVADO" : "🚨 COMPROVANTE RECEBIDO",
+    title: automatic ? "PAGAMENTO APROVADO" : "COMPROVANTE RECEBIDO",
     message: notificationText({
       ...input,
       paymentLabel: automatic ? "Automatico" : "Manual"
     }),
     tags: automatic ? "white_check_mark,money_with_wings" : "rotating_light,receipt",
-    priority: automatic ? "high" : "urgent",
+    priority: automatic ? "high" : "max",
     click: input.discordUrl,
     idempotencyKey: input.idempotencyKey
   };
@@ -120,7 +146,20 @@ async function publishNtfy(input, options = {}) {
       signal: AbortSignal.timeout(Number(options.timeoutMs) || 12_000)
     });
     if (!response.ok) {
-      const error = new Error(`ntfy HTTP ${response.status}`);
+      let responseText = "";
+      try {
+        if (typeof response.text === "function") responseText = await response.text();
+      } catch {
+        responseText = "";
+      }
+      let detail = "";
+      try {
+        const parsed = JSON.parse(responseText);
+        detail = String(parsed.error || parsed.message || "").replace(/[\r\n]+/g, " ").slice(0, 180);
+      } catch {
+        detail = responseText.replace(/[\r\n]+/g, " ").slice(0, 180);
+      }
+      const error = new Error(`ntfy HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
       error.code = "ntfy_failed";
       throw error;
     }
@@ -141,12 +180,24 @@ function sendManualProofNotification(input, options = {}) {
   }, options);
 }
 
+function sendNtfyTestNotification(options = {}) {
+  return publishNtfy({
+    title: "Dragon Store - teste",
+    message: "Teste de notificacao enviado com sucesso.",
+    tags: "white_check_mark",
+    priority: "default",
+    idempotencyKey: `test:${Date.now()}`
+  }, options);
+}
+
 module.exports = {
   notificationText,
   ntfyConfig,
+  ntfyEndpoint,
   ntfyReady,
   publishNtfy,
   saoPauloTime,
   sendAutomaticPaymentNotification,
-  sendManualProofNotification
+  sendManualProofNotification,
+  sendNtfyTestNotification
 };

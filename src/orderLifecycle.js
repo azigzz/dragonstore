@@ -102,6 +102,21 @@ function paymentChoiceAvailability(totalCents, automaticConfigured) {
   };
 }
 
+function manualPaymentConfirmationMode(order) {
+  if (!order || String(order.status || "") !== "open" || String(order.paymentMethod || "") !== "MANUAL_PIX") {
+    return "disabled";
+  }
+  const state = String(order.paymentState || "");
+  if (order.manualPaymentAwaitingReplacement && ["MANUAL_PAYMENT_REJECTED", "AWAITING_MANUAL_PAYMENT"].includes(state)) {
+    return "replacement";
+  }
+  if (["AWAITING_MANUAL_PAYMENT", "MANUAL_PAYMENT_UNDER_REVIEW"].includes(state) &&
+      !order.manualPaymentNotificationSentAt) {
+    return "initial";
+  }
+  return "disabled";
+}
+
 module.exports = {
   DEFAULT_INACTIVITY_MS,
   DEFAULT_MANUAL_NOTIFICATION_COOLDOWN_MS,
@@ -112,6 +127,7 @@ module.exports = {
   isManualInactivityCandidate,
   manualNotificationCooldownMs,
   manualNotificationRemaining,
+  manualPaymentConfirmationMode,
   markHumanActivity,
   paymentChoiceAvailability,
   recordManualNotification
