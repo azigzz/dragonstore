@@ -8,6 +8,25 @@ function validAmountInCents(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
+function paymentProviderHttpStatus(error) {
+  const status = Number(error?.mercadoPago?.status ?? error?.pagBank?.status ?? error?.status ?? 0);
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : 0;
+}
+
+function isAmbiguousPaymentProviderFailure(error) {
+  const status = paymentProviderHttpStatus(error);
+  return status === 0 || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function automaticPaymentRecoveryAvailable(order) {
+  if (![PAYMENT_METHOD.PAGBANK_PIX, PAYMENT_METHOD.MERCADOPAGO_PIX].includes(order?.paymentMethod)) return false;
+  if (order.paymentState !== "AWAITING_PAGBANK_PAYMENT") return false;
+  if (order.paymentMethod === PAYMENT_METHOD.MERCADOPAGO_PIX) {
+    return Boolean(order.mercadoPagoReferenceId && order.mercadoPagoIdempotencyKey && !order.mercadoPagoPixCopyPaste);
+  }
+  return Boolean(order.pagBankReferenceId && order.pagBankIdempotencyKey && !order.pagBankPixCopyPaste);
+}
+
 function resolvePaymentMethod(amountInCents) {
   if (!validAmountInCents(amountInCents)) {
     throw new TypeError("O valor do pedido deve ser um inteiro positivo em centavos.");
@@ -36,4 +55,12 @@ function calculateServerCart(requestedItems, getServerProduct, discountPercent =
   return { items, grossCents, discountCents, totalCents, discountPercent: percent };
 }
 
-module.exports = { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod, validAmountInCents };
+module.exports = {
+  PAYMENT_METHOD,
+  automaticPaymentRecoveryAvailable,
+  calculateServerCart,
+  isAmbiguousPaymentProviderFailure,
+  paymentProviderHttpStatus,
+  resolvePaymentMethod,
+  validAmountInCents
+};

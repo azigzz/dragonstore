@@ -13,7 +13,14 @@ const { createOAuthServer, pullVerifiedUsersToBackup } = require("./oauthServer"
 const { createServerBackup, restoreServerBackup, validateServerBackup } = require("./serverBackup");
 const { currentSetupSummary, provisionStoreSetup } = require("./storeSetup");
 const { QUICK_PANEL_TEMPLATE, parseQuickPanelTemplate } = require("./quickPanelTemplate");
-const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("./paymentPolicy");
+const {
+  PAYMENT_METHOD,
+  automaticPaymentRecoveryAvailable,
+  calculateServerCart,
+  isAmbiguousPaymentProviderFailure,
+  paymentProviderHttpStatus,
+  resolvePaymentMethod
+} = require("./paymentPolicy");
 const { isAuthorizedOwner, parseOwnerIds } = require("./securityPolicy");
 const { createPixOrder, getPagBankOrder, normalizeCustomer, pagBankConfig, pagBankReady, paidPixCharge, validatePaidPixNotification, verifyWebhookSignature } = require("./pagBank");
 const { createMercadoPagoPix, getMercadoPagoPayment, mercadoPagoConfig, mercadoPagoReady, validateApprovedMercadoPagoPayment, verifyMercadoPagoSignature } = require("./mercadoPago");
@@ -3649,6 +3656,49 @@ function safePagBankFailure(error, order) {
   const lines = lastPagBankDiagnostic.errors.map(item => `codigo=${item.code || "n/a"} parametro=${item.parameterName || "n/a"} descricao=${item.description || "n/a"}`).join(" | ");
   console.warn(`PagBank request recusada: HTTP=${lastPagBankDiagnostic.status || "n/a"} ambiente=${config.environment} pedido=${lastPagBankDiagnostic.orderId} ${lines}`);
 }
+async function handleAutomaticPaymentCreationFailure(context, db, order, panel, method, error) {
+  if (method === PAYMENT_METHOD.PAGBANK_PIX) safePagBankFailure(error, order);
+  else console.warn(`Mercado Pago: falha ao criar cobranca do pedido #${order.id}: ${errorSummary(error).message}`);
+
+  const httpStatus = paymentProviderHttpStatus(error);
+  const auditEvent = method === PAYMENT_METHOD.MERCADOPAGO_PIX
+    ? "order.mercadopago_create_failed"
+    : "order.pagbank_create_failed";
+
+  if (isAmbiguousPaymentProviderFailure(error)) {
+    order.paymentCreationUncertainAt = new Date().toISOString();
+    touchOrder(order);
+    appendAuditLog(db, context, auditEvent, { order, httpStatus });
+    await persistPaymentOrder(db, order, panel);
+    await refreshCartMessage(context.guild, order, panel, context.channel);
+    return actionReply(context, {
+      content: "Nao consegui confirmar a resposta do provedor. Use **Tentar pagamento** para reutilizar a mesma cobranca com seguranca ou cancele o carrinho. Nao faca outro Pix enquanto a cobranca nao aparecer.",
+      ephemeral: true
+    });
+  }
+
+  if (order.stockReservedAt) await releaseOrderStock(getPostgresPool(), order.id).catch(() => null);
+  delete order.paymentMethod;
+  delete order.paymentState;
+  delete order.totalCentsSnapshot;
+  delete order.paymentSnapshot;
+  delete order.paymentExpiresAt;
+  delete order.paymentCreationUncertainAt;
+  delete order.stockReservedAt;
+  delete order.pagBankReferenceId;
+  delete order.pagBankIdempotencyKey;
+  delete order.mercadoPagoReferenceId;
+  delete order.mercadoPagoIdempotencyKey;
+  delete order.paymentPreference;
+  touchOrder(order);
+  appendAuditLog(db, context, auditEvent, { order, httpStatus });
+  await persistPaymentOrder(db, order, panel);
+  await refreshCartMessage(context.guild, order, panel, context.channel);
+  return actionReply(context, {
+    content: "O provedor recusou a criacao do Pix. Confira os dados e tente novamente; voce tambem pode escolher Pix manual ou cancelar o carrinho.",
+    ephemeral: true
+  });
+}
 async function startOrderPayment(context, id, customerInput = null) {
   const db = readOrders();
   const order = orderForAction(db, id, context, false);
@@ -3688,13 +3738,14 @@ async function startOrderPayment(context, id, customerInput = null) {
       order.mercadoPagoPaymentId = payment.paymentId;
       order.mercadoPagoPixCopyPaste = payment.copyPaste;
       order.paymentExpiresAt = payment.expiresAt;
+      delete order.paymentCreationUncertainAt;
       touchOrder(order);
       await persistPaymentOrder(db, order, panel);
       const paymentPayload = await buildPagBankPaymentPayload(order, panel);
       await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
       return actionReply(context, { content: "Cobranca Mercado Pago recuperada.", ephemeral: true });
     } catch (error) {
-      return actionReply(context, { content: `Nao foi possivel gerar o Pix Mercado Pago: ${error.message}`, ephemeral: true });
+      return handleAutomaticPaymentCreationFailure(context, db, order, panel, PAYMENT_METHOD.MERCADOPAGO_PIX, error);
     } finally { releaseOrderActionLock(order); }
   }
   if (order.paymentMethod === PAYMENT_METHOD.PAGBANK_PIX && order.paymentState === PAYMENT_STATE.AWAITING_PAGBANK_PAYMENT && order.pagBankReferenceId && order.pagBankIdempotencyKey) {
@@ -3712,6 +3763,7 @@ async function startOrderPayment(context, id, customerInput = null) {
       order.pagBankPixCopyPaste = charge.copyPaste;
       order.pagBankQrCodeImageUrl = charge.qrCodeImageUrl;
       order.paymentExpiresAt = charge.expiresAt || order.paymentExpiresAt;
+      delete order.paymentCreationUncertainAt;
       touchOrder(order);
       appendAuditLog(db, context, "order.pagbank_qr_recovered", { order, pagBankOrderId: order.pagBankOrderId });
       await persistPaymentOrder(db, order, panel);
@@ -3719,8 +3771,7 @@ async function startOrderPayment(context, id, customerInput = null) {
       await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
       return actionReply(context, { content: "Cobranca PagBank recuperada com a mesma chave de idempotencia.", ephemeral: true });
     } catch (error) {
-      safePagBankFailure(error, order);
-      return actionReply(context, { content: "Nao foi possivel gerar o Pix. Verifique os dados informados e tente novamente.", ephemeral: true });
+      return handleAutomaticPaymentCreationFailure(context, db, order, panel, PAYMENT_METHOD.PAGBANK_PIX, error);
     } finally {
       releaseOrderActionLock(order);
     }
@@ -3808,29 +3859,13 @@ async function startOrderPayment(context, id, customerInput = null) {
         order.pagBankPixCopyPaste = charge.copyPaste;
         order.pagBankQrCodeImageUrl = charge.qrCodeImageUrl;
       }
+      delete order.paymentCreationUncertainAt;
       order.paymentExpiresAt = charge.expiresAt || order.paymentExpiresAt;
       touchOrder(order);
       appendAuditLog(db, context, method === PAYMENT_METHOD.MERCADOPAGO_PIX ? "order.mercadopago_qr_created" : "order.pagbank_qr_created", { order, amountCents: snapshot.totalCents, providerPaymentId: order.mercadoPagoPaymentId || order.pagBankOrderId });
       await persistPaymentOrder(db, order, panel);
     } catch (error) {
-      if (method === PAYMENT_METHOD.PAGBANK_PIX) safePagBankFailure(error, order);
-      else console.warn(`Mercado Pago: falha ao criar cobranca do pedido #${order.id}: ${errorSummary(error).message}`);
-      if (order.stockReservedAt) await releaseOrderStock(getPostgresPool(), order.id).catch(() => null);
-      delete order.paymentMethod;
-      delete order.paymentState;
-      delete order.totalCentsSnapshot;
-      delete order.paymentSnapshot;
-      delete order.paymentExpiresAt;
-      delete order.stockReservedAt;
-      delete order.pagBankReferenceId;
-      delete order.pagBankIdempotencyKey;
-      delete order.mercadoPagoReferenceId;
-      delete order.mercadoPagoIdempotencyKey;
-      delete order.paymentPreference;
-      touchOrder(order);
-      appendAuditLog(db, context, method === PAYMENT_METHOD.MERCADOPAGO_PIX ? "order.mercadopago_create_failed" : "order.pagbank_create_failed", { order, httpStatus: error?.pagBank?.status || error?.mercadoPago?.status || 0 });
-      await persistPaymentOrder(db, order, panel);
-      return actionReply(context, { content: "Nao foi possivel gerar o Pix. Verifique os dados informados e tente novamente.", ephemeral: true });
+      return handleAutomaticPaymentCreationFailure(context, db, order, panel, method, error);
     }
     const paymentPayload = await buildPagBankPaymentPayload(order, panel);
     await context.channel.send({ content: `<@${order.userId}> pagamento do pedido #${order.id}:`, ...paymentPayload, allowedMentions: { users: [order.userId] } });
@@ -7460,6 +7495,7 @@ function cartActionRows(orderOrId) {
   const finished = isFinishedCart(order);
   const paid = Boolean(order.paymentStatus === "marked_paid" || order.paidAt);
   const frozen = paymentStarted(order);
+  const paymentRecovery = automaticPaymentRecoveryAvailable(order);
   const manualApprovalAllowed = order.paymentFlowVersion < 2 ||
     (order.paymentMethod === PAYMENT_METHOD.MANUAL_PIX &&
       (Number(order.paymentFlowVersion || 0) >= 3
@@ -7470,11 +7506,11 @@ function cartActionRows(orderOrId) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`addproduct:${orderId}`).setLabel("Adicionar produto").setEmoji("➕").setStyle(ButtonStyle.Primary).setDisabled(finished || frozen),
-      new ButtonBuilder().setCustomId(`pay:${orderId}`).setLabel(frozen ? "Pagamento gerado" : "Gerar pagamento").setEmoji("💠").setStyle(ButtonStyle.Success).setDisabled(finished || frozen),
+      new ButtonBuilder().setCustomId(`pay:${orderId}`).setLabel(paymentRecovery ? "Tentar pagamento" : frozen ? "Pagamento gerado" : "Gerar pagamento").setEmoji("💠").setStyle(ButtonStyle.Success).setDisabled(finished || (frozen && !paymentRecovery)),
       new ButtonBuilder().setCustomId(`cancel:${orderId}`).setLabel("Cancelar").setEmoji("✖️").setStyle(ButtonStyle.Danger).setDisabled(finished)
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`sendpix:${orderId}`).setLabel("Reenviar Pix").setEmoji("💸").setStyle(ButtonStyle.Secondary).setDisabled(finished || !frozen),
+      new ButtonBuilder().setCustomId(`sendpix:${orderId}`).setLabel("Reenviar Pix").setEmoji("💸").setStyle(ButtonStyle.Secondary).setDisabled(finished || !frozen || paymentRecovery),
       new ButtonBuilder().setCustomId(`paid:${orderId}`).setLabel(automaticPayment ? "Verificar pagamento" : "Aprovar pagamento").setEmoji("💵").setStyle(ButtonStyle.Secondary).setDisabled(finished || paid || (!manualApprovalAllowed && !automaticVerificationAllowed)),
       new ButtonBuilder().setCustomId(`deliver:${orderId}`).setLabel("Entregar").setEmoji("📦").setStyle(ButtonStyle.Primary).setDisabled(finished || Boolean(order.deliveredAt)),
       new ButtonBuilder().setCustomId(`finish:${orderId}`).setLabel("Finalizar").setEmoji("✅").setStyle(ButtonStyle.Success).setDisabled(finished),

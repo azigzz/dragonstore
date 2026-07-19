@@ -21,6 +21,7 @@ const {
   const beforeLimit = Date.parse(order.lastInteractionAt) + DEFAULT_INACTIVITY_MS - 60 * 1000;
   assert.equal(isInactive(order, beforeLimit), false);
   assert.equal(isInactive(order, Date.parse(order.lastInteractionAt) + DEFAULT_INACTIVITY_MS), true);
+  assert.equal(isInactive(order, Date.parse(order.lastInteractionAt) + DEFAULT_INACTIVITY_MS + 1), true);
 
   const renewedAt = beforeLimit;
   assert.equal(markHumanActivity(order, renewedAt), true);
@@ -47,8 +48,14 @@ const {
     reason: "O Pix automatico esta disponivel somente a partir de R$ 1,00."
   });
   assert.equal(paymentChoiceAvailability(100, true).automatic, true);
+  assert.equal(paymentChoiceAvailability(100, true).manual, true);
   assert.equal(paymentChoiceAvailability(100, false).automatic, false);
   assert.equal(paymentChoiceAvailability(100, false).manual, true);
+  assert.equal(
+    paymentChoiceAvailability(100, true).automatic,
+    true,
+    "o rate limit manual nao pode afetar a disponibilidade do pagamento automatico"
+  );
 
   assert.equal(isManualInactivityCandidate({ status: "open", paymentMethod: "MANUAL_PIX", paymentState: "AWAITING_MANUAL_PAYMENT" }), true);
   assert.equal(isManualInactivityCandidate({ status: "open", paymentMethod: "MANUAL_PIX", paymentState: "MANUAL_PAYMENT_UNDER_REVIEW" }), false);

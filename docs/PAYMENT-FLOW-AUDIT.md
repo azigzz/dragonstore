@@ -25,6 +25,9 @@ auditoria existente nao foi reformulado, expandido ou substituido.
   explicitas. O automatico fica indisponivel abaixo de R$ 1,00.
 - **Falha do ntfy podia deixar o operador sem contexto.** O comprovante continua
   no Discord, o carrinho nao e aprovado e um atendente pode repetir o envio.
+- **Timeout ao criar Pix podia apagar a idempotencia.** Corrigido: respostas
+  ambiguas preservam referencia, reserva e chave para recuperar a mesma
+  cobranca pelo botao **Tentar pagamento**.
 - **Notificacao manual usava prioridade nao aceita pelo ntfy.** Corrigido para
   prioridade `max`; o endpoint agora aceita tanto URL completa quanto
   `NTFY_URL` + `NTFY_TOPIC` e possui `/testntfy`.

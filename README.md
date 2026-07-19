@@ -365,6 +365,7 @@ O total e recalculado usando os produtos salvos no servidor e congelado no momen
 - Cada carrinho envia uma notificacao manual; cada usuario possui intervalo persistente de 5 minutos.
 - Dono, ADM ou atendente configurado confirma o pagamento manual. A operacao continua protegida contra clique concorrente e entrega duplicada.
 - A falha do ntfy nao apaga o comprovante nem aprova o pedido; um atendente pode repetir a notificacao.
+- Se a resposta do provedor automatico se perder por timeout/rede, o bot preserva a referencia e a idempotencia e mostra **Tentar pagamento** para recuperar a mesma cobranca sem duplicar o Pix.
 - Pagamentos automaticos e reservas expiradas sao recuperados por varredura persistente; o fluxo nao depende apenas de `setTimeout`.
 
 Para Mercado Pago, configure `PAYMENT_PROVIDER=mercadopago`, `MERCADOPAGO_ACCESS_TOKEN`, `MERCADOPAGO_WEBHOOK_URL`, `DATABASE_URL` e `STOCK_ENCRYPTION_KEY`. Para PagBank, use `PAYMENT_PROVIDER=pagbank`, `PAGBANK_TOKEN`, `PAGBANK_ENV` e `PAGBANK_WEBHOOK_URL`.

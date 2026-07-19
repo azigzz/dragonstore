@@ -16,11 +16,38 @@ const { createMercadoPagoPix, getMercadoPagoPayment, validateApprovedMercadoPago
   assert.equal(result.paymentId, "123456789");
   assert.equal(result.copyPaste, "PIX-FAKE");
 
+  let apiFailure;
+  await assert.rejects(
+    createMercadoPagoPix({
+      referenceId: "order-failure",
+      idempotencyKey: "idem-failure",
+      amountCents: 100,
+      expiresAt: "2030-01-01T00:15:00.000Z",
+      description: "Pedido com falha",
+      customer: { name: "Maria da Silva", email: "maria@example.com", tax_id: "52998224725" }
+    }, {
+      env,
+      fetchImpl: async () => ({
+        ok: false,
+        status: 503,
+        json: async () => ({ error: "service_unavailable", message: "temporarily unavailable" })
+      })
+    }).catch(error => {
+      apiFailure = error;
+      throw error;
+    }),
+    /Mercado Pago HTTP 503/
+  );
+  assert.equal(apiFailure.mercadoPago.status, 503);
+  assert.equal(apiFailure.message.includes(env.MERCADOPAGO_ACCESS_TOKEN), false);
+
   const secret = "webhook-secret"; const dataId = "123456789"; const requestId = "req-1"; const ts = "1704908010";
   const signature = crypto.createHmac("sha256", secret).update(`id:${dataId};request-id:${requestId};ts:${ts};`).digest("hex");
   assert.equal(verifyMercadoPagoSignature({ xSignature: `ts=${ts},v1=${signature}`, xRequestId: requestId, dataId, secret }), true);
   assert.equal(verifyMercadoPagoSignature({ xSignature: `ts=${ts},v1=${"0".repeat(64)}`, xRequestId: requestId, dataId, secret }), false);
+  assert.equal(verifyMercadoPagoSignature({ xSignature: "", xRequestId: requestId, dataId, secret }), false);
   assert.equal(validateApprovedMercadoPagoPayment({ mercadoPagoReferenceId: "order-1", mercadoPagoPaymentId: "123456789", totalCentsSnapshot: 100 }, { id: 123456789, status: "approved", payment_method_id: "pix", external_reference: "order-1", transaction_amount: 1 }).ok, true);
+  assert.equal(validateApprovedMercadoPagoPayment({ mercadoPagoReferenceId: "order-1", mercadoPagoPaymentId: "123456789", totalCentsSnapshot: 100 }, { id: 123456789, status: "pending", payment_method_id: "pix", external_reference: "order-1", transaction_amount: 1 }).ok, false);
   await getMercadoPagoPayment("123456789", { env, fetchImpl: async (_url, options) => { assert.equal(options.method, "GET"); return { ok: true, status: 200, json: async () => ({ id: 123456789 }) }; } });
   console.log("Mercado Pago integration tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

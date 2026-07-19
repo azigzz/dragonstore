@@ -1,6 +1,13 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { PAYMENT_METHOD, calculateServerCart, resolvePaymentMethod } = require("../src/paymentPolicy");
+const {
+  PAYMENT_METHOD,
+  automaticPaymentRecoveryAvailable,
+  calculateServerCart,
+  isAmbiguousPaymentProviderFailure,
+  paymentProviderHttpStatus,
+  resolvePaymentMethod
+} = require("../src/paymentPolicy");
 const { buildHomologationReport, createPixOrder, getPagBankOrder, normalizeCustomer, pagBankConfig, pagBankErrorDetails, paidPixCharge, qrCodeData, validatePaidPixNotification, validCnpj, validCpf, validPagBankWebhookUrl, verifyWebhookSignature } = require("../src/pagBank");
 const { canApproveManualPayment, isAuthorizedOwner } = require("../src/securityPolicy");
 
@@ -12,6 +19,29 @@ assert.equal(resolvePaymentMethod(100), PAYMENT_METHOD.PAGBANK_PIX);
 assert.equal(resolvePaymentMethod(200), PAYMENT_METHOD.PAGBANK_PIX);
 assert.throws(() => resolvePaymentMethod(0), /inteiro positivo/i);
 assert.throws(() => resolvePaymentMethod(99.5), /inteiro positivo/i);
+assert.equal(paymentProviderHttpStatus({ mercadoPago: { status: 422 } }), 422);
+assert.equal(paymentProviderHttpStatus({ pagBank: { status: 503 } }), 503);
+assert.equal(isAmbiguousPaymentProviderFailure(new Error("timeout")), true);
+assert.equal(isAmbiguousPaymentProviderFailure({ mercadoPago: { status: 503 } }), true);
+assert.equal(isAmbiguousPaymentProviderFailure({ pagBank: { status: 429 } }), true);
+assert.equal(isAmbiguousPaymentProviderFailure({ mercadoPago: { status: 422 } }), false);
+assert.equal(automaticPaymentRecoveryAvailable({
+  paymentMethod: PAYMENT_METHOD.MERCADOPAGO_PIX,
+  paymentState: "AWAITING_PAGBANK_PAYMENT",
+  mercadoPagoReferenceId: "ref",
+  mercadoPagoIdempotencyKey: "idem"
+}), true);
+assert.equal(automaticPaymentRecoveryAvailable({
+  paymentMethod: PAYMENT_METHOD.MERCADOPAGO_PIX,
+  paymentState: "AWAITING_PAGBANK_PAYMENT",
+  mercadoPagoReferenceId: "ref",
+  mercadoPagoIdempotencyKey: "idem",
+  mercadoPagoPixCopyPaste: "pix"
+}), false);
+assert.equal(automaticPaymentRecoveryAvailable({
+  paymentMethod: PAYMENT_METHOD.MANUAL_PIX,
+  paymentState: "AWAITING_MANUAL_PAYMENT"
+}), false);
 
 const catalog = new Map([["p1", { productId: "p1", name: "Produto", priceCents: 100 }]]);
 const calculated = calculateServerCart([{ productId: "p1", priceCents: 1, quantity: 2 }], item => catalog.get(item.productId), 10);
